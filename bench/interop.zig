@@ -365,16 +365,17 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .transmit_byte_budget = 16 * 1024,
             .transmit_fd_budget = 4,
         },
-        .object_capacity = 16,
-        .object_quota = 16,
+        .object_capacity = 20,
+        .object_quota = 20,
         .buckets_per_client = 32,
-        .max_globals = 2,
+        .max_globals = 3,
         .registry_capacity = 2,
     });
     switch (kind) {
         .xdg => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
             _ = try runtime.globals.add(&standard_protocol.xdg_wm_base.info, 5, null);
+            _ = try runtime.globals.add(&standard_protocol.wp_presentation.info, 1, null);
         },
         .shm => _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null),
         .dmabuf => _ = try runtime.globals.add(
@@ -459,7 +460,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         if (prepared) _ = try reactor.ring.submit();
     }
     switch (kind) {
-        .xdg => if (!handler.ponged or !handler.configured)
+        .xdg => if (!handler.ponged or !handler.configured or !handler.clock_seen or
+            !handler.feedback_presented or !handler.feedback_discarded or
+            handler.feedback_count != 2)
             return error.IncompleteInterop,
         .shm => if (!handler.pool_created or !handler.buffer_created or
             !handler.buffer_destroyed or !handler.pool_destroyed)
@@ -522,6 +525,10 @@ const ProtocolServerHandler = struct {
     plane_added_count: usize = 0,
     buffer_destroyed_count: usize = 0,
     params_destroyed_count: usize = 0,
+    clock_seen: bool = false,
+    feedback_presented: bool = false,
+    feedback_discarded: bool = false,
+    feedback_count: usize = 0,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -586,7 +593,66 @@ const ProtocolServerHandler = struct {
                         .modifier_lo = drm_format_modifier_invalid_lo,
                     } },
                 );
+            } else if (resource_interface == &standard_protocol.wp_presentation.info) {
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wp_presentation,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .clock_id = .{ .clk_id = 1 } },
+                );
+                handler.clock_seen = true;
             }
+        } else if (interface == &standard_protocol.wp_presentation.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wp_presentation,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .feedback => |value| {
+                    const feedback = (try standard_protocol.wp_presentation.admit_feedback(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).callback;
+                    handler.feedback_count += 1;
+                    if (handler.feedback_count == 1) {
+                        try wayring.server.sendEvent(
+                            standard_protocol,
+                            standard_protocol.wp_presentation_feedback,
+                            handler.objects,
+                            handler.queue,
+                            feedback,
+                            .{ .presented = .{
+                                .tv_sec_hi = 1,
+                                .tv_sec_lo = 2,
+                                .tv_nsec = 3,
+                                .refresh = 16_666_667,
+                                .seq_hi = 4,
+                                .seq_lo = 5,
+                                .flags = .vsync,
+                            } },
+                        );
+                        handler.feedback_presented = true;
+                    } else if (handler.feedback_count == 2) {
+                        try wayring.server.sendEvent(
+                            standard_protocol,
+                            standard_protocol.wp_presentation_feedback,
+                            handler.objects,
+                            handler.queue,
+                            feedback,
+                            .{ .discarded = .{} },
+                        );
+                        handler.feedback_discarded = true;
+                    } else return error.UnexpectedRequest;
+                },
+                .destroy => {},
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
             const decoded = try wayring.server.decodeRequest(
                 standard_protocol.zwp_linux_dmabuf_v1,
@@ -893,7 +959,8 @@ fn wayringXdgClient() !u8 {
     try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
     while (handler.compositor == null or handler.wm_base == null or
-        !handler.synced or !handler.deleted or !handler.pinged)
+        handler.presentation == null or !handler.synced or !handler.deleted or
+        !handler.pinged or !handler.clock_seen)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     const surface = (try standard_protocol.wl_compositor.construct_create_surface(
@@ -915,6 +982,13 @@ fn wayringXdgClient() !u8 {
         xdg_surface,
         .{},
     )).id;
+    const first_feedback = (try standard_protocol.wp_presentation.construct_feedback(
+        client_objects,
+        &actor.transmit,
+        handler.presentation.?,
+        .{ .surface = surface.id },
+    )).callback;
+    handler.feedback = first_feedback;
     try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
@@ -924,7 +998,27 @@ fn wayringXdgClient() !u8 {
     );
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (!handler.configured)
+    while (!handler.configured or !handler.feedback_presented or handler.feedback_deletes != 1)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const second_feedback = (try standard_protocol.wp_presentation.construct_feedback(
+        client_objects,
+        &actor.transmit,
+        handler.presentation.?,
+        .{ .surface = surface.id },
+    )).callback;
+    if (second_feedback.id != first_feedback.id) return error.FeedbackIdNotReused;
+    handler.feedback = second_feedback;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .commit = .{} },
+    );
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.feedback_discarded or handler.feedback_deletes != 2)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     handler.synced = false;
@@ -964,6 +1058,13 @@ fn wayringXdgClient() !u8 {
         handler.wm_base.?,
         .{ .destroy = .{} },
     );
+    try wayring.client.sendRequest(
+        standard_protocol.wp_presentation,
+        client_objects,
+        &actor.transmit,
+        handler.presentation.?,
+        .{ .destroy = .{} },
+    );
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
     while (actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
@@ -982,12 +1083,18 @@ const XdgClientHandler = struct {
     callback: wayring.objects.Handle,
     compositor: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
+    presentation: ?wayring.objects.Handle = null,
+    feedback: ?wayring.objects.Handle = null,
     xdg_surface: ?wayring.objects.Handle = null,
     toplevel: ?wayring.objects.Handle = null,
     synced: bool = false,
     deleted: bool = false,
     pinged: bool = false,
     configured: bool = false,
+    clock_seen: bool = false,
+    feedback_presented: bool = false,
+    feedback_discarded: bool = false,
+    feedback_deletes: usize = 0,
 
     pub fn event(
         handler: *XdgClientHandler,
@@ -1000,6 +1107,10 @@ const XdgClientHandler = struct {
             switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
                 .delete_id => |deleted| {
                     if (deleted.id == handler.callback.id) handler.deleted = true;
+                    if (handler.feedback) |feedback| if (deleted.id == feedback.id) {
+                        handler.feedback_deletes += 1;
+                        if (handler.feedback_deletes == 2) handler.feedback = null;
+                    };
                 },
                 .@"error" => return error.ProtocolError,
             }
@@ -1035,6 +1146,20 @@ const XdgClientHandler = struct {
                             @min(global.version, 5),
                             null,
                         );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wp_presentation.info.name,
+                    )) {
+                        handler.presentation = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wp_presentation.info,
+                            1,
+                            null,
+                        );
                     }
                 },
                 .global_remove => {},
@@ -1068,6 +1193,40 @@ const XdgClientHandler = struct {
                 .{ .pong = .{ .serial = serial } },
             );
             handler.pinged = true;
+        } else if (interface == &standard_protocol.wp_presentation.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wp_presentation,
+                handler.objects,
+                handler.presentation orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .clock_id => |value| {
+                    if (value.clk_id != 1) return error.InvalidClock;
+                    handler.clock_seen = true;
+                },
+            }
+        } else if (interface == &standard_protocol.wp_presentation_feedback.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wp_presentation_feedback,
+                handler.objects,
+                handler.feedback orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .presented => |value| {
+                    if (value.tv_sec_hi != 1 or value.tv_sec_lo != 2 or
+                        value.tv_nsec != 3 or value.refresh != 16_666_667 or
+                        value.seq_hi != 4 or value.seq_lo != 5 or
+                        value.flags.value != standard_protocol.wp_presentation_feedback.kind.vsync.value)
+                        return error.InvalidPresentation;
+                    handler.feedback_presented = true;
+                },
+                .discarded => handler.feedback_discarded = true,
+                .sync_output => return error.UnexpectedEvent,
+            }
         } else if (interface == &standard_protocol.xdg_toplevel.info) {
             _ = try wayring.client.decodeEvent(
                 standard_protocol.xdg_toplevel,

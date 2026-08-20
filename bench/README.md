@@ -130,9 +130,11 @@ Xdg interoperability mode drives both a real libwayland client against a
 Wayring server and a Wayring client against a real libwayland server. Each
 pairing performs registry binding, `wl_compositor` surface creation,
 `xdg_wm_base` ping/pong, `xdg_surface` and `xdg_toplevel` construction,
-configure/ack, synchronization, and ordered destruction. This validates
-production protocol object and version lifecycles independently of the private
-benchmark protocol.
+configure/ack, presentation clock advertisement, presented and discarded
+feedback, synchronization, and ordered destruction. Presentation feedback also
+validates destructor events, `delete_id`, and immediate client-ID reuse. This
+validates production protocol object and version lifecycles independently of
+the private benchmark protocol.
 
 Shm interoperability mode runs both a libwayland client against a Wayring
 server and a Wayring client against a libwayland server. Each pairing performs

@@ -1,4 +1,5 @@
 #include "xdg-interop.h"
+#include "presentation-time-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
 
 #include <stdint.h>
@@ -15,7 +16,67 @@ struct server_state {
 	int xdg_surface_destroyed;
 	int surface_destroyed;
 	int wm_base_destroyed;
+	int presentation_destroyed;
+	int feedback_count;
 };
+
+static void
+presentation_feedback(struct wl_client *client, struct wl_resource *resource,
+                      struct wl_resource *surface, uint32_t id)
+{
+	struct server_state *state = wl_resource_get_user_data(resource);
+	struct wl_resource *feedback;
+
+	(void) surface;
+	feedback = wl_resource_create(
+		client, &wp_presentation_feedback_interface, 1, id);
+	if (feedback == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	state->feedback_count++;
+	if (state->feedback_count == 1) {
+		wp_presentation_feedback_send_presented(
+			feedback, 1, 2, 3, 16666667, 4, 5,
+			WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
+	} else if (state->feedback_count == 2) {
+		wp_presentation_feedback_send_discarded(feedback);
+	} else {
+		wl_client_post_implementation_error(client, "unexpected presentation feedback");
+	}
+	wl_resource_destroy(feedback);
+}
+
+static void
+presentation_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct server_state *state = wl_resource_get_user_data(resource);
+
+	(void) client;
+	state->presentation_destroyed = 1;
+	wl_resource_destroy(resource);
+}
+
+static const struct wp_presentation_interface presentation_implementation = {
+	.destroy = presentation_destroy,
+	.feedback = presentation_feedback,
+};
+
+static void
+bind_presentation(struct wl_client *client, void *data, uint32_t version,
+                  uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(
+		client, &wp_presentation_interface, version < 1 ? (int) version : 1, id);
+
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(
+		resource, &presentation_implementation, data, NULL);
+	wp_presentation_send_clock_id(resource, 1);
+}
 
 static void
 surface_commit(struct wl_client *client, struct wl_resource *resource)
@@ -235,7 +296,9 @@ xdg_server_fd(int fd)
 	if (wl_global_create(state.display, &wl_compositor_interface, 4,
 	                     &state, bind_compositor) == NULL ||
 	    wl_global_create(state.display, &xdg_wm_base_interface, 5,
-	                     &state, bind_wm_base) == NULL) {
+	                     &state, bind_wm_base) == NULL ||
+	    wl_global_create(state.display, &wp_presentation_interface, 1,
+	                     &state, bind_presentation) == NULL) {
 		wl_display_destroy(state.display);
 		return EXIT_FAILURE;
 	}
@@ -250,5 +313,6 @@ xdg_server_fd(int fd)
 	wl_display_destroy(state.display);
 	return state.ponged && state.configured && state.toplevel_destroyed &&
 	       state.xdg_surface_destroyed && state.surface_destroyed &&
-	       state.wm_base_destroyed ? EXIT_SUCCESS : EXIT_FAILURE;
+	       state.wm_base_destroyed && state.presentation_destroyed &&
+	       state.feedback_count == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -17,8 +17,10 @@ zig build-exe -OReleaseSafe --dep wayring \
     "$generated/wayland-core.zig"
 protocols_datadir=$(pkg-config --variable=pkgdatadir wayland-protocols)
 xdg_shell="$protocols_datadir/stable/xdg-shell/xdg-shell.xml"
+presentation_time="$protocols_datadir/stable/presentation-time/presentation-time.xml"
 linux_dmabuf="$protocols_datadir/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
-"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" "$linux_dmabuf" \
+"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" \
+    "$presentation_time" "$linux_dmabuf" \
     "$generated/wayland-xdg.zig"
 
 wayland-scanner client-header "$root/bench/protocol.xml" \
@@ -33,6 +35,12 @@ wayland-scanner server-header "$xdg_shell" \
     "$generated/xdg-shell-server-protocol.h"
 wayland-scanner private-code "$xdg_shell" \
     "$generated/xdg-shell-protocol.c"
+wayland-scanner client-header "$presentation_time" \
+    "$generated/presentation-time-client-protocol.h"
+wayland-scanner server-header "$presentation_time" \
+    "$generated/presentation-time-server-protocol.h"
+wayland-scanner private-code "$presentation_time" \
+    "$generated/presentation-time-protocol.c"
 wayland-scanner client-header "$linux_dmabuf" \
     "$generated/linux-dmabuf-client-protocol.h"
 wayland-scanner server-header "$linux_dmabuf" \
@@ -80,6 +88,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/dmabuf-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
+    "$generated/presentation-time-protocol.c" \
     "$generated/linux-dmabuf-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
     --dep wayring -Mstandard_protocol="$generated/wayland-xdg.zig" \

@@ -1,4 +1,5 @@
 #include "xdg-interop.h"
+#include "presentation-time-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 #include <stdint.h>
@@ -10,8 +11,69 @@
 struct client_state {
 	struct wl_compositor *compositor;
 	struct xdg_wm_base *wm_base;
+	struct wp_presentation *presentation;
 	int pinged;
 	int configured;
+	int clock_seen;
+	int presented;
+	int discarded;
+};
+
+static void
+handle_clock_id(void *data, struct wp_presentation *presentation,
+                uint32_t clock_id)
+{
+	struct client_state *state = data;
+
+	(void) presentation;
+	if (clock_id == 1)
+		state->clock_seen = 1;
+}
+
+static const struct wp_presentation_listener presentation_listener = {
+	.clock_id = handle_clock_id,
+};
+
+static void
+handle_feedback_sync_output(void *data,
+                            struct wp_presentation_feedback *feedback,
+                            struct wl_output *output)
+{
+	(void) data;
+	(void) feedback;
+	(void) output;
+}
+
+static void
+handle_feedback_presented(void *data,
+                          struct wp_presentation_feedback *feedback,
+                          uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                          uint32_t tv_nsec, uint32_t refresh,
+                          uint32_t seq_hi, uint32_t seq_lo, uint32_t flags)
+{
+	struct client_state *state = data;
+
+	(void) feedback;
+	if (tv_sec_hi == 1 && tv_sec_lo == 2 && tv_nsec == 3 &&
+	    refresh == 16666667 && seq_hi == 4 && seq_lo == 5 &&
+	    flags == WP_PRESENTATION_FEEDBACK_KIND_VSYNC)
+		state->presented = 1;
+}
+
+static void
+handle_feedback_discarded(void *data,
+                          struct wp_presentation_feedback *feedback)
+{
+	struct client_state *state = data;
+
+	(void) feedback;
+	state->discarded = 1;
+}
+
+static const struct wp_presentation_feedback_listener feedback_listener = {
+	.sync_output = handle_feedback_sync_output,
+	.presented = handle_feedback_presented,
+	.discarded = handle_feedback_discarded,
 };
 
 static void
@@ -42,6 +104,11 @@ handle_global(void *data, struct wl_registry *registry, uint32_t name,
 			registry, name, &xdg_wm_base_interface,
 			version < 5 ? version : 5);
 		xdg_wm_base_add_listener(state->wm_base, &wm_base_listener, state);
+	} else if (strcmp(interface, wp_presentation_interface.name) == 0) {
+		state->presentation = wl_registry_bind(
+			registry, name, &wp_presentation_interface, 1);
+		wp_presentation_add_listener(
+			state->presentation, &presentation_listener, state);
 	}
 }
 
@@ -125,6 +192,7 @@ xdg_client_fd(int fd)
 	struct wl_surface *surface = NULL;
 	struct xdg_surface *xdg_surface = NULL;
 	struct xdg_toplevel *toplevel = NULL;
+	struct wp_presentation_feedback *feedback;
 	int status = EXIT_FAILURE;
 
 	if (display == NULL)
@@ -132,8 +200,8 @@ xdg_client_fd(int fd)
 	registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &registry_listener, &state);
 	if (wl_display_roundtrip(display) < 0 || state.compositor == NULL ||
-	    state.wm_base == NULL || wl_display_roundtrip(display) < 0 ||
-	    !state.pinged)
+	    state.wm_base == NULL || state.presentation == NULL ||
+	    wl_display_roundtrip(display) < 0 || !state.pinged || !state.clock_seen)
 		goto cleanup_registry;
 
 	surface = wl_compositor_create_surface(state.compositor);
@@ -145,8 +213,21 @@ xdg_client_fd(int fd)
 	if (toplevel == NULL)
 		goto cleanup_toplevel;
 	xdg_toplevel_add_listener(toplevel, &toplevel_listener, &state);
+	feedback = wp_presentation_feedback(state.presentation, surface);
+	if (feedback == NULL)
+		goto cleanup_toplevel;
+	wp_presentation_feedback_add_listener(feedback, &feedback_listener, &state);
 	wl_surface_commit(surface);
-	while (!state.configured) {
+	while (!state.configured || !state.presented) {
+		if (wl_display_dispatch(display) < 0)
+			goto cleanup_toplevel;
+	}
+	feedback = wp_presentation_feedback(state.presentation, surface);
+	if (feedback == NULL)
+		goto cleanup_toplevel;
+	wp_presentation_feedback_add_listener(feedback, &feedback_listener, &state);
+	wl_surface_commit(surface);
+	while (!state.discarded) {
 		if (wl_display_dispatch(display) < 0)
 			goto cleanup_toplevel;
 	}
@@ -164,6 +245,8 @@ cleanup_toplevel:
 cleanup_registry:
 	if (state.wm_base != NULL)
 		xdg_wm_base_destroy(state.wm_base);
+	if (state.presentation != NULL)
+		wp_presentation_destroy(state.presentation);
 	if (state.compositor != NULL)
 		wl_compositor_destroy(state.compositor);
 	wl_registry_destroy(registry);
