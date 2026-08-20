@@ -5,5 +5,6 @@ int xdg_client_fd(int fd);
 int xdg_server_fd(int fd);
 int shm_client_fd(int fd);
 int shm_server_fd(int fd);
+int dmabuf_client_fd(int fd);
 
 #endif

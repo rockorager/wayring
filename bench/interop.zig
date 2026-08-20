@@ -21,7 +21,10 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm };
+const ProtocolInterop = enum { xdg, shm, dmabuf };
+const drm_format_argb8888: u32 = 0x34325241;
+const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
+const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
 
 const Options = struct {
     messages: u64 = 1_000_000,
@@ -34,6 +37,7 @@ const Options = struct {
         xdg_libwayland_server,
         shm_libwayland_client,
         shm_libwayland_server,
+        dmabuf_libwayland_client,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -47,6 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .xdg_libwayland_server => wayringXdgClient(),
         .shm_libwayland_client => wayringProtocolServer(.shm),
         .shm_libwayland_server => wayringShmClient(),
+        .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf),
     };
 }
 
@@ -334,6 +339,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         c._exit(switch (kind) {
             .xdg => ffi.xdg_client_fd(connected_fd),
             .shm => ffi.shm_client_fd(connected_fd),
+            .dmabuf => ffi.dmabuf_client_fd(connected_fd),
         });
     }
 
@@ -369,6 +375,11 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             _ = try runtime.globals.add(&standard_protocol.xdg_wm_base.info, 5, null);
         },
         .shm => _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null),
+        .dmabuf => _ = try runtime.globals.add(
+            &standard_protocol.zwp_linux_dmabuf_v1.info,
+            3,
+            null,
+        ),
     }
     try runtime.prepareAccept();
     _ = try reactor.ring.submit();
@@ -451,6 +462,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .shm => if (!handler.pool_created or !handler.buffer_created or
             !handler.buffer_destroyed or !handler.pool_destroyed)
             return error.IncompleteInterop,
+        .dmabuf => if (!handler.params_created or !handler.plane_added or
+            !handler.dmabuf_buffer_created or !handler.buffer_destroyed or
+            !handler.params_destroyed)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -492,6 +507,10 @@ const ProtocolServerHandler = struct {
     buffer_created: bool = false,
     buffer_destroyed: bool = false,
     pool_destroyed: bool = false,
+    params_created: bool = false,
+    plane_added: bool = false,
+    dmabuf_buffer_created: bool = false,
+    params_destroyed: bool = false,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -543,7 +562,75 @@ const ProtocolServerHandler = struct {
                     resource,
                     .{ .format = .{ .format = .argb8888 } },
                 );
+            } else if (resource_interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.zwp_linux_dmabuf_v1,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .modifier = .{
+                        .format = drm_format_argb8888,
+                        .modifier_hi = drm_format_modifier_invalid_hi,
+                        .modifier_lo = drm_format_modifier_invalid_lo,
+                    } },
+                );
             }
+        } else if (interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.zwp_linux_dmabuf_v1,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .create_params => |value| {
+                    _ = try standard_protocol.zwp_linux_dmabuf_v1.admit_create_params(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    );
+                    handler.params_created = true;
+                },
+                .destroy => {},
+                .get_default_feedback, .get_surface_feedback => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.zwp_linux_buffer_params_v1.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.zwp_linux_buffer_params_v1,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .add => |value| {
+                    defer _ = linux.close(value.fd);
+                    const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
+                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0 or
+                        value.plane_idx != 0 or value.offset != 0 or value.stride != 4 or
+                        value.modifier_hi != drm_format_modifier_invalid_hi or
+                        value.modifier_lo != drm_format_modifier_invalid_lo)
+                        return error.InvalidDmabufPlane;
+                    handler.plane_added = true;
+                },
+                .create_immed => |value| {
+                    if (!handler.plane_added or value.width != 1 or value.height != 1 or
+                        value.format != drm_format_argb8888 or value.flags.value != 0)
+                        return error.InvalidDmabufBuffer;
+                    _ = try standard_protocol.zwp_linux_buffer_params_v1.admit_create_immed(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    );
+                    handler.dmabuf_buffer_created = true;
+                },
+                .destroy => handler.params_destroyed = handler.buffer_destroyed,
+                .create => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_shm.info) {
             const decoded = try wayring.server.decodeRequest(
                 standard_protocol.wl_shm,
@@ -1568,6 +1655,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .shm_libwayland_client;
         } else if (std.mem.eql(u8, value, "shm-libwayland-server")) {
             options.mode = .shm_libwayland_server;
+        } else if (std.mem.eql(u8, value, "dmabuf-libwayland-client")) {
+            options.mode = .dmabuf_libwayland_client;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

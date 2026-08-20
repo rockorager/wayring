@@ -17,7 +17,8 @@ zig build-exe -OReleaseSafe --dep wayring \
     "$generated/wayland-core.zig"
 protocols_datadir=$(pkg-config --variable=pkgdatadir wayland-protocols)
 xdg_shell="$protocols_datadir/stable/xdg-shell/xdg-shell.xml"
-"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" \
+linux_dmabuf="$protocols_datadir/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
+"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" "$linux_dmabuf" \
     "$generated/wayland-xdg.zig"
 
 wayland-scanner client-header "$root/bench/protocol.xml" \
@@ -32,6 +33,10 @@ wayland-scanner server-header "$xdg_shell" \
     "$generated/xdg-shell-server-protocol.h"
 wayland-scanner private-code "$xdg_shell" \
     "$generated/xdg-shell-protocol.c"
+wayland-scanner client-header "$linux_dmabuf" \
+    "$generated/linux-dmabuf-client-protocol.h"
+wayland-scanner private-code "$linux_dmabuf" \
+    "$generated/linux-dmabuf-protocol.c"
 
 cflags="-std=c11 -O3 -DNDEBUG -D_GNU_SOURCE -Wall -Wextra -Werror"
 
@@ -69,8 +74,10 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/xdg-interop-server.c" \
     "$root/bench/shm-interop-client.c" \
     "$root/bench/shm-interop-server.c" \
+    "$root/bench/dmabuf-interop-client.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
+    "$generated/linux-dmabuf-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
     --dep wayring -Mstandard_protocol="$generated/wayland-xdg.zig" \
     --dep wayring -Mbenchmark_protocol="$generated/wayring-benchmark.zig" \
