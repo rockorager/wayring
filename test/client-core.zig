@@ -171,6 +171,155 @@ test "generic client helpers apply generated destructor lifecycle" {
     try std.testing.expect(client_objects.namespace.resolve(callback) == null);
 }
 
+test "generated constructors transact typed and dynamic new IDs" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 512, &descriptors, 2);
+    defer queue.deinit();
+    var client_objects = try wayring.objects.ClientObjects.init(
+        std.testing.allocator,
+        6,
+        5,
+        &Core.Display.info,
+        null,
+    );
+    defer client_objects.deinit(std.testing.allocator);
+    const Interface = protocol.wp_wayring_test_v1;
+    const parent = try client_objects.createLocal(&Interface.info, 1, null);
+    var typed_context: u8 = 1;
+    var dynamic_context: u8 = 2;
+
+    const failed_fd_result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(failed_fd_result));
+    const failed_fd: linux.fd_t = @intCast(failed_fd_result);
+    defer _ = linux.close(failed_fd);
+    const full = [_]u8{0} ** 512;
+    try queue.enqueue(&full, &.{});
+    try std.testing.expectError(error.ByteBudgetExceeded, Interface.construct_all_arguments(
+        &client_objects,
+        &queue,
+        parent,
+        .{
+            .signed = -1,
+            .count = .first,
+            .fixed_value = 256,
+            .title = "rollback",
+            .optional_title = null,
+            .target = null,
+            .child = .{ .context = &typed_context },
+            .dynamic_child = .{
+                .interface = &Interface.info,
+                .version = 1,
+                .context = &dynamic_context,
+            },
+            .bytes = &.{},
+            .optional_bytes = null,
+            .descriptor = failed_fd,
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), client_objects.namespace.table.len());
+    try consume(&queue);
+
+    const descriptor_result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(descriptor_result));
+    const constructed = try Interface.construct_all_arguments(
+        &client_objects,
+        &queue,
+        parent,
+        .{
+            .signed = -7,
+            .count = .second,
+            .fixed_value = 512,
+            .title = "constructed",
+            .optional_title = "optional",
+            .target = parent.id,
+            .child = .{ .context = &typed_context },
+            .dynamic_child = .{
+                .interface = &Interface.info,
+                .version = 1,
+                .context = &dynamic_context,
+            },
+            .bytes = &.{ 1, 2, 3 },
+            .optional_bytes = &.{4},
+            .descriptor = @intCast(descriptor_result),
+        },
+    );
+    const typed = client_objects.namespace.resolve(constructed.child).?;
+    try std.testing.expectEqual(&Interface.info, typed.interface);
+    try std.testing.expectEqual(@as(?*anyopaque, &typed_context), typed.context);
+    const dynamic = client_objects.namespace.resolve(constructed.dynamic_child).?;
+    try std.testing.expectEqual(&Interface.info, dynamic.interface);
+    try std.testing.expectEqual(@as(?*anyopaque, &dynamic_context), dynamic.context);
+
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 2);
+    const duplicate_result = linux.fcntl(@intCast(descriptor_result), linux.F.DUPFD_CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(duplicate_result));
+    try received_fds.append(@intCast(duplicate_result));
+    const request = try Interface.decodeRequest(try firstMessage(&queue), &received_fds);
+    const arguments = switch (request) {
+        .all_arguments => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(constructed.child.id, arguments.child);
+    try std.testing.expectEqual(constructed.dynamic_child.id, arguments.dynamic_child.id);
+    try std.testing.expectEqualStrings(Interface.info.name, arguments.dynamic_child.interface);
+    _ = linux.close(arguments.descriptor);
+    try consume(&queue);
+}
+
+test "generated constructors accept typed IDs from external protocol modules" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer queue.deinit();
+    var client_objects = try wayring.objects.ClientObjects.init(
+        std.testing.allocator,
+        4,
+        3,
+        &Core.Display.info,
+        null,
+    );
+    defer client_objects.deinit(std.testing.allocator);
+    const Interface = protocol.wp_wayring_test_v1;
+    const external: wayring.metadata.Interface = .{
+        .name = "wp_external_v1",
+        .version = 3,
+        .requests = &.{},
+        .events = &.{},
+    };
+    const parent = try client_objects.createLocal(&Interface.info, 1, null);
+
+    try std.testing.expectError(error.WrongInterface, Interface.construct_construct_external(
+        &client_objects,
+        &queue,
+        parent,
+        .{ .child = .{ .interface = &Interface.info } },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), client_objects.namespace.table.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.queuedBytes());
+
+    const constructed = try Interface.construct_construct_external(
+        &client_objects,
+        &queue,
+        parent,
+        .{ .child = .{ .interface = &external } },
+    );
+    const child = client_objects.namespace.resolve(constructed.child).?;
+    try std.testing.expectEqual(&external, child.interface);
+    try std.testing.expectEqual(@as(u32, 1), child.version);
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    const request = try Interface.decodeRequest(try firstMessage(&queue), &received_fds);
+    try std.testing.expectEqual(constructed.child.id, switch (request) {
+        .construct_external => |arguments| arguments.child,
+        else => unreachable,
+    });
+    try consume(&queue);
+}
+
 test "client terminal display error stops concatenated event dispatch" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 4);
     defer blocks.deinit(std.testing.allocator);

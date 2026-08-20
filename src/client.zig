@@ -9,6 +9,26 @@ const objects = @import("objects.zig");
 const tx = @import("tx.zig");
 const wire = @import("wire.zig");
 
+/// Application state attached to a generated typed `new_id` constructor.
+pub const NewObjectContext = struct {
+    context: ?*anyopaque = null,
+};
+
+/// Metadata and application state for a typed `new_id` whose interface is
+/// declared in another generated protocol module.
+pub const TypedNewObject = struct {
+    interface: *const metadata.Interface,
+    context: ?*anyopaque = null,
+};
+
+/// Interface, negotiated version, and application state for an untyped
+/// (dynamic) generated `new_id` constructor.
+pub const NewObject = struct {
+    interface: *const metadata.Interface,
+    version: u32,
+    context: ?*anyopaque = null,
+};
+
 /// Encodes an arbitrary generated request and applies destructor lifecycle only
 /// after the complete frame is committed to the transmit queue.
 pub fn sendRequest(

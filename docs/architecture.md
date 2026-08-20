@@ -49,6 +49,17 @@ arguments expand to their interface string, version, and ID wire fields. The
 benchmark protocol uses both generated directions, and the scanner is also
 checked against the complete core `wayland.xml` protocol.
 
+Requests containing `new_id` arguments also expose generated transactional
+constructors. A constructor validates the parent, creates every child in the
+bounded client object namespace, directly encodes the request, and rolls all
+children back if any allocation or TX step fails. Typed children inherit the
+parent's negotiated version, capped by the child interface maximum; dynamic
+children take an explicit interface and version. For typed interfaces declared
+by another protocol module, the caller supplies that module's metadata and the
+constructor validates its XML interface name before allocating an ID. This
+keeps cross-protocol references explicit without runtime reflection or
+steady-state allocation.
+
 Each generated interface also exports compact immutable metadata: its maximum
 version and each request/event's introduction version and destructor bit.
 Object dispatch resolves the sender ID to an interface and negotiated version,
