@@ -618,6 +618,8 @@ main(int argc, char **argv)
 	uint64_t connections = 1;
 	int client_tx = 0;
 	int client_rx = 0;
+	int idle = 0;
+	uint64_t idle_ms = 1000;
 	uint64_t start, elapsed, total_messages;
 	int child_status;
 	pid_t child;
@@ -638,6 +640,8 @@ main(int argc, char **argv)
 			client_tx = 1;
 		} else if (strcmp(argv[5], "client-rx") == 0) {
 			client_rx = 1;
+		} else if (strcmp(argv[5], "idle") == 0) {
+			idle = 1;
 		} else if (strcmp(argv[5], "round-trip") != 0) {
 			fprintf(stderr, "invalid benchmark mode: %s\n", argv[5]);
 			return EXIT_FAILURE;
@@ -645,11 +649,14 @@ main(int argc, char **argv)
 	}
 	if (argc > 6)
 		options.objects = (uint32_t) parse_count(argv[6], "object count");
+	if (argc > 7)
+		idle_ms = parse_count(argv[7], "idle duration");
 	if (options.messages == 0 || options.batch == 0 || options.warmup == 0 ||
 	    options.objects == 0 || options.objects > max_objects ||
 	    connections == 0 || connections > max_connections ||
 	    (options.objects > 1 &&
-	     (connections != 1 || options.latency || client_tx || client_rx)) ||
+	     (connections != 1 || options.latency || client_tx || client_rx || idle)) ||
+	    (idle && idle_ms == 0) ||
 	    (options.latency && options.messages + options.warmup > UINT32_MAX)) {
 		fprintf(stderr, "counts must be nonzero and connections at most 64\n");
 		return EXIT_FAILURE;
@@ -700,6 +707,11 @@ main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 	}
+	if (idle && benchmark_resource_sample(
+		    "libwayland", "idle", (size_t) connections, child, idle_ms) < 0) {
+		perror("idle sample");
+		return EXIT_FAILURE;
+	}
 
 	if (options.latency) {
 		if (run_latency(states, (size_t) connections, &options, NULL) < 0) {
@@ -712,6 +724,11 @@ main(int argc, char **argv)
 			perror("warmup");
 			return EXIT_FAILURE;
 		}
+		if (idle && benchmark_resource_sample(
+			    "libwayland", "active", (size_t) connections, child, 0) < 0) {
+			perror("active sample");
+			return EXIT_FAILURE;
+		}
 		start = monotonic_ns();
 		if (send_phase(states, (size_t) connections, options.messages,
 		               options.batch, 2) < 0) {
@@ -720,7 +737,7 @@ main(int argc, char **argv)
 		}
 		elapsed = monotonic_ns() - start;
 		total_messages = options.messages * connections;
-		printf("backend=libwayland connections=%" PRIu64 " objects=%" PRIu32
+		if (!idle) printf("backend=libwayland connections=%" PRIu64 " objects=%" PRIu32
 		       " messages=%" PRIu64 " batch=%" PRIu32
 		       " elapsed_ns=%" PRIu64 " messages_per_second=%.0f\n",
 		       connections, options.objects, total_messages, options.batch, elapsed,

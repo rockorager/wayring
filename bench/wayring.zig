@@ -3,6 +3,13 @@ const wayring = @import("wayring");
 const benchmark_protocol = @import("benchmark_protocol");
 
 const c = std.c;
+extern fn benchmark_resource_sample(
+    backend: [*:0]const u8,
+    scope: [*:0]const u8,
+    connections: usize,
+    server: c.pid_t,
+    idle_ms: u64,
+) c_int;
 const linux = std.os.linux;
 const wire = wayring.wire;
 const ancillary = wayring.ancillary;
@@ -38,7 +45,7 @@ const send_tag = (completions.Token{
 }).encode();
 
 const Options = struct {
-    const Mode = enum { round_trip, latency, client_tx, client_rx };
+    const Mode = enum { round_trip, latency, client_tx, client_rx, idle };
 
     warmup: u64 = 100_000,
     messages: u64 = 1_000_000,
@@ -46,6 +53,7 @@ const Options = struct {
     connections: usize = 1,
     objects: usize = 1,
     mode: Mode = .round_trip,
+    idle_ms: u64 = 1000,
 };
 
 const Ring = struct {
@@ -1192,15 +1200,29 @@ fn multiMain(options: Options) !u8 {
     var ring = try Ring.init(multi_ring_entries);
     defer ring.deinit();
     try validateFdLane(&ring, parent_fds[0]);
+    if (options.mode == .idle and benchmark_resource_sample(
+        "wayring-multishot",
+        "idle",
+        options.connections,
+        child,
+        options.idle_ms,
+    ) != 0) return error.SystemCallFailed;
     if (options.mode == .latency) {
         try runMultiLatency(allocator, &ring, parent_fds, options);
     } else {
         try sendMultiPhase(allocator, &ring, parent_fds, options.warmup, options.batch, 1);
+        if (options.mode == .idle and benchmark_resource_sample(
+            "wayring-multishot",
+            "active",
+            options.connections,
+            child,
+            0,
+        ) != 0) return error.SystemCallFailed;
         const start = try monotonicNs();
         try sendMultiPhase(allocator, &ring, parent_fds, options.messages, options.batch, 2);
         const elapsed = try monotonicNs() - start;
         const total_messages = try std.math.mul(u64, options.messages, options.connections);
-        _ = c.printf(
+        if (options.mode != .idle) _ = c.printf(
             "backend=wayring-multishot connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
             options.connections,
             total_messages,
@@ -1234,13 +1256,17 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .client_tx
         else if (std.mem.eql(u8, value, "client-rx"))
             options.mode = .client_rx
+        else if (std.mem.eql(u8, value, "idle"))
+            options.mode = .idle
         else if (!std.mem.eql(u8, value, "round-trip"))
             return error.InvalidMessage;
     }
     if (iterator.next()) |value| options.objects = try std.fmt.parseUnsigned(usize, value, 10);
+    if (iterator.next()) |value| options.idle_ms = try std.fmt.parseUnsigned(u64, value, 10);
     if (options.messages == 0 or options.batch == 0 or options.warmup == 0 or
         options.connections == 0 or options.connections > max_connections or
         options.objects == 0 or options.objects > max_objects or
+        (options.mode == .idle and options.idle_ms == 0) or
         (options.objects > 1 and (options.connections != 1 or options.mode != .round_trip)) or
         (options.mode == .latency and
             options.messages > std.math.maxInt(u32) - options.warmup) or
@@ -1254,7 +1280,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const options = try parseOptions(init.args);
     if (options.mode == .client_tx) return clientTransmitMain(options);
     if (options.mode == .client_rx) return clientReceiveMain(options);
-    if (options.connections > 1 or options.mode == .latency) return multiMain(options);
+    if (options.connections > 1 or options.mode == .latency or options.mode == .idle)
+        return multiMain(options);
     var sockets: [2]c.fd_t = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
         return error.SystemCallFailed;

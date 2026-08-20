@@ -10,6 +10,9 @@ connections=${CONNECTIONS:-8}
 objects=${OBJECTS:-64}
 latency_messages=${LATENCY_MESSAGES:-10000}
 latency_warmup=${LATENCY_WARMUP:-1000}
+idle_ms=${IDLE_MS:-1000}
+resource_connections=${RESOURCE_CONNECTIONS:-"1 8 32 64"}
+resource_warmup=${RESOURCE_WARMUP:-10000}
 mode=${1:-throughput}
 
 "$root/bench/build.sh"
@@ -67,6 +70,23 @@ case "$mode" in
             "$messages" "$batch" "$warmup" "$connections"
         strace -f -c "$root/zig-out/bench/wayring-ping" \
             "$messages" "$batch" "$warmup" "$connections"
+        ;;
+    resources)
+        for resource_count in $resource_connections; do
+            echo "# scope=idle connections=$resource_count idle_ms=$idle_ms" >&2
+            "$root/zig-out/bench/libwayland-ping" \
+                1 256 "$resource_warmup" "$resource_count" idle 1 "$idle_ms"
+            "$root/zig-out/bench/wayring-ping" \
+                1 256 "$resource_warmup" "$resource_count" idle 1 "$idle_ms"
+        done
+        ;;
+    idle-perf)
+        events=task-clock,context-switches,cpu-migrations,page-faults
+        echo "# scope=idle connections=$connections idle_ms=$idle_ms" >&2
+        perf stat -e "$events" "$root/zig-out/bench/libwayland-ping" \
+            1 1 1 "$connections" idle 1 "$idle_ms"
+        perf stat -e "$events" "$root/zig-out/bench/wayring-ping" \
+            1 1 1 "$connections" idle 1 "$idle_ms"
         ;;
     latency)
         sample=1
@@ -153,7 +173,7 @@ case "$mode" in
         done
         ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency]" >&2
         exit 2
         ;;
 esac

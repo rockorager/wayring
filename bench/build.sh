@@ -30,6 +30,7 @@ cc $cflags -I"$generated" \
     $(pkg-config --cflags wayland-client wayland-server) \
     "$root/bench/libwayland-client.c" \
     "$root/bench/libwayland-server.c" \
+    "$root/bench/resource.c" \
     "$generated/wayring-benchmark-protocol.c" \
     $(pkg-config --libs wayland-client wayland-server) \
     -o "$out/libwayland-ping"
@@ -39,6 +40,7 @@ cc $cflags "$root/bench/raw.c" -o "$out/raw-ping"
 
 zig build-exe -OReleaseFast -lc --dep wayring --dep benchmark_protocol \
     -Mroot="$root/bench/wayring.zig" \
+    -cflags $cflags -I"$root/bench" -- "$root/bench/resource.c" \
     --dep wayring -Mbenchmark_protocol="$generated/wayring-benchmark.zig" \
     -Mwayring="$root/src/root.zig" \
     -femit-bin="$out/wayring-ping"

@@ -26,6 +26,8 @@ bench/run.sh perf
 bench/run.sh syscalls
 bench/run.sh multi
 bench/run.sh multi-syscalls
+bench/run.sh resources
+bench/run.sh idle-perf
 bench/run.sh latency
 bench/run.sh client
 bench/run.sh client-perf
@@ -43,6 +45,8 @@ MESSAGES=5000000 BATCH=256 WARMUP=200000 REPEATS=10 bench/run.sh throughput
 CONNECTIONS=32 MESSAGES=100000 bench/run.sh multi
 OBJECTS=64 MESSAGES=5000000 bench/run.sh objects
 CONNECTIONS=8 LATENCY_MESSAGES=10000 LATENCY_WARMUP=1000 bench/run.sh latency
+RESOURCE_CONNECTIONS="1 8 32 64" IDLE_MS=1000 bench/run.sh resources
+CONNECTIONS=64 IDLE_MS=5000 bench/run.sh idle-perf
 ```
 
 The multi-connection modes compare Wayring and libwayland across identical
@@ -55,6 +59,22 @@ connection; the reported message count and throughput are aggregate. Wayring
 client send SQEs for every connection are submitted together once per batch;
 libwayland queues the same requests before flushing each display. Connection
 counts are limited to 64.
+
+Resource mode samples initialized client/server pairs while idle and again
+after `RESOURCE_WARMUP` messages per connection. It reports the resident memory
+of each process, their combined RSS, and server RSS per connection. The active
+sample captures lazily committed working memory that idle RSS intentionally
+does not. Fixed process and shared-library cost is included, so compare the
+slope across `RESOURCE_CONNECTIONS`, not only the per-connection quotient.
+Compare server RSS between implementations: the Wayring parent is a minimal
+io_uring benchmark driver while the libwayland parent uses a full client, so
+their client and combined RSS figures describe each executable but are not
+client-runtime parity measurements.
+`idle-perf` records task-clock and scheduler counters for the whole process tree
+during the same idle interval. Context switches are the portable wakeup proxy;
+the resource output also reports their exact per-process deltas from `/proc`
+because some environments restrict perf's kernel counters. The benchmark does
+not label context switches as exact kernel wakeup counts.
 
 Object mode binds or installs multiple instances of the benchmark interface and
 round-robins requests across them. This defeats Wayring's last-object lookup

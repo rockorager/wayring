@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 struct benchmark_options {
 	uint64_t warmup;
@@ -27,5 +28,8 @@ int benchmark_client_fd(int fd, const struct benchmark_options *options,
 int benchmark_server(int fd, const struct benchmark_options *options);
 int benchmark_server_multi(const int *fds, size_t count,
                            const struct benchmark_options *options);
+int benchmark_resource_sample(const char *backend, const char *scope,
+                              size_t connections, pid_t server,
+                              uint64_t sample_ms);
 
 #endif
