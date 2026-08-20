@@ -466,13 +466,21 @@ pub const ServerObjects = struct {
         server_objects: *ServerObjects,
         handle: Handle,
     ) ServerObjectsError!Object {
+        const object = try server_objects.cancelLocal(handle);
+        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
+        return object;
+    }
+
+    /// Removes a server-created object that was never published to the client.
+    pub fn cancelLocal(
+        server_objects: *ServerObjects,
+        handle: Handle,
+    ) ServerObjectsError!Object {
         if (handle.id < server_id_start) return error.InvalidServerId;
         if (server_objects.namespace.resolve(handle) == null)
             return error.StaleHandle;
         try server_objects.ids.release(handle.id);
-        const object = server_objects.namespace.remove(handle).?;
-        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
-        return object;
+        return server_objects.namespace.remove(handle).?;
     }
 };
 
@@ -984,10 +992,18 @@ pub const SharedServerObjects = struct {
         server_objects: *SharedServerObjects,
         handle: Handle,
     ) ServerObjectsError!Object {
-        if (handle.id < server_id_start) return error.InvalidServerId;
-        const object = server_objects.namespace.remove(handle) orelse return error.StaleHandle;
+        const object = try server_objects.cancelLocal(handle);
         if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
         return object;
+    }
+
+    /// Removes a server-created object that was never published to the client.
+    pub fn cancelLocal(
+        server_objects: *SharedServerObjects,
+        handle: Handle,
+    ) ServerObjectsError!Object {
+        if (handle.id < server_id_start) return error.InvalidServerId;
+        return server_objects.namespace.remove(handle) orelse error.StaleHandle;
     }
 };
 
@@ -1420,6 +1436,9 @@ test "server objects separate client and server ID ownership" {
     try std.testing.expectEqual(@as(usize, 2), removal_count);
     const reused = try server_objects.createLocal(&child_info, 1, null);
     try std.testing.expectEqual(first.id, reused.id);
+    _ = try server_objects.cancelLocal(reused);
+    try std.testing.expectEqual(@as(usize, 2), removal_count);
+    try std.testing.expectEqual(first.id, (try server_objects.createLocal(&child_info, 1, null)).id);
 }
 
 fn countRemoval(context: ?*anyopaque, _: Handle, _: Object) void {

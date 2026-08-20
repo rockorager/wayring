@@ -76,6 +76,17 @@ client-selected ID, and removes earlier children if any later insertion fails.
 Handlers therefore receive generation-tagged handles without manually
 reimplementing multi-object rollback.
 
+Generated events provide the reverse transaction. A server event constructor
+allocates every server-range child, directly encodes the event, and cancels all
+unpublished children if allocation, validation, or TX backpressure fails. The
+client admission helper validates typed and dynamic interface metadata, inserts
+every decoded server-range ID, and removes earlier insertions if a later child
+cannot be admitted. Typed children inherit the parent object's negotiated
+version capped by the child metadata; dynamic events carry an explicit version.
+Unpublished server rollback bypasses resource-removal hooks just like failed
+request admission, while successfully published children retain normal
+lifecycle notification.
+
 Server globals may install a cold-path bind factory. Registry binding first
 validates and inserts the requested object, then calls the factory with peer
 credentials plus global and resource handles; factory failure cancels the

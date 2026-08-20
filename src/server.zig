@@ -9,10 +9,23 @@ const objects = @import("objects.zig");
 const tx = @import("tx.zig");
 const wire = @import("wire.zig");
 
+/// Application state attached to a typed object created by a generated event.
+pub const NewObjectContext = struct {
+    context: ?*anyopaque = null,
+};
+
 /// Metadata and application state assigned while admitting a decoded
 /// `new_id` whose interface is not statically available in this module.
 pub const NewObject = struct {
     interface: *const metadata.Interface,
+    context: ?*anyopaque = null,
+};
+
+/// Interface, version, and application state for an untyped `new_id` created
+/// by a generated server event constructor.
+pub const NewEventObject = struct {
+    interface: *const metadata.Interface,
+    version: u32,
     context: ?*anyopaque = null,
 };
 

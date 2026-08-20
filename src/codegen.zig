@@ -132,6 +132,8 @@ fn emitInterface(
     try emitClientConstructors(output, allocator, protocol, interface);
     try emitServerAdmissions(output, allocator, protocol, interface);
     try emitDirection(output, allocator, "Event", interface.events);
+    try emitServerEventConstructors(output, allocator, protocol, interface);
+    try emitClientEventAdmissions(output, allocator, protocol, interface);
     try add(output, allocator, "};\n\n");
 }
 
@@ -442,6 +444,354 @@ fn emitServerAdmissions(
             try add(output, allocator, ");\n        errdefer _ = server_objects.cancelClient(new_object_");
             try unsigned(output, allocator, index);
             try add(output, allocator, ") catch unreachable;\n");
+        }
+        try add(output, allocator, "        return .{\n");
+        for (message.arguments, 0..) |argument, index| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "            .");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, " = new_object_");
+            try unsigned(output, allocator, index);
+            try add(output, allocator, ",\n");
+        }
+        try add(output, allocator, "        };\n    }\n\n");
+    }
+}
+
+fn emitServerEventConstructors(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    protocol: protocol_ir.Protocol,
+    interface: protocol_ir.Interface,
+) Error!void {
+    for (interface.events) |message| {
+        var new_id_count: usize = 0;
+        for (message.arguments) |argument| if (argument.type == .new_id) {
+            new_id_count += 1;
+        };
+        if (new_id_count == 0) continue;
+
+        try add(output, allocator, "    pub const EventConstructor_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, " = struct {\n");
+        for (message.arguments) |argument| {
+            try add(output, allocator, "        ");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ": ");
+            if (argument.type != .new_id) {
+                try emitType(output, allocator, argument);
+            } else {
+                if (argument.allow_null) try add(output, allocator, "?");
+                if (argument.interface) |child_interface| {
+                    try add(
+                        output,
+                        allocator,
+                        if (hasInterface(protocol, child_interface))
+                            "wayring.server.NewObjectContext"
+                        else
+                            "wayring.server.NewObject",
+                    );
+                    if (hasInterface(protocol, child_interface) and !argument.allow_null)
+                        try add(output, allocator, " = .{}");
+                } else {
+                    try add(output, allocator, "wayring.server.NewEventObject");
+                }
+            }
+            try add(output, allocator, ",\n");
+        }
+        try add(output, allocator, "    };\n\n    pub const EventConstructed_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, " = struct {\n");
+        for (message.arguments) |argument| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "        ");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, if (argument.allow_null)
+                ": ?wayring.objects.Handle,\n"
+            else
+                ": wayring.objects.Handle,\n");
+        }
+        try add(output, allocator, "    };\n\n    pub fn construct_event_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, "(comptime protocol: type, server_objects: anytype, queue: *tx.Queue, parent: wayring.objects.Handle, payload: EventConstructor_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, ") !EventConstructed_");
+        try add(output, allocator, message.name);
+        try add(output, allocator,
+            \\ {
+            \\        const parent_object = server_objects.namespace.resolve(parent) orelse return error.StaleHandle;
+            \\        if (parent_object.interface != &info) return error.WrongInterface;
+            \\        const parent_version = parent_object.version;
+        );
+        for (message.arguments) |argument| {
+            if (argument.type != .new_id) continue;
+            if (argument.interface) |child_interface| {
+                if (hasInterface(protocol, child_interface)) continue;
+                if (argument.allow_null) {
+                    try add(output, allocator, "        if (payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ") |specification| if (!std.mem.eql(u8, specification.interface.name, \"");
+                } else {
+                    try add(output, allocator, "        if (!std.mem.eql(u8, payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface.name, \"");
+                }
+                try add(output, allocator, child_interface);
+                try add(output, allocator, "\")) return error.WrongInterface;\n");
+            } else {
+                if (argument.allow_null) {
+                    try add(output, allocator, "        if (payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ") |specification| try specification.interface.validateVersion(specification.version);\n");
+                } else {
+                    try add(output, allocator, "        try payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface.validateVersion(payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".version);\n");
+                }
+            }
+        }
+        for (message.arguments, 0..) |argument, index| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "        const new_object_");
+            try unsigned(output, allocator, index);
+            if (argument.allow_null) try add(output, allocator, ": ?wayring.objects.Handle");
+            try add(output, allocator, " = ");
+            if (argument.allow_null) {
+                try add(output, allocator, "if (payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ") |specification| try server_objects.createLocal(");
+            } else {
+                try add(output, allocator, "try server_objects.createLocal(");
+            }
+            if (argument.interface) |child_interface| {
+                if (hasInterface(protocol, child_interface)) {
+                    try add(output, allocator, "&");
+                    try emitChildInterface(output, allocator, interface.name, child_interface);
+                    try add(output, allocator, ".info, @min(parent_version, ");
+                    try emitChildInterface(output, allocator, interface.name, child_interface);
+                    try add(output, allocator, ".info.version), ");
+                } else {
+                    const prefix = if (argument.allow_null) "specification" else "payload.";
+                    try add(output, allocator, prefix);
+                    if (!argument.allow_null) try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface, @min(parent_version, ");
+                    try add(output, allocator, prefix);
+                    if (!argument.allow_null) try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface.version), ");
+                }
+            } else {
+                const prefix = if (argument.allow_null) "specification" else "payload.";
+                try add(output, allocator, prefix);
+                if (!argument.allow_null) try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface, ");
+                try add(output, allocator, prefix);
+                if (!argument.allow_null) try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".version, ");
+            }
+            if (argument.allow_null) {
+                try add(output, allocator, "specification.context");
+            } else {
+                try add(output, allocator, "payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".context");
+            }
+            try add(output, allocator, if (argument.allow_null) ") else null;\n" else ");\n");
+            try add(output, allocator, "        errdefer ");
+            if (argument.allow_null) {
+                try add(output, allocator, "if (new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ") |handle| { _ = server_objects.cancelLocal(handle) catch unreachable; }\n");
+            } else {
+                try add(output, allocator, "_ = server_objects.cancelLocal(new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ") catch unreachable;\n");
+            }
+        }
+        try add(output, allocator, "        try wayring.server.sendEvent(protocol, @This(), server_objects, queue, parent, .{ .");
+        try identifier(output, allocator, message.name);
+        try add(output, allocator, " = .{\n");
+        for (message.arguments, 0..) |argument, index| {
+            try add(output, allocator, "            .");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, " = ");
+            if (argument.type != .new_id) {
+                try add(output, allocator, "payload.");
+                try identifier(output, allocator, argument.name);
+            } else if (argument.interface != null) {
+                if (argument.allow_null) {
+                    try add(output, allocator, "if (new_object_");
+                    try unsigned(output, allocator, index);
+                    try add(output, allocator, ") |handle| handle.id else null");
+                } else {
+                    try add(output, allocator, "new_object_");
+                    try unsigned(output, allocator, index);
+                    try add(output, allocator, ".id");
+                }
+            } else if (argument.allow_null) {
+                try add(output, allocator, "if (new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ") |handle| .{ .interface = payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".?.interface.name, .version = payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".?.version, .id = handle.id } else null");
+            } else {
+                try add(output, allocator, ".{ .interface = payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface.name, .version = payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".version, .id = new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ".id }");
+            }
+            try add(output, allocator, ",\n");
+        }
+        try add(output, allocator, "        } });\n        return .{\n");
+        for (message.arguments, 0..) |argument, index| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "            .");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, " = new_object_");
+            try unsigned(output, allocator, index);
+            try add(output, allocator, ",\n");
+        }
+        try add(output, allocator, "        };\n    }\n\n");
+    }
+}
+
+fn emitClientEventAdmissions(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    protocol: protocol_ir.Protocol,
+    interface: protocol_ir.Interface,
+) Error!void {
+    for (interface.events) |message| {
+        var new_id_count: usize = 0;
+        for (message.arguments) |argument| if (argument.type == .new_id) {
+            new_id_count += 1;
+        };
+        if (new_id_count == 0) continue;
+
+        try add(output, allocator, "    pub const EventNewObjects_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, " = struct {\n");
+        for (message.arguments) |argument| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "        ");
+            try identifier(output, allocator, argument.name);
+            if (argument.interface != null and hasInterface(protocol, argument.interface.?)) {
+                try add(output, allocator, ": ?*anyopaque = null,\n");
+            } else {
+                try add(output, allocator, ": wayring.client.TypedNewObject,\n");
+            }
+        }
+        try add(output, allocator, "    };\n\n    pub const EventAdmitted_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, " = struct {\n");
+        for (message.arguments) |argument| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "        ");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, if (argument.allow_null)
+                ": ?wayring.objects.Handle,\n"
+            else
+                ": wayring.objects.Handle,\n");
+        }
+        try add(output, allocator, "    };\n\n    pub fn admit_event_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, "(client_objects: *wayring.objects.ClientObjects, parent: wayring.objects.Handle, payload: Event_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, ", new_objects: EventNewObjects_");
+        try add(output, allocator, message.name);
+        try add(output, allocator, ") !EventAdmitted_");
+        try add(output, allocator, message.name);
+        try add(output, allocator,
+            \\ {
+            \\        const parent_object = client_objects.namespace.resolve(parent) orelse return error.StaleHandle;
+            \\        if (parent_object.interface != &info) return error.WrongInterface;
+            \\        const parent_version = parent_object.version;
+        );
+        for (message.arguments) |argument| {
+            if (argument.type != .new_id) continue;
+            if (argument.interface) |child_interface| {
+                if (hasInterface(protocol, child_interface)) continue;
+                try add(output, allocator, "        if (!std.mem.eql(u8, new_objects.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface.name, \"");
+                try add(output, allocator, child_interface);
+                try add(output, allocator, "\")) return error.WrongInterface;\n");
+            } else {
+                try add(output, allocator, "        if (!std.mem.eql(u8, new_objects.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface.name, payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface)) return error.WrongInterface;\n        try new_objects.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface.validateVersion(payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".version);\n");
+            }
+        }
+        for (message.arguments, 0..) |argument, index| {
+            if (argument.type != .new_id) continue;
+            try add(output, allocator, "        const new_object_");
+            try unsigned(output, allocator, index);
+            if (argument.allow_null) try add(output, allocator, ": ?wayring.objects.Handle");
+            try add(output, allocator, " = ");
+            if (argument.allow_null) {
+                try add(output, allocator, "if (payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ") |id| try client_objects.insertPeer(id, ");
+            } else {
+                try add(output, allocator, "try client_objects.insertPeer(");
+                if (argument.interface == null) {
+                    try add(output, allocator, "payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".id, ");
+                } else {
+                    try add(output, allocator, "payload.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ", ");
+                }
+            }
+            if (argument.interface) |child_interface| {
+                if (hasInterface(protocol, child_interface)) {
+                    try add(output, allocator, "&");
+                    try emitChildInterface(output, allocator, interface.name, child_interface);
+                    try add(output, allocator, ".info, @min(parent_version, ");
+                    try emitChildInterface(output, allocator, interface.name, child_interface);
+                    try add(output, allocator, ".info.version), new_objects.");
+                    try identifier(output, allocator, argument.name);
+                } else {
+                    try add(output, allocator, "new_objects.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface, @min(parent_version, new_objects.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".interface.version), new_objects.");
+                    try identifier(output, allocator, argument.name);
+                    try add(output, allocator, ".context");
+                }
+            } else {
+                try add(output, allocator, "new_objects.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface, payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".version, new_objects.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".context");
+            }
+            try add(output, allocator, if (argument.allow_null) ") else null;\n" else ");\n");
+            if (argument.allow_null) {
+                try add(output, allocator, "        errdefer if (new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ") |handle| { _ = client_objects.removePeer(handle) catch unreachable; }\n");
+            } else {
+                try add(output, allocator, "        errdefer _ = client_objects.removePeer(new_object_");
+                try unsigned(output, allocator, index);
+                try add(output, allocator, ") catch unreachable;\n");
+            }
         }
         try add(output, allocator, "        return .{\n");
         for (message.arguments, 0..) |argument, index| {

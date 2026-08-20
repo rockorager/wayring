@@ -347,6 +347,150 @@ test "generated server admission transacts decoded new IDs" {
     try std.testing.expectEqual(@as(?*anyopaque, &dynamic_context), dynamic.context);
 }
 
+test "generated server events transact peer object creation" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var transmit_queue = wayring.tx.Queue.init(&blocks, 128, &descriptors, 0);
+    defer transmit_queue.deinit();
+    var object_pool = try wayring.objects.SharedObjectPool.init(std.testing.allocator, 8);
+    defer object_pool.deinit(std.testing.allocator);
+    var buckets = [_]wayring.objects.SharedObjectBucket{.{}} ** 8;
+    var server_objects = try wayring.objects.SharedServerObjects.init(
+        &object_pool,
+        &buckets,
+        1,
+        8,
+        &Core.Display.info,
+        null,
+    );
+    defer server_objects.deinit();
+    var removals: RemovalState = .{};
+    server_objects.setRemovalHook(.{ .context = &removals, .notify = removedObject });
+    var client_objects = try wayring.objects.ClientObjects.init(
+        std.testing.allocator,
+        6,
+        2,
+        &Core.Display.info,
+        null,
+    );
+    defer client_objects.deinit(std.testing.allocator);
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    const Interface = protocol.wp_wayring_test_v1;
+    const external: wayring.metadata.Interface = .{
+        .name = "wp_external_v1",
+        .version = 3,
+        .requests = &.{},
+        .events = &.{},
+    };
+    const server_parent = try server_objects.insertClient(2, &Interface.info, 1, null);
+    const client_parent = try client_objects.createLocal(&Interface.info, 1, null);
+    var local_context: u8 = 1;
+    var external_context: u8 = 2;
+    var dynamic_context: u8 = 3;
+
+    const full = [_]u8{0} ** 128;
+    try transmit_queue.enqueue(&full, &.{});
+    try std.testing.expectError(
+        error.ByteBudgetExceeded,
+        Interface.construct_event_spawn_children(
+            protocol,
+            &server_objects,
+            &transmit_queue,
+            server_parent,
+            .{
+                .local_child = .{ .context = &local_context },
+                .external_child = .{ .interface = &external, .context = &external_context },
+                .dynamic_child = .{
+                    .interface = &Interface.info,
+                    .version = 1,
+                    .context = &dynamic_context,
+                },
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), server_objects.namespace.len());
+    try std.testing.expectEqual(@as(usize, 0), removals.total);
+    try consume(&transmit_queue);
+
+    const constructed = try Interface.construct_event_spawn_children(
+        protocol,
+        &server_objects,
+        &transmit_queue,
+        server_parent,
+        .{
+            .local_child = .{ .context = &local_context },
+            .external_child = .{ .interface = &external, .context = &external_context },
+            .dynamic_child = .{
+                .interface = &Interface.info,
+                .version = 1,
+                .context = &dynamic_context,
+            },
+        },
+    );
+    const message = try firstMessage(&transmit_queue);
+    const event = try wayring.client.decodeEvent(
+        Interface,
+        &client_objects,
+        client_parent,
+        message,
+        &received_fds,
+    );
+    const payload = switch (event) {
+        .spawn_children => |value| value,
+    };
+    try std.testing.expectEqual(constructed.local_child.id, payload.local_child);
+    try std.testing.expectEqual(constructed.external_child.id, payload.external_child);
+    try std.testing.expectEqual(constructed.dynamic_child.id, payload.dynamic_child.id);
+
+    const occupied = try client_objects.insertPeer(
+        constructed.external_child.id,
+        &external,
+        1,
+        null,
+    );
+    try std.testing.expectError(
+        error.DuplicateId,
+        Interface.admit_event_spawn_children(
+            &client_objects,
+            client_parent,
+            payload,
+            .{
+                .local_child = &local_context,
+                .external_child = .{ .interface = &external, .context = &external_context },
+                .dynamic_child = .{ .interface = &Interface.info, .context = &dynamic_context },
+            },
+        ),
+    );
+    try std.testing.expect(client_objects.namespace.get(constructed.local_child.id) == null);
+    _ = try client_objects.removePeer(occupied);
+
+    const admitted = try Interface.admit_event_spawn_children(
+        &client_objects,
+        client_parent,
+        payload,
+        .{
+            .local_child = &local_context,
+            .external_child = .{ .interface = &external, .context = &external_context },
+            .dynamic_child = .{ .interface = &Interface.info, .context = &dynamic_context },
+        },
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &local_context),
+        client_objects.namespace.resolve(admitted.local_child).?.context,
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &external_context),
+        client_objects.namespace.resolve(admitted.external_child).?.context,
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &dynamic_context),
+        client_objects.namespace.resolve(admitted.dynamic_child).?.context,
+    );
+    try consume(&transmit_queue);
+}
+
 test "compositor binding creates and destroys a surface resource" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
     defer blocks.deinit(std.testing.allocator);

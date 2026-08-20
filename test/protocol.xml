@@ -88,5 +88,10 @@
       <arg name="external_child" type="new_id" interface="wp_external_v1"/>
       <arg name="dynamic_child" type="new_id"/>
     </request>
+    <event name="spawn_children">
+      <arg name="local_child" type="new_id" interface="wp_wayring_test_v1"/>
+      <arg name="external_child" type="new_id" interface="wp_external_v1"/>
+      <arg name="dynamic_child" type="new_id"/>
+    </event>
   </interface>
 </protocol>
