@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wayring_test">
+  <interface name="wl_display" version="1">
+    <request name="sync">
+      <arg name="callback" type="new_id" interface="wl_callback"/>
+    </request>
+    <request name="get_registry">
+      <arg name="registry" type="new_id" interface="wl_registry"/>
+    </request>
+    <event name="error">
+      <arg name="object_id" type="object" allow-null="true"/>
+      <arg name="code" type="uint"/>
+      <arg name="message" type="string"/>
+    </event>
+    <event name="delete_id">
+      <arg name="id" type="uint"/>
+    </event>
+  </interface>
+  <interface name="wl_registry" version="1">
+    <request name="bind">
+      <arg name="name" type="uint"/>
+      <arg name="id" type="new_id"/>
+    </request>
+    <event name="global">
+      <arg name="name" type="uint"/>
+      <arg name="interface" type="string"/>
+      <arg name="version" type="uint"/>
+    </event>
+    <event name="global_remove">
+      <arg name="name" type="uint"/>
+    </event>
+  </interface>
+  <interface name="wl_callback" version="1">
+    <event name="done" type="destructor">
+      <arg name="callback_data" type="uint"/>
+    </event>
+  </interface>
+  <interface name="wp_wayring_other_v1" version="1">
+    <enum name="direction">
+      <entry name="backward" value="-1"/>
+      <entry name="forward" value="1"/>
+    </enum>
+  </interface>
+  <interface name="wp_wayring_test_v1" version="1">
+    <enum name="mode" bitfield="true">
+      <entry name="first" value="1"/>
+      <entry name="second" value="2"/>
+    </enum>
+    <request name="all_arguments">
+      <arg name="signed" type="int"/>
+      <arg name="count" type="uint" enum="mode"/>
+      <arg name="fixed_value" type="fixed"/>
+      <arg name="title" type="string"/>
+      <arg name="optional_title" type="string" allow-null="true"/>
+      <arg name="target" type="object" allow-null="true"/>
+      <arg name="child" type="new_id" interface="wp_wayring_test_v1"/>
+      <arg name="dynamic_child" type="new_id"/>
+      <arg name="bytes" type="array"/>
+      <arg name="optional_bytes" type="array" allow-null="true"/>
+      <arg name="descriptor" type="fd"/>
+    </request>
+    <request name="set_title">
+      <arg name="title" type="string"/>
+    </request>
+    <request name="set_target">
+      <arg name="target" type="object"/>
+    </request>
+    <request name="set_direction">
+      <arg name="direction" type="int" enum="wp_wayring_other_v1.direction"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>

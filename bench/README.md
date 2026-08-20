@@ -1,0 +1,97 @@
+# Transport benchmarks
+
+The benchmark sends a private 12-byte Wayland `ping(uint)` request from one
+process to another and waits for one `pong(uint)` after each phase. The raw
+Unix-stream implementation is a lower-bound control; libwayland measures its
+normal generated stub, buffering, marshalling, event-loop, and dispatch path.
+The `wayring-multishot` backend uses io_uring `sendmsg` and a persistent
+multishot `recvmsg` with a provided-buffer ring. It validates every frame and
+directly decodes and dispatches its integer argument. Responses use the
+generated direct-to-TX encoder, which reserves shared blocks and avoids an
+intermediate frame copy. The receive path retains
+the ancillary-data layout needed for SCM_RIGHTS rather than substituting plain
+`recv` for easier benchmark numbers. Before timing, it sends a real descriptor
+through SCM_RIGHTS, queues it on the receiver's ordered FD lane, and verifies
+that it arrived with close-on-exec set. The server runs through the bounded
+connection actor and generation-checked CQE dispatcher, coalesces queued output
+behind a single active send SQE, and cancels its multishot receive before
+unregistering buffers.
+
+Build with `zig build benchmarks`, or run all three implementations directly:
+
+```sh
+bench/run.sh throughput
+bench/run.sh perf
+bench/run.sh syscalls
+bench/run.sh multi
+bench/run.sh multi-syscalls
+bench/run.sh latency
+bench/run.sh client
+bench/run.sh client-perf
+bench/run.sh client-syscalls
+bench/run.sh interop
+bench/run.sh interop-perf
+bench/run.sh interop-syscalls
+bench/run.sh interop-latency
+```
+
+Configure a run through environment variables:
+
+```sh
+MESSAGES=5000000 BATCH=256 WARMUP=200000 REPEATS=10 bench/run.sh throughput
+CONNECTIONS=32 MESSAGES=100000 bench/run.sh multi
+CONNECTIONS=8 LATENCY_MESSAGES=10000 LATENCY_WARMUP=1000 bench/run.sh latency
+```
+
+The multi-connection modes compare Wayring and libwayland across identical
+socket counts and messages per connection. Wayring uses one io_uring instance
+in each process across all socket pairs. Every server multishot receive selects
+from one provided-buffer group, and all connection actors share the fragment
+and transmit pools. Server object dispatch also uses one shared physical node
+pool with connection-scoped namespaces. `MESSAGES` and `WARMUP` are per
+connection; the reported message count and throughput are aggregate. Wayring
+client send SQEs for every connection are submitted together once per batch;
+libwayland queues the same requests before flushing each display. Connection
+counts are limited to 64.
+
+Client transmit mode isolates request encoding, buffering, and socket output
+from server protocol dispatch. Each implementation sends generated `ping`
+requests to a raw peer that only drains and acknowledges the exact wire-byte
+count for each phase. The acknowledgement is included in the timing so a fast
+client cannot report bytes that remain buffered after the sample. Wayring uses
+its generated direct encoder, shared TX blocks, persistent reactor send state,
+and io_uring submission; libwayland uses its generated client stub and normal
+blocking flush path. Setup traffic and allocator initialization occur before
+the warmup and timed phases.
+
+Client receive mode reverses the setup: a raw peer writes complete generated
+`pong` events, and the timed client validates object metadata, frames each
+message, decodes the typed event, and invokes its handler. Wayring exercises
+the production multishot receiver, provided-buffer ring, connection actor,
+namespace, and generic event dispatcher. Libwayland uses its normal display
+dispatch and generated listener. The peer waits at phase boundaries, excluding
+setup and warmup traffic from the sample.
+
+Latency mode measures complete ping/pong rounds and reports mean, p50, p95,
+p99, and maximum nanoseconds. With one connection this is normal round-trip
+latency. With multiple connections each round sends one ping to every socket
+and ends only after every pong is dispatched, so the distribution measures
+all-client round latency rather than claiming to measure independent one-way
+latencies. Setup and `LATENCY_WARMUP` rounds are excluded.
+
+`perf` records CPU, scheduling, page-fault, and hardware-counter metrics for
+the process tree. `syscalls` uses `strace -f -c` to report syscall counts and
+must not be used for timing comparisons because tracing changes execution.
+Syscall totals include process setup and warmup; use a large message count so
+those fixed costs become negligible. Throughput mode defaults to five
+interleaved raw/libwayland/Wayring samples.
+
+Mixed interoperability mode runs both pairings: a libwayland client against a
+Wayring server and a Wayring client against a libwayland server. Both complete
+the normal display registry round trip, advertise and bind the private global,
+apply callback destruction and `delete_id`, and then exchange typed generated
+requests and events. Before timing, each pairing also transfers an eventfd in
+both directions through generated `fd` arguments and verifies close-on-exec.
+The measurements are useful for validating real wire
+compatibility and finding asymmetric runtime costs; they are not a direct
+replacement for the symmetric implementation comparisons above.

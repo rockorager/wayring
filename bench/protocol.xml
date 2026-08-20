@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wayring_benchmark">
+  <interface name="wp_wayring_benchmark_v1" version="1">
+    <description summary="private transport benchmark protocol">
+      This protocol exists only to measure transport and dispatch overhead.
+    </description>
+    <request name="ping">
+      <arg name="sequence" type="uint"/>
+    </request>
+    <request name="ping_fd">
+      <arg name="sequence" type="uint"/>
+      <arg name="descriptor" type="fd"/>
+    </request>
+    <event name="pong">
+      <arg name="sequence" type="uint"/>
+    </event>
+    <event name="pong_fd">
+      <arg name="sequence" type="uint"/>
+      <arg name="descriptor" type="fd"/>
+    </event>
+  </interface>
+</protocol>
