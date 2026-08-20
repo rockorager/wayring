@@ -399,6 +399,15 @@ pub fn Core(comptime protocol: type) type {
             object_id: ?u32,
             cause: anyerror,
         ) RequestResult {
+            if (cause == error.Disconnected) {
+                actor.beginClose();
+                return .{ .terminal = .{
+                    .dispatched = dispatched,
+                    .object_id = object_id,
+                    .cause = cause,
+                    .error_queued = false,
+                } };
+            }
             var error_queued = actor.lifecycle == .draining;
             if (actor.canDispatch()) {
                 postError(

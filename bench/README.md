@@ -133,3 +133,8 @@ pairing performs registry binding, `wl_compositor` surface creation,
 configure/ack, synchronization, and ordered destruction. This validates
 production protocol object and version lifecycles independently of the private
 benchmark protocol.
+
+Shm interoperability mode drives a libwayland client against a Wayring server
+through `wl_shm` format advertisement, a close-on-exec shared-memory descriptor,
+pool and buffer construction, synchronization, and ordered destruction. It
+exercises production FD transfer and nested core object lifecycles.

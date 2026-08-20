@@ -342,8 +342,10 @@ ownership transitions. The server-side helper also converts malformed frames,
 invalid object or method lookups, resource exhaustion, and unhandled callback
 failures into the corresponding terminal `wl_display.error`; it reports the
 cause to the caller while leaving send draining and receive cancellation
-explicit. The eight-connection benchmark exercises the shared server namespace
-directly. Its
+explicit. Selected `recvmsg` EOF is detected from the decoded payload length,
+not the CQE result, because the latter includes io_uring's output metadata even
+when the stream payload is empty. The eight-connection benchmark exercises the
+shared server namespace directly. Its
 80-million-message median is about 97.4 million messages/second, versus 90.2
 million for the prior per-client table and about 3–5 million for libwayland in
 the same orb.

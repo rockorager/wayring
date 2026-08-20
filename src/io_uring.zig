@@ -605,6 +605,59 @@ test "reactor admits peers and closes descriptors rejected by capacity" {
     );
 }
 
+test "selected recvmsg detects stream EOF behind its metadata prefix" {
+    const allocator = std.testing.allocator;
+    var owner: Reactor = undefined;
+    try owner.initOwned(allocator, .{ .entries = 8 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 256,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 1,
+        .descriptor_count = 2,
+        .send_descriptor_capacity = 1,
+    });
+    defer owner.deinit(allocator);
+
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &sockets,
+    )));
+    const peer = try owner.attachReceiving(sockets[0], .{
+        .received_fd_budget = 1,
+        .transmit_byte_budget = 64,
+        .transmit_fd_budget = 1,
+    });
+    const actor = try owner.getActor(peer);
+    const receiver = try owner.getReceiver(peer);
+    _ = try owner.ring.submit();
+    _ = linux.close(sockets[1]);
+
+    const completion = try owner.ring.copy_cqe();
+    const routed = (owner.route(null, completion) orelse
+        return error.InvalidCompletion).connection;
+    const event = try actor.completeRouted(routed.operation, completion);
+    switch (event) {
+        .received => {
+            try std.testing.expectError(
+                error.Disconnected,
+                receiver.decodeCompletion(completion),
+            );
+            actor.beginClose();
+        },
+        .disconnected => {},
+        else => return error.InvalidCompletion,
+    }
+    try std.testing.expect(actor.canDeinit());
+    try owner.destroyPeer(peer);
+}
+
 /// Persistent state for one multishot accept operation. Accepted descriptor
 /// ownership transfers to the caller through `Event.accepted`.
 pub const Listener = struct {
@@ -1113,6 +1166,7 @@ pub const Receiver = struct {
             output.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC) != 0 or
             output.payloadlen != payload.len)
             return error.InvalidMessage;
+        if (payload.len == 0) return error.Disconnected;
 
         return .{ .completion = completion, .control = control, .payload = payload };
     }

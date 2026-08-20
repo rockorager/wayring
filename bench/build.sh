@@ -67,6 +67,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/libwayland-server.c" \
     "$root/bench/xdg-interop-client.c" \
     "$root/bench/xdg-interop-server.c" \
+    "$root/bench/shm-interop-client.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
