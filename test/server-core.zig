@@ -220,6 +220,117 @@ test "generic server requests finish generated destructor lifecycle" {
     try std.testing.expectEqual(@as(usize, 0), transmit_queue.queuedBytes());
 }
 
+test "generated server admission transacts decoded new IDs" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var receive_queue = wayring.tx.Queue.init(&blocks, 128, &descriptors, 0);
+    defer receive_queue.deinit();
+    var object_pool = try wayring.objects.SharedObjectPool.init(std.testing.allocator, 6);
+    defer object_pool.deinit(std.testing.allocator);
+    var buckets = [_]wayring.objects.SharedObjectBucket{.{}} ** 8;
+    var server_objects = try wayring.objects.SharedServerObjects.init(
+        &object_pool,
+        &buckets,
+        1,
+        6,
+        &Core.Display.info,
+        null,
+    );
+    defer server_objects.deinit();
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    const Interface = protocol.wp_wayring_test_v1;
+    const external: wayring.metadata.Interface = .{
+        .name = "wp_external_v1",
+        .version = 3,
+        .requests = &.{},
+        .events = &.{},
+    };
+    const parent = try server_objects.insertClient(2, &Interface.info, 1, null);
+    var local_context: u8 = 1;
+    var external_context: u8 = 2;
+    var dynamic_context: u8 = 3;
+
+    try Interface.encodeRequest(&receive_queue, parent.id, .{ .construct_children = .{
+        .local_child = 3,
+        .external_child = 4,
+        .dynamic_child = .{
+            .interface = Interface.info.name,
+            .version = 1,
+            .id = parent.id,
+        },
+    } });
+    var decoded = try wayring.server.decodeRequest(
+        Interface,
+        &server_objects,
+        try firstMessage(&receive_queue),
+        &received_fds,
+    );
+    try consume(&receive_queue);
+    try std.testing.expectError(error.WrongInterface, Interface.admit_construct_children(
+        &server_objects,
+        decoded.handle,
+        decoded.value.construct_children,
+        .{
+            .local_child = &local_context,
+            .external_child = .{ .interface = &Interface.info },
+            .dynamic_child = .{ .interface = &Interface.info },
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), server_objects.namespace.len());
+    try std.testing.expectError(error.DuplicateId, Interface.admit_construct_children(
+        &server_objects,
+        decoded.handle,
+        decoded.value.construct_children,
+        .{
+            .local_child = &local_context,
+            .external_child = .{ .interface = &external, .context = &external_context },
+            .dynamic_child = .{ .interface = &Interface.info, .context = &dynamic_context },
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), server_objects.namespace.len());
+    try std.testing.expect(server_objects.namespace.get(3) == null);
+    try std.testing.expect(server_objects.namespace.get(4) == null);
+
+    try Interface.encodeRequest(&receive_queue, parent.id, .{ .construct_children = .{
+        .local_child = 3,
+        .external_child = 4,
+        .dynamic_child = .{
+            .interface = Interface.info.name,
+            .version = 1,
+            .id = 5,
+        },
+    } });
+    decoded = try wayring.server.decodeRequest(
+        Interface,
+        &server_objects,
+        try firstMessage(&receive_queue),
+        &received_fds,
+    );
+    try consume(&receive_queue);
+    const admitted = try Interface.admit_construct_children(
+        &server_objects,
+        decoded.handle,
+        decoded.value.construct_children,
+        .{
+            .local_child = &local_context,
+            .external_child = .{ .interface = &external, .context = &external_context },
+            .dynamic_child = .{ .interface = &Interface.info, .context = &dynamic_context },
+        },
+    );
+    const local = server_objects.namespace.resolve(admitted.local_child).?;
+    try std.testing.expectEqual(&Interface.info, local.interface);
+    try std.testing.expectEqual(@as(?*anyopaque, &local_context), local.context);
+    const external_object = server_objects.namespace.resolve(admitted.external_child).?;
+    try std.testing.expectEqual(&external, external_object.interface);
+    try std.testing.expectEqual(@as(u32, 1), external_object.version);
+    try std.testing.expectEqual(@as(?*anyopaque, &external_context), external_object.context);
+    const dynamic = server_objects.namespace.resolve(admitted.dynamic_child).?;
+    try std.testing.expectEqual(&Interface.info, dynamic.interface);
+    try std.testing.expectEqual(@as(?*anyopaque, &dynamic_context), dynamic.context);
+}
+
 test "generic server events commit generated destructor lifecycle atomically" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 3);
     defer blocks.deinit(std.testing.allocator);

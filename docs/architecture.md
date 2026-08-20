@@ -60,6 +60,14 @@ constructor validates its XML interface name before allocating an ID. This
 keeps cross-protocol references explicit without runtime reflection or
 steady-state allocation.
 
+The server-side counterpart leaves decoding free of application policy, then
+admits all decoded `new_id` values in one generated transaction. Applications
+supply child contexts and metadata for dynamic or cross-protocol interfaces;
+the helper validates interface names and negotiated versions, inserts every
+client-selected ID, and removes earlier children if any later insertion fails.
+Handlers therefore receive generation-tagged handles without manually
+reimplementing multi-object rollback.
+
 Each generated interface also exports compact immutable metadata: its maximum
 version and each request/event's introduction version and destructor bit.
 Object dispatch resolves the sender ID to an interface and negotiated version,

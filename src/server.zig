@@ -9,6 +9,13 @@ const objects = @import("objects.zig");
 const tx = @import("tx.zig");
 const wire = @import("wire.zig");
 
+/// Metadata and application state assigned while admitting a decoded
+/// `new_id` whose interface is not statically available in this module.
+pub const NewObject = struct {
+    interface: *const metadata.Interface,
+    context: ?*anyopaque = null,
+};
+
 pub const GlobalError = objects.Error || metadata.Error || error{
     NameExhausted,
     UnknownGlobal,
