@@ -376,6 +376,11 @@ performs message-path allocation.
 Relative display names can be resolved under a supplied runtime directory into
 caller storage; absolute names and inherited descriptors remain supported
 without consulting hidden process-global configuration.
+The standard client bootstrap helper likewise takes an explicit Zig
+environment value and caller storage. It honors inherited `WAYLAND_SOCKET`
+before resolving `WAYLAND_DISPLAY` (defaulting to `wayland-0`) under
+`XDG_RUNTIME_DIR`, and returns a configured nonblocking close-on-exec descriptor
+without allocating.
 
 Admission consumes an accepted descriptor and acquires the next free generation
 slot in O(1), producing a compact generation-tagged peer handle. Sockets, actors,

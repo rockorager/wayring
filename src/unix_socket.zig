@@ -13,6 +13,8 @@ pub const Error = error{
     NotFound,
     PermissionDenied,
     BufferTooSmall,
+    MissingRuntimeDirectory,
+    InvalidDescriptor,
     SystemCallFailed,
 };
 
@@ -84,6 +86,35 @@ pub fn connect(path: []const u8) Error!linux.fd_t {
     try check(linux.connect(fd, &address.value, address.len));
     try configure(fd);
     return fd;
+}
+
+/// Resolves and opens the standard Wayland client transport without allocation
+/// or process-global environment access. WAYLAND_SOCKET takes precedence; its
+/// inherited descriptor is configured in place. Otherwise WAYLAND_DISPLAY
+/// defaults to "wayland-0" and relative names require XDG_RUNTIME_DIR.
+/// Successful return transfers descriptor ownership to the caller.
+pub fn connectEnvironment(
+    storage: []u8,
+    environ: std.process.Environ,
+) Error!linux.fd_t {
+    if (std.process.Environ.getPosix(environ, "WAYLAND_SOCKET")) |value| {
+        const descriptor = std.fmt.parseUnsigned(u32, value, 10) catch
+            return error.InvalidDescriptor;
+        if (descriptor > std.math.maxInt(linux.fd_t)) return error.InvalidDescriptor;
+        const fd: linux.fd_t = @intCast(descriptor);
+        configure(fd) catch return error.InvalidDescriptor;
+        _ = peerCredentials(fd) catch return error.InvalidDescriptor;
+        return fd;
+    }
+
+    const display_name = std.process.Environ.getPosix(environ, "WAYLAND_DISPLAY") orelse
+        "wayland-0";
+    const runtime_directory = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR") orelse
+        if (display_name.len > 0 and display_name[0] == '/')
+            ""
+        else
+            return error.MissingRuntimeDirectory;
+    return connect(try resolveDisplayPath(storage, runtime_directory, display_name));
 }
 
 /// Binds a close-on-exec, nonblocking Unix stream listener without unlinking an
@@ -221,5 +252,70 @@ test "resolves relative and absolute Wayland display paths" {
     try std.testing.expectError(
         error.BufferTooSmall,
         resolveDisplayPath(storage[0..4], "/tmp", "wayland-0"),
+    );
+}
+
+test "connects from an explicit Wayland environment" {
+    const allocator = std.testing.allocator;
+    var path_storage: [100]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_storage,
+        "/tmp/wayring-environment-test-{d}",
+        .{linux.getpid()},
+    );
+    unlink(path) catch |err| if (err != error.NotFound) return err;
+    defer unlink(path) catch {};
+    const listener = try listen(path, 1);
+    defer _ = linux.close(listener);
+
+    var environment_map: std.process.Environ.Map = .init(allocator);
+    defer environment_map.deinit();
+    try environment_map.put("XDG_RUNTIME_DIR", "/tmp");
+    try environment_map.put("WAYLAND_DISPLAY", std.fs.path.basename(path));
+    const environment: std.process.Environ = .{
+        .block = try environment_map.createPosixBlock(allocator, .{}),
+    };
+    defer environment.block.deinit(allocator);
+
+    var resolved: [108]u8 = undefined;
+    const client = try connectEnvironment(&resolved, environment);
+    defer _ = linux.close(client);
+    const accepted_result = linux.accept4(
+        listener,
+        null,
+        null,
+        linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+    );
+    try check(accepted_result);
+    _ = linux.close(@intCast(accepted_result));
+}
+
+test "configures WAYLAND_SOCKET from an explicit environment" {
+    const allocator = std.testing.allocator;
+    var sockets: [2]linux.fd_t = undefined;
+    try check(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &sockets));
+    defer _ = linux.close(sockets[0]);
+    defer _ = linux.close(sockets[1]);
+
+    var descriptor_storage: [16]u8 = undefined;
+    const descriptor = try std.fmt.bufPrint(&descriptor_storage, "{d}", .{sockets[0]});
+    var environment_map: std.process.Environ.Map = .init(allocator);
+    defer environment_map.deinit();
+    try environment_map.put("WAYLAND_SOCKET", descriptor);
+    try environment_map.put("WAYLAND_DISPLAY", "ignored");
+    const environment: std.process.Environ = .{
+        .block = try environment_map.createPosixBlock(allocator, .{}),
+    };
+    defer environment.block.deinit(allocator);
+
+    var path_storage: [108]u8 = undefined;
+    try std.testing.expectEqual(sockets[0], try connectEnvironment(&path_storage, environment));
+    const status: linux.O = @bitCast(@as(u32, @intCast(linux.fcntl(sockets[0], linux.F.GETFL, 0))));
+    try std.testing.expect(status.NONBLOCK);
+    try std.testing.expect(linux.fcntl(sockets[0], linux.F.GETFD, 0) & linux.FD_CLOEXEC != 0);
+
+    try std.testing.expectError(
+        error.MissingRuntimeDirectory,
+        connectEnvironment(&path_storage, .empty),
     );
 }
