@@ -8,6 +8,7 @@ struct benchmark_options {
 	uint64_t warmup;
 	uint64_t messages;
 	uint32_t batch;
+	uint32_t objects;
 	int latency;
 };
 

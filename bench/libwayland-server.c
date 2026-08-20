@@ -83,24 +83,36 @@ bind_benchmark(struct wl_client *client, void *data, uint32_t version,
 {
 	struct server_state *server = data;
 	struct connection_state *connection;
+	struct wl_listener *destroy_listener;
 	struct wl_resource *resource;
+	int new_connection = 0;
 
-	connection = calloc(1, sizeof *connection);
+	destroy_listener = wl_client_get_destroy_listener(client, handle_client_destroy);
+	if (destroy_listener == NULL) {
+		connection = calloc(1, sizeof *connection);
+		new_connection = 1;
+	} else {
+		connection = wl_container_of(
+			destroy_listener, connection, client_destroy);
+	}
 	resource = wl_resource_create(client, &wp_wayring_benchmark_v1_interface,
 	                              (int) version, id);
 	if (connection == NULL || resource == NULL) {
-		free(connection);
+		if (new_connection)
+			free(connection);
 		wl_client_post_no_memory(client);
 		return;
 	}
 
-	connection->server = server;
-	connection->next_ack = server->options->warmup;
-	connection->final_ack = server->options->warmup +
-	                        server->options->messages;
+	if (new_connection) {
+		connection->server = server;
+		connection->next_ack = server->options->warmup;
+		connection->final_ack = server->options->warmup +
+		                        server->options->messages;
+		connection->client_destroy.notify = handle_client_destroy;
+		wl_client_add_destroy_listener(client, &connection->client_destroy);
+	}
 	wl_resource_set_implementation(resource, &implementation, connection, NULL);
-	connection->client_destroy.notify = handle_client_destroy;
-	wl_client_add_destroy_listener(client, &connection->client_destroy);
 }
 
 int

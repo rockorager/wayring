@@ -21,6 +21,7 @@ Build with `zig build benchmarks`, or run all three implementations directly:
 
 ```sh
 bench/run.sh throughput
+bench/run.sh objects
 bench/run.sh perf
 bench/run.sh syscalls
 bench/run.sh multi
@@ -40,6 +41,7 @@ Configure a run through environment variables:
 ```sh
 MESSAGES=5000000 BATCH=256 WARMUP=200000 REPEATS=10 bench/run.sh throughput
 CONNECTIONS=32 MESSAGES=100000 bench/run.sh multi
+OBJECTS=64 MESSAGES=5000000 bench/run.sh objects
 CONNECTIONS=8 LATENCY_MESSAGES=10000 LATENCY_WARMUP=1000 bench/run.sh latency
 ```
 
@@ -53,6 +55,12 @@ connection; the reported message count and throughput are aggregate. Wayring
 client send SQEs for every connection are submitted together once per batch;
 libwayland queues the same requests before flushing each display. Connection
 counts are limited to 64.
+
+Object mode binds or installs multiple instances of the benchmark interface and
+round-robins requests across them. This defeats Wayring's last-object lookup
+cache and measures object-table dispatch rather than repeatedly targeting one
+hot resource. Resource setup is excluded from timing; object counts are limited
+to 64.
 
 Client transmit mode isolates request encoding, buffering, and socket output
 from server protocol dispatch. Each implementation sends generated `ping`

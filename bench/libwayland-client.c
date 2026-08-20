@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
-enum { max_connections = 64 };
+enum { max_connections = 64, max_objects = 64 };
 
 #ifdef WAYRING_PEER_ONLY
 #define MAIN_ONLY __attribute__((unused))
@@ -28,6 +28,11 @@ struct client_state {
 	struct wl_display *display;
 	struct wl_registry *registry;
 	struct wp_wayring_benchmark_v1 *benchmark;
+	struct wp_wayring_benchmark_v1 *benchmarks[max_objects];
+	uint32_t benchmark_global;
+	uint32_t benchmark_version;
+	uint32_t object_count;
+	uint32_t object_cursor;
 	uint32_t ack;
 	uint64_t received;
 	int fd_valid;
@@ -142,9 +147,12 @@ handle_global(void *data, struct wl_registry *registry, uint32_t name,
 	struct client_state *state = data;
 
 	if (strcmp(interface, wp_wayring_benchmark_v1_interface.name) == 0) {
+		state->benchmark_global = name;
+		state->benchmark_version = version < 1 ? version : 1;
 		state->benchmark = wl_registry_bind(
 			registry, name, &wp_wayring_benchmark_v1_interface,
-			version < 1 ? version : 1);
+			state->benchmark_version);
+		state->benchmarks[0] = state->benchmark;
 	}
 }
 
@@ -195,8 +203,11 @@ static int run_latency(struct client_state *states, size_t connections,
                        struct benchmark_result *result);
 
 static int
-connect_client(struct client_state *state, int fd)
+connect_client(struct client_state *state, int fd,
+               const struct benchmark_options *options)
 {
+	uint32_t i;
+
 	state->display = wl_display_connect_to_fd(fd);
 	if (state->display == NULL)
 		return -1;
@@ -204,9 +215,20 @@ connect_client(struct client_state *state, int fd)
 	wl_registry_add_listener(state->registry, &registry_listener, state);
 	if (wl_display_roundtrip(state->display) < 0 || state->benchmark == NULL)
 		return -1;
-	wp_wayring_benchmark_v1_set_user_data(state->benchmark, state);
-	wp_wayring_benchmark_v1_add_listener(state->benchmark,
-	                                     &benchmark_listener, state);
+	state->object_count = options->objects;
+	for (i = 1; i < state->object_count; i++)
+		state->benchmarks[i] = wl_registry_bind(
+			state->registry, state->benchmark_global,
+			&wp_wayring_benchmark_v1_interface, state->benchmark_version);
+	for (i = 0; i < state->object_count; i++) {
+		if (state->benchmarks[i] == NULL)
+			return -1;
+		wp_wayring_benchmark_v1_set_user_data(state->benchmarks[i], state);
+		wp_wayring_benchmark_v1_add_listener(
+			state->benchmarks[i], &benchmark_listener, state);
+	}
+	if (flush_blocking(state->display) < 0)
+		return -1;
 	return 0;
 }
 
@@ -232,9 +254,15 @@ send_phase(struct client_state *states, size_t connections, uint64_t count,
 		uint64_t i;
 
 		for (connection = 0; connection < connections; connection++) {
-			for (i = 0; i < chunk; i++)
+			for (i = 0; i < chunk; i++) {
 				wp_wayring_benchmark_v1_ping(
-					states[connection].benchmark, ack);
+					states[connection].benchmarks[
+						states[connection].object_cursor], ack);
+				states[connection].object_cursor++;
+				if (states[connection].object_cursor ==
+				    states[connection].object_count)
+					states[connection].object_cursor = 0;
+			}
 		}
 		for (connection = 0; connection < connections; connection++) {
 			if (flush_blocking(states[connection].display) < 0)
@@ -268,9 +296,10 @@ benchmark_client_fd(int fd, const struct benchmark_options *options,
 	result->p99_ns = 0;
 	result->max_ns = 0;
 	if (options == NULL || options->warmup == 0 || options->messages == 0 ||
-	    options->batch == 0)
+	    options->batch == 0 || options->objects == 0 ||
+	    options->objects > max_objects)
 		return EXIT_FAILURE;
-	if (connect_client(&state, fd) < 0)
+	if (connect_client(&state, fd, options) < 0)
 		goto cleanup;
 	descriptor = eventfd(0, EFD_CLOEXEC);
 	if (descriptor < 0)
@@ -300,8 +329,9 @@ benchmark_client_fd(int fd, const struct benchmark_options *options,
 	status = EXIT_SUCCESS;
 
 cleanup:
-	if (state.benchmark != NULL)
-		wp_wayring_benchmark_v1_destroy(state.benchmark);
+	while (state.object_count > 0)
+		wp_wayring_benchmark_v1_destroy(
+			state.benchmarks[--state.object_count]);
 	if (state.registry != NULL)
 		wl_registry_destroy(state.registry);
 	if (state.display != NULL)
@@ -580,6 +610,7 @@ main(int argc, char **argv)
 		.warmup = 100000,
 		.messages = 1000000,
 		.batch = 256,
+		.objects = 1,
 	};
 	struct client_state *states;
 	int (*sockets)[2];
@@ -607,13 +638,18 @@ main(int argc, char **argv)
 			client_tx = 1;
 		} else if (strcmp(argv[5], "client-rx") == 0) {
 			client_rx = 1;
-		} else {
+		} else if (strcmp(argv[5], "round-trip") != 0) {
 			fprintf(stderr, "invalid benchmark mode: %s\n", argv[5]);
 			return EXIT_FAILURE;
 		}
 	}
+	if (argc > 6)
+		options.objects = (uint32_t) parse_count(argv[6], "object count");
 	if (options.messages == 0 || options.batch == 0 || options.warmup == 0 ||
+	    options.objects == 0 || options.objects > max_objects ||
 	    connections == 0 || connections > max_connections ||
+	    (options.objects > 1 &&
+	     (connections != 1 || options.latency || client_tx || client_rx)) ||
 	    (options.latency && options.messages + options.warmup > UINT32_MAX)) {
 		fprintf(stderr, "counts must be nonzero and connections at most 64\n");
 		return EXIT_FAILURE;
@@ -659,7 +695,7 @@ main(int argc, char **argv)
 	}
 	for (i = 0; i < connections; i++) {
 		close(sockets[i][1]);
-		if (connect_client(&states[i], sockets[i][0]) < 0) {
+		if (connect_client(&states[i], sockets[i][0], &options) < 0) {
 			fprintf(stderr, "failed to connect libwayland client\n");
 			return EXIT_FAILURE;
 		}
@@ -684,15 +720,17 @@ main(int argc, char **argv)
 		}
 		elapsed = monotonic_ns() - start;
 		total_messages = options.messages * connections;
-		printf("backend=libwayland connections=%" PRIu64
+		printf("backend=libwayland connections=%" PRIu64 " objects=%" PRIu32
 		       " messages=%" PRIu64 " batch=%" PRIu32
 		       " elapsed_ns=%" PRIu64 " messages_per_second=%.0f\n",
-		       connections, total_messages, options.batch, elapsed,
+		       connections, options.objects, total_messages, options.batch, elapsed,
 		       (double) total_messages * 1000000000.0 / (double) elapsed);
 	}
 
 	for (i = 0; i < connections; i++) {
-		wp_wayring_benchmark_v1_destroy(states[i].benchmark);
+		while (states[i].object_count > 0)
+			wp_wayring_benchmark_v1_destroy(
+				states[i].benchmarks[--states[i].object_count]);
 		wl_registry_destroy(states[i].registry);
 		wl_display_disconnect(states[i].display);
 	}

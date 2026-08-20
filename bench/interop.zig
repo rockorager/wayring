@@ -608,6 +608,7 @@ fn cOptions(options: Options) ffi.struct_benchmark_options {
         .warmup = options.warmup,
         .messages = options.messages,
         .batch = options.batch,
+        .objects = 1,
         .latency = @intFromBool(options.latency),
     };
 }

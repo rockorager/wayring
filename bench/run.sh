@@ -7,6 +7,7 @@ batch=${BATCH:-256}
 warmup=${WARMUP:-100000}
 repeats=${REPEATS:-5}
 connections=${CONNECTIONS:-8}
+objects=${OBJECTS:-64}
 latency_messages=${LATENCY_MESSAGES:-10000}
 latency_warmup=${LATENCY_WARMUP:-1000}
 mode=${1:-throughput}
@@ -27,6 +28,17 @@ case "$mode" in
         while [ "$sample" -le "$repeats" ]; do
             echo "# sample=$sample" >&2
             run_all env
+            sample=$((sample + 1))
+        done
+        ;;
+    objects)
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample objects=$objects" >&2
+            "$root/zig-out/bench/libwayland-ping" \
+                "$messages" "$batch" "$warmup" 1 round-trip "$objects"
+            "$root/zig-out/bench/wayring-ping" \
+                "$messages" "$batch" "$warmup" 1 round-trip "$objects"
             sample=$((sample + 1))
         done
         ;;
@@ -141,7 +153,7 @@ case "$mode" in
         done
         ;;
     *)
-        echo "usage: $0 [throughput|perf|syscalls|multi|multi-syscalls|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency]" >&2
         exit 2
         ;;
 esac

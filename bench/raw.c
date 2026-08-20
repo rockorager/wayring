@@ -135,6 +135,7 @@ main(int argc, char **argv)
 		.warmup = 100000,
 		.messages = 1000000,
 		.batch = 256,
+		.objects = 1,
 	};
 	uint64_t start, elapsed;
 	int sockets[2], child_status;

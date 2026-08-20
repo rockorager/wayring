@@ -21,6 +21,7 @@ const recv_buffer_size = 64 * 1024;
 const ring_entries = 8;
 const multi_ring_entries = 256;
 const max_connections = 64;
+const max_objects = 64;
 const recv_buffer_count = 8;
 const control_size = 256;
 const buffer_group_id = 1;
@@ -43,6 +44,7 @@ const Options = struct {
     messages: u64 = 1_000_000,
     batch: u32 = 256,
     connections: usize = 1,
+    objects: usize = 1,
     mode: Mode = .round_trip,
 };
 
@@ -199,17 +201,18 @@ fn sendActorResponse(
     owner: *IoReactor,
     peer: wayring.io_uring.Peer,
     actor: *connection.Actor,
+    response_object: u32,
     sequence: u32,
 ) !void {
-    try Benchmark.encodeEvent(&actor.transmit, object_id, .{
+    try Benchmark.encodeEvent(&actor.transmit, response_object, .{
         .pong = .{ .sequence = sequence },
     });
     try flushActorSend(owner, peer, actor);
 }
 
-fn encodeMessage(bytes: *[message_size]u8, opcode: u16, sequence: u32) !void {
+fn encodeMessage(bytes: *[message_size]u8, id: u32, opcode: u16, sequence: u32) !void {
     try (wire.Header{
-        .object_id = object_id,
+        .object_id = id,
         .opcode = opcode,
         .size = message_size,
     }).encode(bytes[0..wire.header_len]);
@@ -220,7 +223,12 @@ fn nativeEndian() std.builtin.Endian {
     return @import("builtin").cpu.arch.endian();
 }
 
-fn receiveMessage(ring: *Ring, fd: c.fd_t, storage: *[message_size]u8) !u32 {
+fn receiveMessage(
+    ring: *Ring,
+    fd: c.fd_t,
+    storage: *[message_size]u8,
+    object_count: usize,
+) !u32 {
     var filled: usize = 0;
     var control: [256]u8 align(@alignOf(linux.cmsghdr)) = undefined;
     while (filled < storage.len) {
@@ -228,7 +236,9 @@ fn receiveMessage(ring: *Ring, fd: c.fd_t, storage: *[message_size]u8) !u32 {
     }
 
     const message = (try wire.Message.decode(storage)) orelse return error.InvalidMessage;
-    if (message.header.object_id != object_id or message.header.opcode != 0)
+    if (message.header.object_id < object_id or
+        message.header.object_id >= object_id + @as(u32, @intCast(object_count)) or
+        message.header.opcode != 0)
         return error.InvalidMessage;
     var arguments = message.arguments();
     const sequence = try arguments.uint();
@@ -237,11 +247,13 @@ fn receiveMessage(ring: *Ring, fd: c.fd_t, storage: *[message_size]u8) !u32 {
 }
 
 fn sendPhase(
+    comptime varied_objects: bool,
     allocator: std.mem.Allocator,
     ring: *Ring,
     fd: c.fd_t,
     count: u64,
     batch: u32,
+    object_count: usize,
     sequence: u32,
 ) !void {
     const capacity = try std.math.mul(usize, batch, message_size);
@@ -249,18 +261,33 @@ fn sendPhase(
     defer allocator.free(buffer);
 
     var remaining = count;
+    var object_cursor: usize = 0;
     while (remaining > 0) {
         const chunk: usize = @intCast(@min(remaining, batch));
-        for (0..chunk) |index| {
-            const start = index * message_size;
-            try encodeMessage(buffer[start..][0..message_size], 0, sequence);
+        if (varied_objects) {
+            for (0..chunk) |index| {
+                const start = index * message_size;
+                try encodeMessage(
+                    buffer[start..][0..message_size],
+                    object_id + @as(u32, @intCast(object_cursor)),
+                    0,
+                    sequence,
+                );
+                object_cursor += 1;
+                if (object_cursor == object_count) object_cursor = 0;
+            }
+        } else {
+            for (0..chunk) |index| {
+                const start = index * message_size;
+                try encodeMessage(buffer[start..][0..message_size], object_id, 0, sequence);
+            }
         }
         try ring.sendAll(fd, buffer[0 .. chunk * message_size]);
         remaining -= chunk;
     }
 
     var response: [message_size]u8 = undefined;
-    if (try receiveMessage(ring, fd, &response) != sequence)
+    if (try receiveMessage(ring, fd, &response, object_count) != sequence)
         return error.InvalidMessage;
 }
 
@@ -410,6 +437,7 @@ fn rawWritePhase(
         const chunk: usize = @intCast(@min(remaining, batch));
         for (0..chunk) |index| try encodeMessage(
             storage[index * message_size ..][0..message_size],
+            object_id,
             0,
             sequence,
         );
@@ -548,15 +576,15 @@ fn clientReceiveMain(options: Options) !u8 {
 
 fn validateFdLane(ring: *Ring, fd: c.fd_t) !void {
     var request: [message_size]u8 = undefined;
-    try encodeMessage(&request, 1, 0);
+    try encodeMessage(&request, object_id, 1, 0);
     try ring.sendWithFds(fd, &request, &.{fd});
 
     var response: [message_size]u8 = undefined;
-    if (try receiveMessage(ring, fd, &response) != 0)
+    if (try receiveMessage(ring, fd, &response, 1) != 0)
         return error.InvalidMessage;
 }
 
-fn server(fd: c.fd_t, options: Options) !void {
+fn server(comptime varied_objects: bool, fd: c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = ring_entries }, .{
@@ -581,8 +609,13 @@ fn server(fd: c.fd_t, options: Options) !void {
     const actor = try owner.getActor(peer);
     const receiver = try owner.getReceiver(peer);
     const slots = owner.slots;
-    var namespace = try objects.Namespace.init(allocator, 8);
-    _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.info.version, null);
+    var namespace = try objects.Namespace.init(allocator, @max(options.objects, 8));
+    for (0..options.objects) |index| _ = try namespace.insert(
+        object_id + @as(u32, @intCast(index)),
+        &Benchmark.info,
+        Benchmark.info.version,
+        null,
+    );
     try receiver.arm(
         ring,
         fd,
@@ -593,6 +626,7 @@ fn server(fd: c.fd_t, options: Options) !void {
     var received: u64 = 0;
     var next_ack = options.warmup;
     const final_ack = options.warmup + options.messages;
+    const max_object_id = object_id + @as(u32, @intCast(options.objects));
 
     while (received < final_ack) {
         const input = try receiver.next(ring, fd, slots, actor);
@@ -600,7 +634,11 @@ fn server(fd: c.fd_t, options: Options) !void {
         _ = try actor.ingestControl(input.control);
         var payload = input.payload;
         while (try framer.next(&payload)) |message| {
-            if (message.header.object_id != object_id or message.header.opcode > 1)
+            if ((if (varied_objects)
+                message.header.object_id < object_id or message.header.object_id >= max_object_id
+            else
+                message.header.object_id != object_id) or
+                message.header.opcode > 1)
                 return error.InvalidMessage;
 
             if (message.header.opcode == 1) {
@@ -615,7 +653,7 @@ fn server(fd: c.fd_t, options: Options) !void {
                     descriptor_flags & linux.FD_CLOEXEC != 0;
                 _ = linux.close(received_fd);
                 if (!valid_fd) return error.InvalidMessage;
-                try sendActorResponse(&owner, peer, actor, sequence);
+                try sendActorResponse(&owner, peer, actor, object_id, sequence);
                 continue;
             }
 
@@ -627,7 +665,13 @@ fn server(fd: c.fd_t, options: Options) !void {
             };
             received += 1;
             if (received == next_ack) {
-                try sendActorResponse(&owner, peer, actor, sequence);
+                try sendActorResponse(
+                    &owner,
+                    peer,
+                    actor,
+                    message.header.object_id,
+                    sequence,
+                );
                 next_ack = final_ack;
             }
         }
@@ -969,7 +1013,7 @@ fn sendMultiPhase(
         const byte_count = chunk * message_size;
         for (0..chunk) |index| {
             const start = index * message_size;
-            try encodeMessage(buffer[start..][0..message_size], 0, sequence);
+            try encodeMessage(buffer[start..][0..message_size], object_id, 0, sequence);
         }
         @memset(written, std.math.maxInt(usize));
         for (fds, 0..) |fd, index| {
@@ -1005,7 +1049,7 @@ fn sendMultiPhase(
 
     for (fds) |fd| {
         var response: [message_size]u8 = undefined;
-        if (try receiveMessage(ring, fd, &response) != sequence)
+        if (try receiveMessage(ring, fd, &response, 1) != sequence)
             return error.InvalidMessage;
     }
 }
@@ -1019,7 +1063,7 @@ fn latencyMultiRound(
     messages: []linux.msghdr_const,
     written: []usize,
 ) !void {
-    try encodeMessage(request, 0, sequence);
+    try encodeMessage(request, object_id, 0, sequence);
     @memset(written, std.math.maxInt(usize));
     for (fds, 0..) |fd, index| {
         iovecs[index] = .{ .base = request, .len = request.len };
@@ -1051,7 +1095,7 @@ fn latencyMultiRound(
     }
     for (fds) |fd| {
         var response: [message_size]u8 = undefined;
-        if (try receiveMessage(ring, fd, &response) != sequence)
+        if (try receiveMessage(ring, fd, &response, 1) != sequence)
             return error.InvalidMessage;
     }
 }
@@ -1190,11 +1234,14 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .client_tx
         else if (std.mem.eql(u8, value, "client-rx"))
             options.mode = .client_rx
-        else
+        else if (!std.mem.eql(u8, value, "round-trip"))
             return error.InvalidMessage;
     }
+    if (iterator.next()) |value| options.objects = try std.fmt.parseUnsigned(usize, value, 10);
     if (options.messages == 0 or options.batch == 0 or options.warmup == 0 or
         options.connections == 0 or options.connections > max_connections or
+        options.objects == 0 or options.objects > max_objects or
+        (options.objects > 1 and (options.connections != 1 or options.mode != .round_trip)) or
         (options.mode == .latency and
             options.messages > std.math.maxInt(u32) - options.warmup) or
         ((options.mode == .client_tx or options.mode == .client_rx) and
@@ -1216,7 +1263,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (child < 0) return error.SystemCallFailed;
     if (child == 0) {
         _ = c.close(sockets[0]);
-        server(sockets[1], options) catch |err| {
+        (if (options.objects == 1)
+            server(false, sockets[1], options)
+        else
+            server(true, sockets[1], options)) catch |err| {
             const name = @errorName(err);
             _ = c.write(2, name.ptr, name.len);
             _ = c.write(2, "\n", 1);
@@ -1231,14 +1281,21 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const allocator = std.heap.c_allocator;
 
     try validateFdLane(&ring, sockets[0]);
-    try sendPhase(allocator, &ring, sockets[0], options.warmup, options.batch, 1);
+    if (options.objects == 1)
+        try sendPhase(false, allocator, &ring, sockets[0], options.warmup, options.batch, 1, 1)
+    else
+        try sendPhase(true, allocator, &ring, sockets[0], options.warmup, options.batch, options.objects, 1);
     const start = try monotonicNs();
-    try sendPhase(allocator, &ring, sockets[0], options.messages, options.batch, 2);
+    if (options.objects == 1)
+        try sendPhase(false, allocator, &ring, sockets[0], options.messages, options.batch, 1, 2)
+    else
+        try sendPhase(true, allocator, &ring, sockets[0], options.messages, options.batch, options.objects, 2);
     const elapsed = try monotonicNs() - start;
     _ = c.close(sockets[0]);
 
     _ = c.printf(
-        "backend=wayring-multishot messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+        "backend=wayring-multishot objects=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+        options.objects,
         options.messages,
         options.batch,
         elapsed,
