@@ -334,6 +334,88 @@ test "generated server admission transacts decoded new IDs" {
     try std.testing.expectEqual(@as(?*anyopaque, &dynamic_context), dynamic.context);
 }
 
+test "compositor binding creates and destroys a surface resource" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var receive_queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer receive_queue.deinit();
+    var transmit_queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer transmit_queue.deinit();
+    var object_pool = try wayring.objects.SharedObjectPool.init(std.testing.allocator, 5);
+    defer object_pool.deinit(std.testing.allocator);
+    var buckets = [_]wayring.objects.SharedObjectBucket{.{}} ** 8;
+    var server_objects = try wayring.objects.SharedServerObjects.init(
+        &object_pool,
+        &buckets,
+        1,
+        5,
+        &Core.Display.info,
+        null,
+    );
+    defer server_objects.deinit();
+    var removals: RemovalState = .{};
+    server_objects.setRemovalHook(.{ .context = &removals, .notify = removedObject });
+    var globals = try wayring.server.Globals.init(std.testing.allocator, 1);
+    defer globals.deinit(std.testing.allocator);
+    const global = try globals.add(&protocol.wl_compositor.info, 6, null);
+    const compositor = try Core.bindGlobal(&server_objects, &globals, .{ .bind = .{
+        .name = global.id,
+        .id = .{
+            .interface = protocol.wl_compositor.info.name,
+            .version = 4,
+            .id = 2,
+        },
+    } });
+    var surface_context: u8 = 1;
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+
+    try protocol.wl_compositor.encodeRequest(&receive_queue, compositor.id, .{
+        .create_surface = .{ .id = 3 },
+    });
+    const create = try wayring.server.decodeRequest(
+        protocol.wl_compositor,
+        &server_objects,
+        try firstMessage(&receive_queue),
+        &received_fds,
+    );
+    try consume(&receive_queue);
+    const admitted = try protocol.wl_compositor.admit_create_surface(
+        &server_objects,
+        create.handle,
+        create.value.create_surface,
+        .{ .id = &surface_context },
+    );
+    const surface = server_objects.namespace.resolve(admitted.id).?;
+    try std.testing.expectEqual(&protocol.wl_surface.info, surface.interface);
+    try std.testing.expectEqual(@as(u32, 4), surface.version);
+    try std.testing.expectEqual(@as(?*anyopaque, &surface_context), surface.context);
+
+    try protocol.wl_surface.encodeRequest(&receive_queue, admitted.id.id, .{
+        .destroy = .{},
+    });
+    const destroy = try wayring.server.decodeRequest(
+        protocol.wl_surface,
+        &server_objects,
+        try firstMessage(&receive_queue),
+        &received_fds,
+    );
+    try consume(&receive_queue);
+    try destroy.finish(protocol, &server_objects, &transmit_queue);
+    try std.testing.expect(server_objects.namespace.resolve(admitted.id) == null);
+    try std.testing.expectEqual(@as(usize, 1), removals.total);
+    const deleted = try Core.Display.decodeEvent(
+        try firstMessage(&transmit_queue),
+        &received_fds,
+    );
+    try std.testing.expectEqual(admitted.id.id, switch (deleted) {
+        .delete_id => |value| value.id,
+        else => unreachable,
+    });
+    try consume(&transmit_queue);
+}
+
 test "generic server events commit generated destructor lifecycle atomically" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 3);
     defer blocks.deinit(std.testing.allocator);

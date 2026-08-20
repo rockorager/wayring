@@ -35,6 +35,14 @@
       <arg name="callback_data" type="uint"/>
     </event>
   </interface>
+  <interface name="wl_compositor" version="6">
+    <request name="create_surface">
+      <arg name="id" type="new_id" interface="wl_surface"/>
+    </request>
+  </interface>
+  <interface name="wl_surface" version="6">
+    <request name="destroy" type="destructor"/>
+  </interface>
   <interface name="wp_wayring_other_v1" version="1">
     <enum name="direction">
       <entry name="backward" value="-1"/>
