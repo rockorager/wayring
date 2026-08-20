@@ -100,11 +100,11 @@ fn emitInterface(
 ) Error!void {
     try add(output, allocator, "pub const ");
     try identifier(output, allocator, interface.name);
-    try add(output, allocator, " = struct {\n    pub const version: u32 = ");
-    try unsigned(output, allocator, interface.version);
-    try add(output, allocator, ";\n    pub const info: metadata.Interface = .{\n        .name = \"");
+    try add(output, allocator, " = struct {\n    pub const info: metadata.Interface = .{\n        .name = \"");
     try add(output, allocator, interface.name);
-    try add(output, allocator, "\",\n        .version = version,\n        .requests = &.{\n");
+    try add(output, allocator, "\",\n        .version = ");
+    try unsigned(output, allocator, interface.version);
+    try add(output, allocator, ",\n        .requests = &.{\n");
     for (interface.requests) |message| try emitMetadata(output, allocator, message);
     try add(output, allocator, "        },\n        .events = &.{\n");
     for (interface.events) |message| try emitMetadata(output, allocator, message);

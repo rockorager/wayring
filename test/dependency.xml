@@ -5,5 +5,8 @@
       <entry name="idle" value="0"/>
       <entry name="active" value="1"/>
     </enum>
+    <enum name="version">
+      <entry name="current" value="1"/>
+    </enum>
   </interface>
 </protocol>

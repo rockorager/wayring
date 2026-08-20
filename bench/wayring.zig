@@ -517,7 +517,7 @@ fn clientReceiveMain(options: Options) !u8 {
     const actor = try owner.getActor(peer);
     const receiver = try owner.getReceiver(peer);
     var namespace = try objects.Namespace.init(allocator, 1);
-    _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.version, null);
+    _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.info.version, null);
     try owner.armReceive(peer);
 
     try clientReceivePhase(&owner, peer, &namespace, options.warmup, 1);
@@ -582,7 +582,7 @@ fn server(fd: c.fd_t, options: Options) !void {
     const receiver = try owner.getReceiver(peer);
     const slots = owner.slots;
     var namespace = try objects.Namespace.init(allocator, 8);
-    _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.version, null);
+    _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.info.version, null);
     try receiver.arm(
         ring,
         fd,
@@ -890,7 +890,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             actor.generation,
             1,
         );
-        _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.version, null);
+        _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.info.version, null);
         try receiver.prepare(ring, fds[index], actor);
     }
     _ = try ring.submit();

@@ -139,6 +139,8 @@ test "generated enum wrappers preserve unknown signed values" {
 }
 
 test "composed protocols share external enum types" {
+    try std.testing.expectEqual(@as(u32, 1), Provider.info.version);
+    try std.testing.expectEqual(@as(u32, 1), Provider.version.current.toInt());
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 1);
     defer blocks.deinit(std.testing.allocator);
     var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
