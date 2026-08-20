@@ -53,6 +53,10 @@ pub const Namespace = struct {
         namespace.* = undefined;
     }
 
+    pub fn iterator(namespace: *Namespace) Table(Object).Iterator {
+        return namespace.table.iterator();
+    }
+
     pub fn insert(
         namespace: *Namespace,
         id: u32,
@@ -239,6 +243,10 @@ pub const ClientObjects = struct {
         objects.* = undefined;
     }
 
+    pub fn iterator(objects: *ClientObjects) Table(Object).Iterator {
+        return objects.namespace.iterator();
+    }
+
     pub fn createLocal(
         objects: *ClientObjects,
         interface: *const metadata.Interface,
@@ -385,6 +393,10 @@ pub const ServerObjects = struct {
         server_objects.ids.deinit(allocator);
         server_objects.namespace.deinit(allocator);
         server_objects.* = undefined;
+    }
+
+    pub fn iterator(server_objects: *ServerObjects) Table(Object).Iterator {
+        return server_objects.namespace.iterator();
     }
 
     pub fn insertClient(
@@ -538,6 +550,26 @@ pub const SharedObjectPool = struct {
 /// clearing per-slot metadata when a reactor slot is reused, while an intrusive
 /// ownership chain makes whole-client teardown O(1).
 pub const SharedNamespace = struct {
+    pub const Entry = struct {
+        handle: Handle,
+        value: *Object,
+    };
+
+    pub const Iterator = struct {
+        namespace: *SharedNamespace,
+        current: u32,
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.current == shared_end) return null;
+            const node = &self.namespace.pool.nodes[self.current];
+            self.current = node.owner_next;
+            return .{
+                .handle = .{ .id = node.id, .generation = node.generation },
+                .value = &node.object,
+            };
+        }
+    };
+
     pool: *SharedObjectPool,
     buckets: []SharedObjectBucket,
     connection_generation: u32,
@@ -576,6 +608,12 @@ pub const SharedNamespace = struct {
 
     pub fn len(namespace: SharedNamespace) usize {
         return namespace.count;
+    }
+
+    /// Iteration follows the connection's intrusive ownership chain without
+    /// allocation. The namespace must not be mutated while an iterator is live.
+    pub fn iterator(namespace: *SharedNamespace) Iterator {
+        return .{ .namespace = namespace, .current = namespace.owner_head };
     }
 
     pub fn insert(
@@ -851,6 +889,10 @@ pub const SharedServerObjects = struct {
     pub fn deinit(server_objects: *SharedServerObjects) void {
         server_objects.namespace.deinit();
         server_objects.* = undefined;
+    }
+
+    pub fn iterator(server_objects: *SharedServerObjects) SharedNamespace.Iterator {
+        return server_objects.namespace.iterator();
     }
 
     pub fn insertClient(
@@ -1357,6 +1399,15 @@ test "server namespaces share physical objects with isolated quotas" {
     try std.testing.expect(first.namespace.resolve(first_child) != null);
     try std.testing.expect(second.namespace.resolve(second_child) != null);
     try std.testing.expectEqual(@as(usize, 1), pool.available());
+
+    var first_objects = first.iterator();
+    const display_entry = first_objects.next().?;
+    try std.testing.expectEqual(display_id, display_entry.handle.id);
+    try std.testing.expectEqual(&display_info, display_entry.value.interface);
+    const child_entry = first_objects.next().?;
+    try std.testing.expectEqual(first_child, child_entry.handle);
+    try std.testing.expectEqual(&child_info, child_entry.value.interface);
+    try std.testing.expectEqual(null, first_objects.next());
 
     first.deinit();
     first_live = false;

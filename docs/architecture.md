@@ -173,7 +173,10 @@ list in O(1). Handles pair the wire ID with a pool-wide insertion generation so
 an ID reused later cannot validate stale application state. Each namespace
 caches its most recently resolved ID and node index; repeated dispatch to one
 object avoids hashing and the bucket-chain walk, while removal always
-walks the bucket chain to preserve collision unlinking.
+walks the bucket chain to preserve collision unlinking. Allocation-free object
+iterators expose generation-tagged handles and context-bearing object metadata
+when applications need O(n) disconnect cleanup; callers that do not need hooks
+retain the O(1) chain release path.
 
 Logical per-client quotas prevent one connection from monopolizing the shared
 pool. One physical node per inactive reactor slot is reserved for `wl_display`;
