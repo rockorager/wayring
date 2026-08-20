@@ -160,6 +160,7 @@ const Parser = struct {
     interface: ?InterfaceBuilder = null,
     message: ?MessageBuilder = null,
     enumeration: ?EnumBuilder = null,
+    entry_open: bool = false,
     ignored_depth: usize = 0,
 
     fn deinit(parser: *Parser) void {
@@ -296,7 +297,8 @@ const Parser = struct {
     }
 
     fn enumTag(parser: *Parser, tag: Tag) Error!void {
-        if (parser.interface == null or parser.message != null) return error.UnexpectedElement;
+        if (parser.interface == null or parser.message != null or parser.entry_open)
+            return error.UnexpectedElement;
         switch (tag.kind) {
             .start, .empty => {
                 if (parser.enumeration != null) return error.UnexpectedElement;
@@ -321,7 +323,25 @@ const Parser = struct {
     }
 
     fn entryTag(parser: *Parser, tag: Tag) Error!void {
-        if (tag.kind != .empty or parser.enumeration == null) return error.UnexpectedElement;
+        if (parser.enumeration == null) return error.UnexpectedElement;
+        switch (tag.kind) {
+            .start => {
+                if (parser.entry_open) return error.UnexpectedElement;
+                try parser.appendEntry(tag);
+                parser.entry_open = true;
+            },
+            .empty => {
+                if (parser.entry_open) return error.UnexpectedElement;
+                try parser.appendEntry(tag);
+            },
+            .end => {
+                if (!parser.entry_open) return error.UnexpectedElement;
+                parser.entry_open = false;
+            },
+        }
+    }
+
+    fn appendEntry(parser: *Parser, tag: Tag) Error!void {
         try tag.attributes.ensureOnly(&.{
             "name", "value", "summary", "since", "deprecated-since",
         });
@@ -606,7 +626,9 @@ test "parses messages, arguments, enums, and versions" {
         \\    <event name="done"><arg name="serial" type="uint"/></event>
         \\    <enum name="state" bitfield="true">
         \\      <entry name="ready" value="0x1"/>
-        \\      <entry name="failed" value="-1" since="2"/>
+        \\      <entry name="failed" value="-1" since="2">
+        \\        <description summary="failure">Detailed failure.</description>
+        \\      </entry>
         \\    </enum>
         \\  </interface>
         \\</protocol>

@@ -4,9 +4,31 @@ const std = @import("std");
 const protocol_ir = @import("protocol.zig");
 
 pub const Error = std.mem.Allocator.Error || error{
+    DuplicateInterface,
     InvalidEnumType,
     InvalidEnumValue,
 };
+
+pub fn generateProtocols(
+    allocator: std.mem.Allocator,
+    protocols: []const protocol_ir.Protocol,
+) Error![]u8 {
+    var interfaces: std.ArrayList(protocol_ir.Interface) = .empty;
+    defer interfaces.deinit(allocator);
+    for (protocols) |protocol| {
+        for (protocol.interfaces) |interface| {
+            for (interfaces.items) |existing| {
+                if (std.mem.eql(u8, existing.name, interface.name))
+                    return error.DuplicateInterface;
+            }
+            try interfaces.append(allocator, interface);
+        }
+    }
+    return generate(allocator, .{
+        .name = "combined",
+        .interfaces = interfaces.items,
+    });
+}
 
 pub fn generate(
     allocator: std.mem.Allocator,
@@ -1079,6 +1101,27 @@ test "expands an untyped new id into its dynamic wire arguments" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "wayring.client.NewObject") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "const dynamic_interface = (try arguments.string())") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "try writeString(&reservation, payload.@\"id\".interface)") != null);
+}
+
+test "composes protocol interfaces and rejects duplicates" {
+    const first_xml =
+        \\<protocol name="first"><interface name="first_v1" version="1"></interface></protocol>
+    ;
+    const second_xml =
+        \\<protocol name="second"><interface name="second_v1" version="1"></interface></protocol>
+    ;
+    var first = try protocol_ir.Protocol.parse(std.testing.allocator, first_xml);
+    defer first.deinit(std.testing.allocator);
+    var second = try protocol_ir.Protocol.parse(std.testing.allocator, second_xml);
+    defer second.deinit(std.testing.allocator);
+    const generated = try generateProtocols(std.testing.allocator, &.{ first, second });
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub const @\"first_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub const @\"second_v1\"") != null);
+    try std.testing.expectError(
+        error.DuplicateInterface,
+        generateProtocols(std.testing.allocator, &.{ first, first }),
+    );
 }
 
 fn generateAndDeinit(allocator: std.mem.Allocator, xml: []const u8) !void {

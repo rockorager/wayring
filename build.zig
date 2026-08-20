@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
 
     const generate_test_protocol = b.addRunArtifact(scanner);
+    generate_test_protocol.addFileArg(b.path("test/dependency.xml"));
     generate_test_protocol.addFileArg(b.path("test/protocol.xml"));
     const generated_test_protocol = generate_test_protocol.addOutputFileArg("wayring-test-protocol.zig");
     const generated_test_module = b.createModule(.{

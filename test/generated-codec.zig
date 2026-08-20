@@ -5,6 +5,7 @@ const generated = @import("generated_protocol");
 const linux = std.os.linux;
 const Interface = generated.wp_wayring_test_v1;
 const Other = generated.wp_wayring_other_v1;
+const Provider = generated.wp_enum_provider_v1;
 
 test "generated encoder writes every argument directly into the TX queue" {
     try std.testing.expectEqualStrings("wp_wayring_test_v1", Interface.info.name);
@@ -135,6 +136,29 @@ test "generated enum wrappers preserve unknown signed values" {
         else => unreachable,
     });
     try std.testing.expectEqual(@as(i32, -1), Other.direction.backward.toInt());
+}
+
+test "composed protocols share external enum types" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer queue.deinit();
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+
+    try Interface.encodeRequest(&queue, 7, .{
+        .set_external_state = .{ .state = Provider.state.active },
+    });
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const decoded = try Interface.decodeRequest(message, &received_fds);
+    try std.testing.expectEqual(Provider.state.active, switch (decoded) {
+        .set_external_state => |value| value.state,
+        else => unreachable,
+    });
 }
 
 fn expectSuccess(result: usize) !void {

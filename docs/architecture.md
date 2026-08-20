@@ -80,6 +80,12 @@ zig build
 zig-out/bin/wayring-scanner protocol.xml protocol.zig
 ```
 
+Pass dependency XML files before the output to generate one composed module,
+for example `wayland.xml xdg-shell.xml protocols.zig`. Combining dependencies
+lets generated extension arguments use the exact enum types declared by core
+or other protocols, with duplicate interface names rejected at generation
+time.
+
 ## Required invariants
 
 - Receive completions are byte-stream fragments, not Wayland frame boundaries.

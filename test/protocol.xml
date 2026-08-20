@@ -69,6 +69,9 @@
       <arg name="direction" type="int" enum="wp_wayring_other_v1.direction"/>
     </request>
     <request name="destroy" type="destructor"/>
+    <request name="set_external_state">
+      <arg name="state" type="uint" enum="wp_enum_provider_v1.state"/>
+    </request>
     <request name="construct_external">
       <arg name="child" type="new_id" interface="wp_external_v1"/>
     </request>

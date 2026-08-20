@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wayring_test_dependency">
+  <interface name="wp_enum_provider_v1" version="1">
+    <enum name="state">
+      <entry name="idle" value="0"/>
+      <entry name="active" value="1"/>
+    </enum>
+  </interface>
+</protocol>
