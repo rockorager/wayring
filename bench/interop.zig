@@ -33,6 +33,7 @@ const Options = struct {
         xdg_libwayland_client,
         xdg_libwayland_server,
         shm_libwayland_client,
+        shm_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -45,6 +46,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .xdg_libwayland_client => wayringProtocolServer(.xdg),
         .xdg_libwayland_server => wayringXdgClient(),
         .shm_libwayland_client => wayringProtocolServer(.shm),
+        .shm_libwayland_server => wayringShmClient(),
     };
 }
 
@@ -762,7 +764,7 @@ fn wayringXdgClient() !u8 {
     _ = try reactor.ring.submit();
     while (handler.compositor == null or handler.wm_base == null or
         !handler.synced or !handler.deleted or !handler.pinged)
-        try pumpXdgClient(&reactor, peer, client_objects, &handler);
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     const surface = (try standard_protocol.wl_compositor.construct_create_surface(
         client_objects,
@@ -793,7 +795,7 @@ fn wayringXdgClient() !u8 {
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
     while (!handler.configured)
-        try pumpXdgClient(&reactor, peer, client_objects, &handler);
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     handler.synced = false;
     handler.deleted = false;
@@ -802,7 +804,7 @@ fn wayringXdgClient() !u8 {
     _ = try reactor.ring.submit();
     while (!handler.synced or !handler.deleted or
         actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
-        try pumpXdgClient(&reactor, peer, client_objects, &handler);
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     try wayring.client.sendRequest(
         standard_protocol.xdg_toplevel,
@@ -835,7 +837,7 @@ fn wayringXdgClient() !u8 {
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
     while (actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
-        try pumpXdgClient(&reactor, peer, client_objects, &handler);
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
     try connection.deinit(allocator);
@@ -970,11 +972,11 @@ const XdgClientHandler = struct {
     }
 };
 
-fn pumpXdgClient(
+fn pumpProtocolClient(
     reactor: *wayring.io_uring.Reactor,
     peer: wayring.io_uring.Peer,
     client_objects: *wayring.objects.ClientObjects,
-    handler: *XdgClientHandler,
+    handler: anytype,
 ) !void {
     const completion = try reactor.ring.copy_cqe();
     const routed = (reactor.route(null, completion) orelse
@@ -1015,6 +1017,200 @@ fn pumpXdgClient(
     }
     if (prepared) _ = try reactor.ring.submit();
 }
+
+fn wayringShmClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.shm_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: ShmClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.shm == null or !handler.format_seen or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const descriptor_result = linux.memfd_create("wayring-shm-interop", linux.MFD.CLOEXEC);
+    if (linux.errno(descriptor_result) != .SUCCESS) return error.SystemCallFailed;
+    const descriptor: linux.fd_t = @intCast(descriptor_result);
+    if (linux.errno(linux.ftruncate(descriptor, 4096)) != .SUCCESS) {
+        _ = linux.close(descriptor);
+        return error.SystemCallFailed;
+    }
+    const pool = standard_protocol.wl_shm.construct_create_pool(
+        client_objects,
+        &actor.transmit,
+        handler.shm.?,
+        .{ .fd = descriptor, .size = 4096 },
+    ) catch |err| {
+        _ = linux.close(descriptor);
+        return err;
+    };
+    const buffer = (try standard_protocol.wl_shm_pool.construct_create_buffer(
+        client_objects,
+        &actor.transmit,
+        pool.id,
+        .{
+            .offset = 0,
+            .width = 1,
+            .height = 1,
+            .stride = 4,
+            .format = .argb8888,
+        },
+    )).id;
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_buffer,
+        client_objects,
+        &actor.transmit,
+        buffer,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_shm_pool,
+        client_objects,
+        &actor.transmit,
+        pool.id,
+        .{ .destroy = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const ShmClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    shm: ?wayring.objects.Handle = null,
+    format_seen: bool = false,
+    synced: bool = false,
+    deleted: bool = false,
+
+    pub fn event(
+        handler: *ShmClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| if (std.mem.eql(
+                    u8,
+                    global.interface,
+                    standard_protocol.wl_shm.info.name,
+                )) {
+                    handler.shm = try XdgClientCore.bind(
+                        handler.objects,
+                        handler.queue,
+                        handler.registry,
+                        global.name,
+                        &standard_protocol.wl_shm.info,
+                        @min(global.version, 1),
+                        null,
+                    );
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.wl_shm.info) {
+            const shm_event = try wayring.client.decodeEvent(
+                standard_protocol.wl_shm,
+                handler.objects,
+                handler.shm orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (shm_event) {
+                .format => |value| {
+                    if (value.format.value == standard_protocol.wl_shm.format.argb8888.value)
+                        handler.format_seen = true;
+                },
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
 
 fn wayringClient(options: Options) !u8 {
     var sockets: [2]c_int = undefined;
@@ -1370,6 +1566,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .xdg_libwayland_server;
         } else if (std.mem.eql(u8, value, "shm-libwayland-client")) {
             options.mode = .shm_libwayland_client;
+        } else if (std.mem.eql(u8, value, "shm-libwayland-server")) {
+            options.mode = .shm_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

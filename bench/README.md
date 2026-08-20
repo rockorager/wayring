@@ -134,7 +134,9 @@ configure/ack, synchronization, and ordered destruction. This validates
 production protocol object and version lifecycles independently of the private
 benchmark protocol.
 
-Shm interoperability mode drives a libwayland client against a Wayring server
-through `wl_shm` format advertisement, a close-on-exec shared-memory descriptor,
-pool and buffer construction, synchronization, and ordered destruction. It
-exercises production FD transfer and nested core object lifecycles.
+Shm interoperability mode runs both a libwayland client against a Wayring
+server and a Wayring client against a libwayland server. Each pairing performs
+`wl_shm` format advertisement, close-on-exec shared-memory descriptor transfer,
+pool and buffer construction, synchronization, and ordered destruction. This
+exercises production FD ownership and nested core object lifecycles in both
+directions.
