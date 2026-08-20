@@ -126,9 +126,10 @@ The measurements are useful for validating real wire
 compatibility and finding asymmetric runtime costs; they are not a direct
 replacement for the symmetric implementation comparisons above.
 
-Xdg interoperability mode drives a real libwayland client through registry
-binding, `wl_compositor` surface creation, `xdg_wm_base` ping/pong,
-`xdg_surface` and `xdg_toplevel` construction, configure/ack, synchronization,
-and ordered destruction against a Wayring server. This validates production
-protocol object and version lifecycles independently of the private benchmark
-protocol.
+Xdg interoperability mode drives both a real libwayland client against a
+Wayring server and a Wayring client against a real libwayland server. Each
+pairing performs registry binding, `wl_compositor` surface creation,
+`xdg_wm_base` ping/pong, `xdg_surface` and `xdg_toplevel` construction,
+configure/ack, synchronization, and ordered destruction. This validates
+production protocol object and version lifecycles independently of the private
+benchmark protocol.

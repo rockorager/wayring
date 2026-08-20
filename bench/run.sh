@@ -174,6 +174,7 @@ case "$mode" in
         ;;
     xdg-interop)
         "$root/zig-out/bench/wayring-interop" 1 1 1 xdg-libwayland-client
+        "$root/zig-out/bench/wayring-interop" 1 1 1 xdg-libwayland-server
         ;;
     *)
         echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|xdg-interop]" >&2

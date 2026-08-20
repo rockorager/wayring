@@ -28,6 +28,8 @@ wayland-scanner private-code "$root/bench/protocol.xml" \
     "$generated/wayring-benchmark-protocol.c"
 wayland-scanner client-header "$xdg_shell" \
     "$generated/xdg-shell-client-protocol.h"
+wayland-scanner server-header "$xdg_shell" \
+    "$generated/xdg-shell-server-protocol.h"
 wayland-scanner private-code "$xdg_shell" \
     "$generated/xdg-shell-protocol.c"
 
@@ -64,6 +66,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/libwayland-client.c" \
     "$root/bench/libwayland-server.c" \
     "$root/bench/xdg-interop-client.c" \
+    "$root/bench/xdg-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
