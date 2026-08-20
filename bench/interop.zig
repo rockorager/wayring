@@ -38,6 +38,7 @@ const Options = struct {
         shm_libwayland_client,
         shm_libwayland_server,
         dmabuf_libwayland_client,
+        dmabuf_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -52,6 +53,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .shm_libwayland_client => wayringProtocolServer(.shm),
         .shm_libwayland_server => wayringShmClient(),
         .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf),
+        .dmabuf_libwayland_server => wayringDmabufClient(),
     };
 }
 
@@ -1299,6 +1301,223 @@ const ShmClientHandler = struct {
     }
 };
 
+fn wayringDmabufClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.dmabuf_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: DmabufClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.dmabuf == null or !handler.modifier_seen or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const descriptor_result = linux.memfd_create("wayring-dmabuf-interop", linux.MFD.CLOEXEC);
+    if (linux.errno(descriptor_result) != .SUCCESS) return error.SystemCallFailed;
+    const descriptor: linux.fd_t = @intCast(descriptor_result);
+    if (linux.errno(linux.ftruncate(descriptor, 4096)) != .SUCCESS) {
+        _ = linux.close(descriptor);
+        return error.SystemCallFailed;
+    }
+    const params = (try standard_protocol.zwp_linux_dmabuf_v1.construct_create_params(
+        client_objects,
+        &actor.transmit,
+        handler.dmabuf.?,
+        .{},
+    )).params_id;
+    wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        params,
+        .{ .add = .{
+            .fd = descriptor,
+            .plane_idx = 0,
+            .offset = 0,
+            .stride = 4,
+            .modifier_hi = drm_format_modifier_invalid_hi,
+            .modifier_lo = drm_format_modifier_invalid_lo,
+        } },
+    ) catch |err| {
+        _ = linux.close(descriptor);
+        return err;
+    };
+    const buffer = (try standard_protocol.zwp_linux_buffer_params_v1.construct_create_immed(
+        client_objects,
+        &actor.transmit,
+        params,
+        .{
+            .width = 1,
+            .height = 1,
+            .format = drm_format_argb8888,
+            .flags = .fromInt(0),
+        },
+    )).buffer_id;
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_buffer,
+        client_objects,
+        &actor.transmit,
+        buffer,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        params,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_dmabuf_v1,
+        client_objects,
+        &actor.transmit,
+        handler.dmabuf.?,
+        .{ .destroy = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const DmabufClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    dmabuf: ?wayring.objects.Handle = null,
+    modifier_seen: bool = false,
+    synced: bool = false,
+    deleted: bool = false,
+
+    pub fn event(
+        handler: *DmabufClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| if (std.mem.eql(
+                    u8,
+                    global.interface,
+                    standard_protocol.zwp_linux_dmabuf_v1.info.name,
+                )) {
+                    handler.dmabuf = try XdgClientCore.bind(
+                        handler.objects,
+                        handler.queue,
+                        handler.registry,
+                        global.name,
+                        &standard_protocol.zwp_linux_dmabuf_v1.info,
+                        @min(global.version, 3),
+                        null,
+                    );
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
+            const dmabuf_event = try wayring.client.decodeEvent(
+                standard_protocol.zwp_linux_dmabuf_v1,
+                handler.objects,
+                handler.dmabuf orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (dmabuf_event) {
+                .modifier => |value| {
+                    if (value.format == drm_format_argb8888 and
+                        value.modifier_hi == drm_format_modifier_invalid_hi and
+                        value.modifier_lo == drm_format_modifier_invalid_lo)
+                        handler.modifier_seen = true;
+                },
+                .format => {},
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
 fn wayringClient(options: Options) !u8 {
     var sockets: [2]c_int = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
@@ -1657,6 +1876,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .shm_libwayland_server;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-client")) {
             options.mode = .dmabuf_libwayland_client;
+        } else if (std.mem.eql(u8, value, "dmabuf-libwayland-server")) {
+            options.mode = .dmabuf_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

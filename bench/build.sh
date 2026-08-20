@@ -35,6 +35,8 @@ wayland-scanner private-code "$xdg_shell" \
     "$generated/xdg-shell-protocol.c"
 wayland-scanner client-header "$linux_dmabuf" \
     "$generated/linux-dmabuf-client-protocol.h"
+wayland-scanner server-header "$linux_dmabuf" \
+    "$generated/linux-dmabuf-server-protocol.h"
 wayland-scanner private-code "$linux_dmabuf" \
     "$generated/linux-dmabuf-protocol.c"
 
@@ -75,6 +77,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/shm-interop-client.c" \
     "$root/bench/shm-interop-server.c" \
     "$root/bench/dmabuf-interop-client.c" \
+    "$root/bench/dmabuf-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     "$generated/linux-dmabuf-protocol.c" \

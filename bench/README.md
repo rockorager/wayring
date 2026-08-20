@@ -141,9 +141,9 @@ pool and buffer construction, synchronization, and ordered destruction. This
 exercises production FD ownership and nested core object lifecycles in both
 directions.
 
-Linux-dmabuf interoperability mode drives a libwayland client against a
-Wayring server through version-3 modifier advertisement, params construction,
-close-on-exec plane FD transfer, immediate `wl_buffer` creation,
-synchronization, and ordered destruction. The harness validates wire and object
-semantics without attempting to import the synthetic descriptor as a real GPU
-dma-buf.
+Linux-dmabuf interoperability mode runs both a libwayland client against a
+Wayring server and a Wayring client against a libwayland server. Each pairing
+performs version-3 modifier advertisement, params construction, close-on-exec
+plane FD transfer, immediate `wl_buffer` creation, synchronization, and ordered
+destruction. The harness validates wire and object semantics without attempting
+to import the synthetic descriptor as a real GPU dma-buf.
