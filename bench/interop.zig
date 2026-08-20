@@ -230,14 +230,10 @@ const ServerHandler = struct {
                     callback,
                     0,
                 ),
-                .get_registry => |registry| {
-                    var cursor = handler.globals.cursor();
-                    while (try ServerCore.advertiseNext(
-                        handler.objects,
-                        handler.queue,
-                        registry,
-                        &cursor,
-                    )) {}
+                .get_registry => while (true) switch (try handler.runtime.publishNext()) {
+                    .sent => {},
+                    .blocked => return error.ByteBudgetExceeded,
+                    .complete => break,
                 },
             }
         } else if (target.object.interface == &ServerCore.Registry.info) {

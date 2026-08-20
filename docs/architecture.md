@@ -230,6 +230,12 @@ repeated syscalls. Active-peer iteration supports batched shutdown, while
 connection CQE switches and protocol dispatch remain visible to the application.
 Registry subscriptions lease entries from one configurable reactor-wide pool;
 idle clients reserve none, and disconnect returns each client's chain in O(1).
+Each subscription also owns its initial global-listing cursor. The runtime's
+publication driver persists that cursor across TX backpressure, so applications
+do not retain per-registry iteration state. Global-table mutation remains
+serialized until all live initial listings finish, keeping their iterators valid
+and ensuring older globals are queued before later changes. Disconnect releases
+pending listings with the subscription chain in O(1).
 Adding or removing a global snapshots the subscriptions that existed at that
 point into one runtime-owned resumable publication cursor. A second mutation is
 rejected until the first completes, preserving registry event order. Publication

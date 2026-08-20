@@ -518,9 +518,14 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
             .object_capacity = 5,
             .object_quota = 3,
             .buckets_per_client = 8,
-            .max_globals = 1,
+            .max_globals = 2,
             .registry_capacity = 3,
         },
+    );
+    const initial_global = try runtime.globals.add(
+        &protocol.wp_wayring_test_v1.info,
+        1,
+        null,
     );
     try runtime.prepareAccept();
     const client_fds: [2]linux.fd_t = .{
@@ -575,6 +580,33 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
 
     const full = [_]u8{0} ** 64;
     try (try reactor.getActor(accepted_peers[0])).transmit.enqueue(&full, &.{});
+    try std.testing.expectError(
+        error.GlobalUpdateActive,
+        runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, null),
+    );
+    try std.testing.expectEqual(
+        accepted_peers[0],
+        (try runtime.publishNext()).blocked,
+    );
+    try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
+    for (accepted_peers, registries) |peer, registry| {
+        try std.testing.expectEqual(peer, (try runtime.publishNext()).sent);
+        const actor = try reactor.getActor(peer);
+        const message = try firstMessage(&actor.transmit);
+        try std.testing.expectEqual(registry.id, message.header.object_id);
+        const event = try Core.Registry.decodeEvent(message, &actor.received_fds);
+        try std.testing.expectEqual(initial_global.id, switch (event) {
+            .global => |value| value.name,
+            else => unreachable,
+        });
+        try consume(&actor.transmit);
+    }
+    try std.testing.expectEqual(
+        wayring.server.Runtime(protocol).PublishResult.complete,
+        try runtime.publishNext(),
+    );
+
+    try (try reactor.getActor(accepted_peers[0])).transmit.enqueue(&full, &.{});
     const added = try runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, null);
     try std.testing.expectError(
         error.GlobalUpdateActive,
@@ -615,8 +647,12 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         (try runtime.publishNext()).sent,
     );
     try std.testing.expectEqual(
-        wayring.server.Runtime(protocol).PublishResult.complete,
-        try runtime.publishNext(),
+        accepted_peers[0],
+        (try runtime.publishNext()).blocked,
+    );
+    try std.testing.expectError(
+        error.GlobalUpdateActive,
+        runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, null),
     );
     for (accepted_peers, registries) |peer, registry| {
         const actor = try reactor.getActor(peer);
@@ -635,14 +671,33 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     }
 
     const first_actor = try reactor.getActor(accepted_peers[0]);
-    try Core.sendGlobalEntry(
-        try runtime.clients.get(accepted_peers[0]),
-        &first_actor.transmit,
-        late_registry,
-        added.id,
-        (try runtime.globals.get(added.id)).*,
+    var saw_initial = false;
+    var saw_added = false;
+    for (0..2) |_| {
+        try std.testing.expectEqual(
+            accepted_peers[0],
+            (try runtime.publishNext()).sent,
+        );
+        const initial_message = try firstMessage(&first_actor.transmit);
+        try std.testing.expectEqual(late_registry.id, initial_message.header.object_id);
+        const initial_event = try Core.Registry.decodeEvent(
+            initial_message,
+            &first_actor.received_fds,
+        );
+        const name = switch (initial_event) {
+            .global => |value| value.name,
+            else => unreachable,
+        };
+        if (name == initial_global.id) saw_initial = true;
+        if (name == added.id) saw_added = true;
+        try consume(&first_actor.transmit);
+    }
+    try std.testing.expect(saw_initial);
+    try std.testing.expect(saw_added);
+    try std.testing.expectEqual(
+        wayring.server.Runtime(protocol).PublishResult.complete,
+        try runtime.publishNext(),
     );
-    try consume(&first_actor.transmit);
 
     try runtime.removeGlobal(added);
     const removal_peers = [_]wayring.io_uring.Peer{
