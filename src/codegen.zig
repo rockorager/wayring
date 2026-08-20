@@ -437,7 +437,7 @@ fn emitServerAdmissions(
                 try identifier(output, allocator, argument.name);
                 try add(output, allocator, ".context");
             }
-            try add(output, allocator, ");\n        errdefer _ = server_objects.removeClient(new_object_");
+            try add(output, allocator, ");\n        errdefer _ = server_objects.cancelClient(new_object_");
             try unsigned(output, allocator, index);
             try add(output, allocator, ") catch unreachable;\n");
         }

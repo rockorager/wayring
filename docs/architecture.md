@@ -68,6 +68,15 @@ client-selected ID, and removes earlier children if any later insertion fails.
 Handlers therefore receive generation-tagged handles without manually
 reimplementing multi-object rollback.
 
+Server globals may install a cold-path bind factory. Registry binding first
+validates and inserts the requested object, then calls the factory with peer
+credentials plus global and resource handles; factory failure cancels the
+unpublished insertion. Each client namespace may also install one removal hook
+for application resource cleanup. Published destructor removals and disconnect
+teardown notify it, while constructor and bind rollback deliberately do not.
+The hook lives once per client rather than once per object, preserving object
+size and hot lookup locality; disconnect remains O(1) when no hook is installed.
+
 Each generated interface also exports compact immutable metadata: its maximum
 version and each request/event's introduction version and destructor bit.
 Object dispatch resolves the sender ID to an interface and negotiated version,

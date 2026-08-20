@@ -239,6 +239,8 @@ test "generated server admission transacts decoded new IDs" {
         null,
     );
     defer server_objects.deinit();
+    var removals: RemovalState = .{};
+    server_objects.setRemovalHook(.{ .context = &removals, .notify = removedObject });
     var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
     const Interface = protocol.wp_wayring_test_v1;
     const external: wayring.metadata.Interface = .{
@@ -292,6 +294,7 @@ test "generated server admission transacts decoded new IDs" {
     try std.testing.expectEqual(@as(usize, 2), server_objects.namespace.len());
     try std.testing.expect(server_objects.namespace.get(3) == null);
     try std.testing.expect(server_objects.namespace.get(4) == null);
+    try std.testing.expectEqual(@as(usize, 0), removals.total);
 
     try Interface.encodeRequest(&receive_queue, parent.id, .{ .construct_children = .{
         .local_child = 3,
@@ -626,17 +629,19 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
                 .transmit_byte_budget = 64,
                 .transmit_fd_budget = 1,
             },
-            .object_capacity = 5,
+            .object_capacity = 6,
             .object_quota = 3,
             .buckets_per_client = 8,
             .max_globals = 2,
             .registry_capacity = 3,
         },
     );
-    const initial_global = try runtime.globals.add(
+    var bind_state: BindState = .{};
+    const initial_global = try runtime.globals.addWithBinder(
         &protocol.wp_wayring_test_v1.info,
         1,
-        null,
+        &bind_state,
+        activateGlobal,
     );
     try runtime.prepareAccept();
     const client_fds: [2]linux.fd_t = .{
@@ -658,6 +663,11 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         peer.* = (try runtime.completeListener(accept_completion, null)) orelse
             return error.UnexpectedCompletion;
     }
+    var removal_states: [2]RemovalState = .{ .{}, .{} };
+    for (accepted_peers, &removal_states) |peer, *state| try runtime.setRemovalHook(
+        peer,
+        .{ .context = state, .notify = removedObject },
+    );
     var active_peers = runtime.clients.iterator();
     for (accepted_peers) |peer| try std.testing.expectEqual(peer, active_peers.next().?);
     try std.testing.expectEqual(null, active_peers.next());
@@ -688,6 +698,40 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
             else => unreachable,
         };
     }
+
+    const first_binding: Core.Registry.Request = .{ .bind = .{
+        .name = initial_global.id,
+        .id = .{
+            .interface = protocol.wp_wayring_test_v1.info.name,
+            .version = 1,
+            .id = 4,
+        },
+    } };
+    const bound = try runtime.bindGlobal(accepted_peers[0], first_binding);
+    try std.testing.expectEqual(@as(u32, 4), bound.id);
+    try std.testing.expectEqual(accepted_peers[0], bind_state.last.?.peer);
+    try std.testing.expectEqual(linux.getpid(), bind_state.last.?.credentials.pid);
+    try std.testing.expectEqual(initial_global, bind_state.last.?.global);
+    try std.testing.expectEqual(bound, bind_state.last.?.resource);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &bind_state.resource_context),
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(bound).?.context,
+    );
+    _ = try (try runtime.clients.get(accepted_peers[0])).removeClient(bound);
+    try std.testing.expectEqual(@as(usize, 1), removal_states[0].resources);
+
+    bind_state.fail = true;
+    try std.testing.expectError(
+        error.ActivationFailed,
+        runtime.bindGlobal(accepted_peers[0], first_binding),
+    );
+    bind_state.fail = false;
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.get(4) == null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), removal_states[0].resources);
+    const second_bound = try runtime.bindGlobal(accepted_peers[1], first_binding);
+    try std.testing.expectEqual(@as(u32, 4), second_bound.id);
 
     const full = [_]u8{0} ** 64;
     try (try reactor.getActor(accepted_peers[0])).transmit.enqueue(&full, &.{});
@@ -863,11 +907,41 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         }
     }
     for (accepted_peers) |peer| try runtime.destroyClient(peer);
+    try std.testing.expectEqual(@as(usize, 4), removal_states[0].total);
+    try std.testing.expectEqual(@as(usize, 1), removal_states[0].resources);
+    try std.testing.expectEqual(@as(usize, 3), removal_states[1].total);
+    try std.testing.expectEqual(@as(usize, 1), removal_states[1].resources);
     try runtime.deinit(std.testing.allocator);
     try std.testing.expectEqual(
         linux.E.BADF,
         linux.errno(linux.fcntl(listener_fd, linux.F.GETFD, 0)),
     );
+}
+
+const BindState = struct {
+    fail: bool = false,
+    calls: usize = 0,
+    resource_context: u8 = 0,
+    last: ?wayring.server.Binding = null,
+};
+
+fn activateGlobal(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
+    const state: *BindState = @ptrCast(@alignCast(context.?));
+    state.calls += 1;
+    state.last = binding;
+    if (state.fail) return error.ActivationFailed;
+    return &state.resource_context;
+}
+
+const RemovalState = struct {
+    total: usize = 0,
+    resources: usize = 0,
+};
+
+fn removedObject(context: ?*anyopaque, _: wayring.objects.Handle, object: wayring.objects.Object) void {
+    const state: *RemovalState = @ptrCast(@alignCast(context.?));
+    state.total += 1;
+    if (object.interface == &protocol.wp_wayring_test_v1.info) state.resources += 1;
 }
 
 fn firstMessage(queue: *wayring.tx.Queue) !wayring.wire.Message {

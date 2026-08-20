@@ -21,17 +21,28 @@ pub const GlobalError = objects.Error || metadata.Error || error{
     UnknownGlobal,
 };
 
-pub const Global = struct {
-    interface: *const metadata.Interface,
-    version: u32,
-    context: ?*anyopaque,
-};
-
 /// Immutable Linux identity captured from SO_PEERCRED when a client is admitted.
 pub const Credentials = extern struct {
     pid: std.os.linux.pid_t,
     uid: std.os.linux.uid_t,
     gid: std.os.linux.gid_t,
+};
+
+pub const Binding = struct {
+    peer: io_uring.Peer,
+    credentials: Credentials,
+    global: objects.Handle,
+    resource: objects.Handle,
+    version: u32,
+};
+
+pub const BindFn = *const fn (?*anyopaque, Binding) anyerror!?*anyopaque;
+
+pub const Global = struct {
+    interface: *const metadata.Interface,
+    version: u32,
+    context: ?*anyopaque,
+    bind: ?BindFn = null,
 };
 
 /// Owns one listening descriptor and its persistent multishot accept state.
@@ -93,6 +104,16 @@ pub const Globals = struct {
         version: u32,
         context: ?*anyopaque,
     ) GlobalError!objects.Handle {
+        return globals.addWithBinder(interface, version, context, null);
+    }
+
+    pub fn addWithBinder(
+        globals: *Globals,
+        interface: *const metadata.Interface,
+        version: u32,
+        context: ?*anyopaque,
+        bind: ?BindFn,
+    ) GlobalError!objects.Handle {
         try interface.validateVersion(version);
         if (globals.next_name == 0) return error.NameExhausted;
         const name = globals.next_name;
@@ -101,6 +122,7 @@ pub const Globals = struct {
             .interface = interface,
             .version = version,
             .context = context,
+            .bind = bind,
         });
     }
 
@@ -1119,7 +1141,7 @@ pub fn Runtime(comptime protocol: type) type {
                     else
                         runtime.globals.cursor(),
                 ) catch |err| {
-                    _ = server_objects.removeClient(registry) catch unreachable;
+                    _ = server_objects.cancelClient(registry) catch unreachable;
                     return err;
                 },
             }
@@ -1134,14 +1156,79 @@ pub fn Runtime(comptime protocol: type) type {
             version: u32,
             context: ?*anyopaque,
         ) !objects.Handle {
+            return runtime.addGlobalWithBinder(interface, version, context, null);
+        }
+
+        pub fn addGlobalWithBinder(
+            runtime: *Self,
+            interface: *const metadata.Interface,
+            version: u32,
+            context: ?*anyopaque,
+            bind: ?BindFn,
+        ) !objects.Handle {
             if (runtime.global_update != null or runtime.registries.initial_count != 0)
                 return error.GlobalUpdateActive;
-            const handle = try runtime.globals.add(interface, version, context);
+            const handle = try runtime.globals.addWithBinder(
+                interface,
+                version,
+                context,
+                bind,
+            );
             runtime.global_update = runtime.registries.updateAdded(
                 handle.id,
                 (try runtime.globals.get(handle.id)).*,
             );
             return handle;
+        }
+
+        /// Inserts a decoded registry binding, then lets the global activate
+        /// per-client resource state. Failed activation cancels the unpublished
+        /// object without invoking its removal hook.
+        pub fn bindGlobal(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            request: ProtocolCore.Registry.Request,
+        ) !objects.Handle {
+            const binding = switch (request) {
+                .bind => |value| value,
+            };
+            const global_handle = runtime.globals.table.lookupHandle(binding.name) orelse
+                return error.UnknownGlobal;
+            const global = runtime.globals.table.resolve(global_handle) orelse unreachable;
+            const interface = global.interface;
+            const advertised_version = global.version;
+            const global_context = global.context;
+            const binder = global.bind;
+            const credentials = try runtime.clients.getCredentials(peer);
+            const server_objects = try runtime.clients.get(peer);
+            const resource = try ProtocolCore.bindClient(
+                server_objects,
+                binding.id,
+                interface,
+                advertised_version,
+                if (binder == null) global_context else null,
+            );
+            errdefer _ = server_objects.cancelClient(resource) catch unreachable;
+            if (binder) |activate| {
+                const resource_context = try activate(global_context, .{
+                    .peer = peer,
+                    .credentials = credentials,
+                    .global = global_handle,
+                    .resource = resource,
+                    .version = binding.id.version,
+                });
+                server_objects.namespace.resolve(resource).?.context = resource_context;
+            }
+            return resource;
+        }
+
+        pub fn setRemovalHook(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            hook: ?objects.RemovalHook,
+        ) !void {
+            const server_objects = try runtime.clients.get(peer);
+            server_objects.setRemovalHook(hook);
         }
 
         /// Removes a global immediately and snapshots existing registries for

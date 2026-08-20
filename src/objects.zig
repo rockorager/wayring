@@ -22,6 +22,13 @@ pub const Object = struct {
     context: ?*anyopaque = null,
 };
 
+/// Cold-path notification for published objects removed individually or by
+/// connection teardown. Transactional cancellation does not invoke this hook.
+pub const RemovalHook = struct {
+    context: ?*anyopaque = null,
+    notify: *const fn (?*anyopaque, Handle, Object) void,
+};
+
 pub const Dispatch = struct {
     object: *Object,
     message: metadata.Message,
@@ -368,6 +375,7 @@ pub const ServerObjectsError = NamespaceError || ServerIdError || error{
 pub const ServerObjects = struct {
     namespace: Namespace,
     ids: ServerIds,
+    removal_hook: ?RemovalHook = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -390,6 +398,14 @@ pub const ServerObjects = struct {
     }
 
     pub fn deinit(server_objects: *ServerObjects, allocator: std.mem.Allocator) void {
+        if (server_objects.removal_hook) |hook| {
+            var entries = server_objects.iterator();
+            while (entries.next()) |entry| hook.notify(
+                hook.context,
+                entry.handle,
+                entry.value.*,
+            );
+        }
         server_objects.ids.deinit(allocator);
         server_objects.namespace.deinit(allocator);
         server_objects.* = undefined;
@@ -397,6 +413,10 @@ pub const ServerObjects = struct {
 
     pub fn iterator(server_objects: *ServerObjects) Table(Object).Iterator {
         return server_objects.namespace.iterator();
+    }
+
+    pub fn setRemovalHook(server_objects: *ServerObjects, hook: ?RemovalHook) void {
+        server_objects.removal_hook = hook;
     }
 
     pub fn insertClient(
@@ -411,6 +431,15 @@ pub const ServerObjects = struct {
     }
 
     pub fn removeClient(
+        server_objects: *ServerObjects,
+        handle: Handle,
+    ) ServerObjectsError!Object {
+        const object = try server_objects.cancelClient(handle);
+        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
+        return object;
+    }
+
+    pub fn cancelClient(
         server_objects: *ServerObjects,
         handle: Handle,
     ) ServerObjectsError!Object {
@@ -437,7 +466,9 @@ pub const ServerObjects = struct {
         if (server_objects.namespace.resolve(handle) == null)
             return error.StaleHandle;
         try server_objects.ids.release(handle.id);
-        return server_objects.namespace.remove(handle).?;
+        const object = server_objects.namespace.remove(handle).?;
+        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
+        return object;
     }
 };
 
@@ -814,6 +845,7 @@ pub const SharedNamespace = struct {
 /// Server-side object policy over reactor-wide shared physical entries.
 pub const SharedServerObjects = struct {
     namespace: SharedNamespace,
+    removal_hook: ?RemovalHook = null,
 
     pub fn init(
         pool: *SharedObjectPool,
@@ -887,12 +919,24 @@ pub const SharedServerObjects = struct {
     }
 
     pub fn deinit(server_objects: *SharedServerObjects) void {
+        if (server_objects.removal_hook) |hook| {
+            var entries = server_objects.iterator();
+            while (entries.next()) |entry| hook.notify(
+                hook.context,
+                entry.handle,
+                entry.value.*,
+            );
+        }
         server_objects.namespace.deinit();
         server_objects.* = undefined;
     }
 
     pub fn iterator(server_objects: *SharedServerObjects) SharedNamespace.Iterator {
         return server_objects.namespace.iterator();
+    }
+
+    pub fn setRemovalHook(server_objects: *SharedServerObjects, hook: ?RemovalHook) void {
+        server_objects.removal_hook = hook;
     }
 
     pub fn insertClient(
@@ -907,6 +951,15 @@ pub const SharedServerObjects = struct {
     }
 
     pub fn removeClient(
+        server_objects: *SharedServerObjects,
+        handle: Handle,
+    ) ServerObjectsError!Object {
+        const object = try server_objects.cancelClient(handle);
+        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
+        return object;
+    }
+
+    pub fn cancelClient(
         server_objects: *SharedServerObjects,
         handle: Handle,
     ) ServerObjectsError!Object {
@@ -928,7 +981,9 @@ pub const SharedServerObjects = struct {
         handle: Handle,
     ) ServerObjectsError!Object {
         if (handle.id < server_id_start) return error.InvalidServerId;
-        return server_objects.namespace.remove(handle) orelse error.StaleHandle;
+        const object = server_objects.namespace.remove(handle) orelse return error.StaleHandle;
+        if (server_objects.removal_hook) |hook| hook.notify(hook.context, handle, object);
+        return object;
     }
 };
 
@@ -1338,6 +1393,11 @@ test "server objects separate client and server ID ownership" {
         null,
     );
     defer server_objects.deinit(std.testing.allocator);
+    var removal_count: usize = 0;
+    server_objects.setRemovalHook(.{
+        .context = &removal_count,
+        .notify = countRemoval,
+    });
 
     const client = try server_objects.insertClient(7, &child_info, 1, null);
     try std.testing.expectError(
@@ -1345,12 +1405,22 @@ test "server objects separate client and server ID ownership" {
         server_objects.insertClient(server_id_start, &child_info, 1, null),
     );
     _ = try server_objects.removeClient(client);
+    try std.testing.expectEqual(@as(usize, 1), removal_count);
+    const unpublished = try server_objects.insertClient(8, &child_info, 1, null);
+    _ = try server_objects.cancelClient(unpublished);
+    try std.testing.expectEqual(@as(usize, 1), removal_count);
 
     const first = try server_objects.createLocal(&child_info, 1, null);
     try std.testing.expectEqual(server_id_start, first.id);
     _ = try server_objects.removeLocal(first);
+    try std.testing.expectEqual(@as(usize, 2), removal_count);
     const reused = try server_objects.createLocal(&child_info, 1, null);
     try std.testing.expectEqual(first.id, reused.id);
+}
+
+fn countRemoval(context: ?*anyopaque, _: Handle, _: Object) void {
+    const count: *usize = @ptrCast(@alignCast(context.?));
+    count.* += 1;
 }
 
 test "server namespaces share physical objects with isolated quotas" {
