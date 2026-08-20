@@ -858,6 +858,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     });
     defer reactor.deinit(std.testing.allocator);
     const listener_fd = try wayring.unix_socket.listen(path, 4);
+    var visibility: VisibilityState = .{};
     var runtime = try wayring.server.Runtime(protocol).init(
         std.testing.allocator,
         &reactor,
@@ -873,6 +874,10 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
             .buckets_per_client = 8,
             .max_globals = 2,
             .registry_capacity = 3,
+            .global_filter = .{
+                .context = &visibility,
+                .visible = globalVisible,
+            },
         },
     );
     var bind_state: BindState = .{};
@@ -881,6 +886,11 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         1,
         &bind_state,
         activateGlobal,
+    );
+    const initial_restricted = try runtime.globals.add(
+        &protocol.wp_wayring_test_v1.info,
+        1,
+        &visibility.restricted_context,
     );
     try runtime.prepareAccept();
     const client_fds: [2]linux.fd_t = .{
@@ -902,6 +912,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         peer.* = (try runtime.completeListener(accept_completion, null)) orelse
             return error.UnexpectedCompletion;
     }
+    visibility.allowed_slot = accepted_peers[0].slot;
     var removal_states: [2]RemovalState = .{ .{}, .{} };
     for (accepted_peers, &removal_states) |peer, *state| try runtime.setRemovalHook(
         peer,
@@ -983,18 +994,51 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         (try runtime.publishNext()).blocked,
     );
     try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
-    for (accepted_peers, registries) |peer, registry| {
-        try std.testing.expectEqual(peer, (try runtime.publishNext()).sent);
-        const actor = try reactor.getActor(peer);
+    var saw_public = false;
+    var saw_restricted = false;
+    for (0..2) |_| {
+        try std.testing.expectEqual(accepted_peers[0], (try runtime.publishNext()).sent);
+        const actor = try reactor.getActor(accepted_peers[0]);
         const message = try firstMessage(&actor.transmit);
-        try std.testing.expectEqual(registry.id, message.header.object_id);
+        try std.testing.expectEqual(registries[0].id, message.header.object_id);
         const event = try Core.Registry.decodeEvent(message, &actor.received_fds);
-        try std.testing.expectEqual(initial_global.id, switch (event) {
+        const name = switch (event) {
             .global => |value| value.name,
             else => unreachable,
-        });
+        };
+        if (name == initial_global.id) saw_public = true;
+        if (name == initial_restricted.id) saw_restricted = true;
         try consume(&actor.transmit);
     }
+    try std.testing.expect(saw_public);
+    try std.testing.expect(saw_restricted);
+    try std.testing.expectEqual(accepted_peers[1], (try runtime.publishNext()).sent);
+    const second_initial_actor = try reactor.getActor(accepted_peers[1]);
+    const second_initial = try Core.Registry.decodeEvent(
+        try firstMessage(&second_initial_actor.transmit),
+        &second_initial_actor.received_fds,
+    );
+    try std.testing.expectEqual(initial_global.id, switch (second_initial) {
+        .global => |value| value.name,
+        else => unreachable,
+    });
+    try consume(&second_initial_actor.transmit);
+    try std.testing.expectEqual(
+        wayring.server.Runtime(protocol).PublishResult.complete,
+        try runtime.publishNext(),
+    );
+
+    try runtime.removeGlobal(initial_restricted);
+    try std.testing.expectEqual(accepted_peers[0], (try runtime.publishNext()).sent);
+    const initial_remove = try Core.Registry.decodeEvent(
+        try firstMessage(&(try reactor.getActor(accepted_peers[0])).transmit),
+        &(try reactor.getActor(accepted_peers[0])).received_fds,
+    );
+    try std.testing.expectEqual(initial_restricted.id, switch (initial_remove) {
+        .global_remove => |value| value.name,
+        else => unreachable,
+    });
+    try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
     try std.testing.expectEqual(
         wayring.server.Runtime(protocol).PublishResult.complete,
         try runtime.publishNext(),
@@ -1121,6 +1165,56 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         try runtime.publishNext(),
     );
 
+    visibility.allowed_slot = accepted_peers[0].slot;
+    const restricted = try runtime.addGlobal(
+        &protocol.wp_wayring_test_v1.info,
+        1,
+        &visibility.restricted_context,
+    );
+    for ([_]wayring.objects.Handle{ registries[0], late_registry }) |registry| {
+        try std.testing.expectEqual(accepted_peers[0], (try runtime.publishNext()).sent);
+        const message = try firstMessage(&first_actor.transmit);
+        try std.testing.expectEqual(registry.id, message.header.object_id);
+        const event = try Core.Registry.decodeEvent(message, &first_actor.received_fds);
+        try std.testing.expectEqual(restricted.id, switch (event) {
+            .global => |value| value.name,
+            else => unreachable,
+        });
+        try consume(&first_actor.transmit);
+    }
+    try std.testing.expectEqual(
+        wayring.server.Runtime(protocol).PublishResult.complete,
+        try runtime.publishNext(),
+    );
+    try std.testing.expectError(error.UnknownGlobal, runtime.bindGlobal(
+        accepted_peers[1],
+        .{ .bind = .{
+            .name = restricted.id,
+            .id = .{
+                .interface = protocol.wp_wayring_test_v1.info.name,
+                .version = 1,
+                .id = 5,
+            },
+        } },
+    ));
+
+    try runtime.removeGlobal(restricted);
+    for ([_]wayring.objects.Handle{ registries[0], late_registry }) |registry| {
+        try std.testing.expectEqual(accepted_peers[0], (try runtime.publishNext()).sent);
+        const message = try firstMessage(&first_actor.transmit);
+        try std.testing.expectEqual(registry.id, message.header.object_id);
+        const event = try Core.Registry.decodeEvent(message, &first_actor.received_fds);
+        try std.testing.expectEqual(restricted.id, switch (event) {
+            .global_remove => |value| value.name,
+            else => unreachable,
+        });
+        try consume(&first_actor.transmit);
+    }
+    try std.testing.expectEqual(
+        wayring.server.Runtime(protocol).PublishResult.complete,
+        try runtime.publishNext(),
+    );
+
     _ = try runtime.prepareEndpointClose();
     for (accepted_peers) |peer| _ = try runtime.clients.prepareClose(peer);
     _ = try reactor.ring.submit();
@@ -1155,6 +1249,17 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         linux.E.BADF,
         linux.errno(linux.fcntl(listener_fd, linux.F.GETFD, 0)),
     );
+}
+
+const VisibilityState = struct {
+    allowed_slot: u24 = 0,
+    restricted_context: u8 = 0,
+};
+
+fn globalVisible(context: ?*anyopaque, visibility: wayring.server.GlobalVisibility) bool {
+    const state: *VisibilityState = @ptrCast(@alignCast(context.?));
+    const restricted: ?*anyopaque = &state.restricted_context;
+    return visibility.global_context != restricted or visibility.peer.slot == state.allowed_slot;
 }
 
 const BindState = struct {

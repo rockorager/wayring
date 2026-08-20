@@ -95,6 +95,13 @@ for application resource cleanup. Published destructor removals and disconnect
 teardown notify it, while constructor and bind rollback deliberately do not.
 The hook lives once per client rather than once per object, preserving object
 size and hot lookup locality; disconnect remains O(1) when no hook is installed.
+The server runtime may also install one cold-path global-visibility predicate.
+Initial registry listings, later global additions and removals, and bind
+authorization all apply the same predicate to the client's immutable Linux
+credentials and the global definition. Hidden names cannot be bound directly.
+Visibility remains stable for each global lifetime so removal publication
+matches the clients that observed its addition; policy changes remove and
+re-add the global instead of retaining per-registry visibility sets.
 
 Each generated interface also exports compact immutable metadata: its maximum
 version and each request/event's introduction version and destructor bit.

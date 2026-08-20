@@ -58,6 +58,23 @@ pub const Global = struct {
     bind: ?BindFn = null,
 };
 
+/// Cold-path policy input for registry publication and bind authorization.
+pub const GlobalVisibility = struct {
+    peer: io_uring.Peer,
+    credentials: Credentials,
+    global: objects.Handle,
+    interface: *const metadata.Interface,
+    version: u32,
+    global_context: ?*anyopaque,
+};
+
+/// Optional runtime-wide global policy. The predicate must remain stable for a
+/// global's lifetime; remove and re-add a global to change its visibility.
+pub const GlobalFilter = struct {
+    context: ?*anyopaque = null,
+    visible: *const fn (?*anyopaque, GlobalVisibility) bool,
+};
+
 /// Owns one listening descriptor and its persistent multishot accept state.
 /// Socket creation, publication, path cleanup, CQE routing, and accepted-client
 /// policy remain explicit at the caller boundary.
@@ -827,10 +844,10 @@ const RegistrySubscriptions = struct {
     };
 
     const Update = struct {
-        name: u32,
+        handle: objects.Handle,
         change: union(enum) {
             added: Global,
-            removed,
+            removed: Global,
         },
         sequence_limit: u64,
         slot_index: usize = 0,
@@ -985,20 +1002,24 @@ const RegistrySubscriptions = struct {
 
     fn updateAdded(
         subscriptions: RegistrySubscriptions,
-        name: u32,
+        handle: objects.Handle,
         global: Global,
     ) Update {
         return .{
-            .name = name,
+            .handle = handle,
             .change = .{ .added = global },
             .sequence_limit = subscriptions.next_sequence -% 1,
         };
     }
 
-    fn updateRemoved(subscriptions: RegistrySubscriptions, name: u32) Update {
+    fn updateRemoved(
+        subscriptions: RegistrySubscriptions,
+        handle: objects.Handle,
+        global: Global,
+    ) Update {
         return .{
-            .name = name,
-            .change = .removed,
+            .handle = handle,
+            .change = .{ .removed = global },
             .sequence_limit = subscriptions.next_sequence -% 1,
         };
     }
@@ -1061,6 +1082,7 @@ pub fn Runtime(comptime protocol: type) type {
         registries: RegistrySubscriptions,
         global_update: ?RegistrySubscriptions.Update = null,
         actor_config: io_uring.ActorConfig,
+        global_filter: ?GlobalFilter,
 
         pub const PublishResult = union(enum) {
             sent: io_uring.Peer,
@@ -1075,6 +1097,8 @@ pub fn Runtime(comptime protocol: type) type {
             buckets_per_client: usize,
             max_globals: usize,
             registry_capacity: usize,
+            /// Applied to initial listings, later add/remove events, and binds.
+            global_filter: ?GlobalFilter = null,
         };
 
         /// Takes ownership of `listener_fd`. Initialization failure closes it.
@@ -1108,7 +1132,25 @@ pub fn Runtime(comptime protocol: type) type {
                 .globals = globals,
                 .registries = registries,
                 .actor_config = config.actor,
+                .global_filter = config.global_filter,
             };
+        }
+
+        fn globalVisible(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            handle: objects.Handle,
+            global: Global,
+        ) !bool {
+            const filter = runtime.global_filter orelse return true;
+            return filter.visible(filter.context, .{
+                .peer = peer,
+                .credentials = try runtime.clients.getCredentials(peer),
+                .global = handle,
+                .interface = global.interface,
+                .version = global.version,
+                .global_context = global.context,
+            });
         }
 
         pub inline fn prepareAccept(runtime: *Self) !void {
@@ -1194,7 +1236,7 @@ pub fn Runtime(comptime protocol: type) type {
                 bind,
             );
             runtime.global_update = runtime.registries.updateAdded(
-                handle.id,
+                handle,
                 (try runtime.globals.get(handle.id)).*,
             );
             return handle;
@@ -1214,6 +1256,8 @@ pub fn Runtime(comptime protocol: type) type {
             const global_handle = runtime.globals.table.lookupHandle(binding.name) orelse
                 return error.UnknownGlobal;
             const global = runtime.globals.table.resolve(global_handle) orelse unreachable;
+            if (!try runtime.globalVisible(peer, global_handle, global.*))
+                return error.UnknownGlobal;
             const interface = global.interface;
             const advertised_version = global.version;
             const global_context = global.context;
@@ -1255,8 +1299,8 @@ pub fn Runtime(comptime protocol: type) type {
         pub fn removeGlobal(runtime: *Self, handle: objects.Handle) !void {
             if (runtime.global_update != null or runtime.registries.initial_count != 0)
                 return error.GlobalUpdateActive;
-            _ = try runtime.globals.remove(handle);
-            runtime.global_update = runtime.registries.updateRemoved(handle.id);
+            const removed = try runtime.globals.remove(handle);
+            runtime.global_update = runtime.registries.updateRemoved(handle, removed);
         }
 
         /// Queues at most one global event, finishing an active table mutation
@@ -1286,12 +1330,24 @@ pub fn Runtime(comptime protocol: type) type {
                         runtime.registries.advance(update, candidate.node);
                         continue;
                     }
+                    const visibility_global = switch (update.change) {
+                        .added => |value| value,
+                        .removed => |value| value,
+                    };
+                    if (!try runtime.globalVisible(
+                        candidate.peer,
+                        update.handle,
+                        visibility_global,
+                    )) {
+                        runtime.registries.advance(update, candidate.node);
+                        continue;
+                    }
                     switch (update.change) {
                         .added => |global| ProtocolCore.sendGlobalEntry(
                             server_objects,
                             &actor.transmit,
                             candidate.registry,
-                            update.name,
+                            update.handle.id,
                             global,
                         ) catch |err| switch (err) {
                             error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
@@ -1301,7 +1357,7 @@ pub fn Runtime(comptime protocol: type) type {
                             server_objects,
                             &actor.transmit,
                             candidate.registry,
-                            update.name,
+                            update.handle.id,
                         ) catch |err| switch (err) {
                             error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
                             else => return err,
@@ -1335,15 +1391,28 @@ pub fn Runtime(comptime protocol: type) type {
                     continue;
                 }
                 const cursor = &runtime.registries.nodes[candidate.node].initial.?;
-                const sent = ProtocolCore.advertiseNext(
-                    server_objects,
-                    &actor.transmit,
-                    candidate.registry,
-                    cursor,
-                ) catch |err| switch (err) {
-                    error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                    else => return err,
-                };
+                var sent = false;
+                while (!sent) {
+                    if (cursor.pending == null)
+                        cursor.pending = cursor.iterator.next() orelse break;
+                    const entry = cursor.pending.?;
+                    if (!try runtime.globalVisible(candidate.peer, entry.handle, entry.value.*)) {
+                        cursor.pending = null;
+                        continue;
+                    }
+                    ProtocolCore.sendGlobalEntry(
+                        server_objects,
+                        &actor.transmit,
+                        candidate.registry,
+                        entry.handle.id,
+                        entry.value.*,
+                    ) catch |err| switch (err) {
+                        error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
+                        else => return err,
+                    };
+                    cursor.pending = null;
+                    sent = true;
+                }
                 if (!sent) {
                     runtime.registries.completeInitial(candidate);
                     continue;
