@@ -894,7 +894,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
     const receive_buffer_count = try std.math.ceilPowerOfTwo(
         u16,
-        @intCast(@max(recv_buffer_count, options.connections * 2)),
+        @intCast(@max(recv_buffer_count, options.connections)),
     );
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = multi_ring_entries }, .{

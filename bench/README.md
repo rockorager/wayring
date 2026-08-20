@@ -52,9 +52,10 @@ CONNECTIONS=64 IDLE_MS=5000 bench/run.sh idle-perf
 The multi-connection modes compare Wayring and libwayland across identical
 socket counts and messages per connection. Wayring uses one io_uring instance
 in each process across all socket pairs. Every server multishot receive selects
-from one provided-buffer group, and all connection actors share the fragment
-and transmit pools. Server object dispatch also uses one shared physical node
-pool with connection-scoped namespaces. `MESSAGES` and `WARMUP` are per
+from one provided-buffer group sized to at least one buffer per connection, and
+all connection actors share the fragment and transmit pools. Server object
+dispatch also uses one shared physical node pool with connection-scoped
+namespaces. `MESSAGES` and `WARMUP` are per
 connection; the reported message count and throughput are aggregate. Wayring
 client send SQEs for every connection are submitted together once per batch;
 libwayland queues the same requests before flushing each display. Connection
