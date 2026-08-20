@@ -90,6 +90,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_server_core_tests.step);
     test_step.dependOn(&run_end_to_end_tests.step);
 
+    const protocol_compat_test = b.addSystemCommand(&.{ "/bin/sh", "test/protocol-compat.sh" });
+    protocol_compat_test.addArtifactArg(scanner);
+    const protocol_compat_step = b.step(
+        "protocol-compat",
+        "Generate and test common production Wayland protocols",
+    );
+    protocol_compat_step.dependOn(&protocol_compat_test.step);
+
     const build_benchmarks = b.addSystemCommand(&.{ "/bin/sh", "bench/build.sh" });
     const benchmark_step = b.step("benchmarks", "Build the benchmark executables");
     benchmark_step.dependOn(&build_benchmarks.step);

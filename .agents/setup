@@ -5,11 +5,11 @@ version=0.16.0
 install_dir="$HOME/.local/zig/$version"
 bin_dir="$HOME/.local/bin"
 
-if ! pkg-config --exists wayland-client wayland-server 2>/dev/null ||
+if ! pkg-config --exists wayland-client wayland-server wayland-protocols 2>/dev/null ||
     ! command -v strace >/dev/null 2>&1 ||
     ! command -v perf >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y libwayland-dev linux-perf pkg-config strace
+    sudo apt-get install -y libwayland-dev linux-perf pkg-config strace wayland-protocols
 fi
 
 case "$(uname -m)" in
