@@ -178,6 +178,138 @@ test "client and server complete a core round trip on one reactor" {
     try std.testing.expectEqual(final_nop, (try ring.copy_cqe()).user_data);
 }
 
+test "client closes after a transported terminal display error" {
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &sockets,
+    )));
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(std.testing.allocator, .{ .entries = 16 }, .{
+        .max_connections = 2,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 4,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 2,
+        .transmit_block_size = 64,
+        .transmit_block_count = 2,
+        .descriptor_count = 2,
+        .send_descriptor_capacity = 1,
+    });
+    const actor_config: wayring.io_uring.ActorConfig = .{
+        .received_fd_budget = 1,
+        .transmit_byte_budget = 64,
+        .transmit_fd_budget = 1,
+    };
+    var server_connections = try ServerConnections.init(
+        std.testing.allocator,
+        &reactor,
+        2,
+        1,
+        4,
+    );
+    const server_peer = try server_connections.admit(
+        .{ .fd = sockets[0], .more = false },
+        actor_config,
+        null,
+    );
+    var client_connection = try ClientConnection.attach(
+        std.testing.allocator,
+        &reactor,
+        sockets[1],
+        actor_config,
+        .{ .max_objects = 1, .max_client_ids = 1 },
+    );
+    const client_peer = client_connection.peer;
+    const server_actor = try reactor.getActor(server_peer);
+    try ServerCore.postError(server_actor, wayring.objects.display_id, 3, "terminal");
+    try ServerCore.Display.encodeEvent(
+        &server_actor.transmit,
+        wayring.objects.display_id,
+        .{ .delete_id = .{ .id = 2 } },
+    );
+    try reactor.prepareSend(server_peer);
+    _ = try reactor.ring.submit();
+
+    var handler: TerminalClientHandler = .{
+        .objects = &client_connection.objects,
+    };
+    var terminal_seen = false;
+    var send_complete = false;
+    while (!terminal_seen or !send_complete) {
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        const peer = reactor.routedPeer(routed);
+        const actor = try reactor.getActor(peer);
+        const event = try actor.completeRouted(routed.operation, completion);
+        switch (event) {
+            .received => {
+                if (peer.slot != client_peer.slot) return error.InvalidCompletion;
+                const result = try ClientCore.receivedEvents(
+                    actor,
+                    &client_connection.objects.namespace,
+                    try reactor.getReceiver(peer),
+                    completion,
+                    &handler,
+                );
+                const failure = switch (result) {
+                    .terminal => |value| value,
+                    .dispatched => return error.ExpectedProtocolError,
+                };
+                try std.testing.expectEqual(@as(usize, 1), failure.dispatched);
+                try std.testing.expectEqual(
+                    @as(?u32, wayring.objects.display_id),
+                    failure.object_id,
+                );
+                try std.testing.expectEqual(error.ServerProtocolError, failure.cause);
+                terminal_seen = true;
+            },
+            .sent => {
+                if (peer.slot != server_peer.slot) return error.InvalidCompletion;
+                send_complete = true;
+            },
+            .buffers_exhausted => {
+                try reactor.prepareReceive(peer);
+                _ = try reactor.ring.submit();
+            },
+            else => return error.InvalidCompletion,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.errors);
+    try std.testing.expectEqual(@as(usize, 0), handler.delete_ids);
+    try std.testing.expectEqual(
+        wayring.connection.Lifecycle.closing,
+        (try client_connection.actor()).lifecycle,
+    );
+
+    _ = try server_connections.prepareClose(server_peer);
+    _ = try client_connection.prepareClose();
+    _ = try reactor.ring.submit();
+    while (!(try reactor.getActor(server_peer)).canDeinit() or
+        !(try reactor.getActor(client_peer)).canDeinit())
+    {
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        const peer = reactor.routedPeer(routed);
+        const actor = try reactor.getActor(peer);
+        const event = try actor.completeRouted(routed.operation, completion);
+        switch (event) {
+            .received => try (try reactor.getReceiver(peer)).buffers.put(completion),
+            .receive_stopped, .buffers_exhausted, .cancel_complete, .disconnected => {},
+            else => return error.InvalidCompletion,
+        }
+    }
+    try server_connections.destroy(server_peer);
+    try client_connection.deinit(std.testing.allocator);
+    server_connections.deinit(std.testing.allocator);
+    reactor.deinit(std.testing.allocator);
+}
+
 test "client connection rolls back failed object initialization" {
     var sockets: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -282,6 +414,27 @@ const ClientHandler = struct {
                 .@"error" => return error.ProtocolError,
             }
         } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
+const TerminalClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    errors: usize = 0,
+    delete_ids: usize = 0,
+
+    pub fn event(
+        handler: *TerminalClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface != &ClientCore.Display.info)
+            return error.UnexpectedEvent;
+        switch (try ClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+            .@"error" => handler.errors += 1,
+            .delete_id => handler.delete_ids += 1,
+        }
         return .continue_dispatch;
     }
 };
