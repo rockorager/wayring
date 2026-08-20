@@ -107,6 +107,10 @@ pub const Namespace = struct {
         return namespace.table.removeHandle(handle);
     }
 
+    pub fn get(namespace: *Namespace, id: u32) ?*Object {
+        return namespace.table.get(id);
+    }
+
     pub fn resolve(namespace: *Namespace, handle: Handle) ?*Object {
         return namespace.table.resolve(handle);
     }

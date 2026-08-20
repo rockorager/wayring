@@ -107,6 +107,27 @@ test "generic client helpers apply generated destructor lifecycle" {
     var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
 
     const object = try client_objects.createLocal(&protocol.wp_wayring_test_v1.info, 1, null);
+    try std.testing.expectError(
+        error.UnknownObject,
+        wayring.client.sendRequest(
+            protocol.wp_wayring_test_v1,
+            &client_objects,
+            &queue,
+            object,
+            .{ .set_target = .{ .target = 99 } },
+        ),
+    );
+    try std.testing.expectError(
+        error.WrongInterface,
+        wayring.client.sendRequest(
+            protocol.wp_wayring_test_v1,
+            &client_objects,
+            &queue,
+            object,
+            .{ .set_target = .{ .target = wayring.objects.display_id } },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), queue.queuedBytes());
     const full = [_]u8{0} ** 64;
     try queue.enqueue(&full, &.{});
     try std.testing.expectError(

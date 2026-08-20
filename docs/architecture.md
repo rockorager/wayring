@@ -37,6 +37,14 @@ Generated decoders validate and consume the byte argument stream before
 checking the independent descriptor queue. They verify that the complete FD
 set is available before transferring any descriptor, so malformed bytes or FD
 backpressure cannot partially consume a message's descriptor ownership.
+Safe client and server helpers also use generated object-aware decoder variants.
+Every non-null `object` argument must exist in that connection's namespace and,
+when XML declares an interface, its metadata name must match. These checks run
+after byte validation but before descriptor transfer, so an invalid reference
+cannot leak an FD carried by the same message. Standalone codec users retain the
+policy-free decoder, while safe outgoing helpers validate object references
+before committing a frame to TX. Interfaces without object arguments generate
+neither the validator nor an alternate hot path.
 Generated enum arguments use four-byte transparent wrappers with named values
 and explicit integer conversion. Unknown values remain representable and round
 trip unchanged, including signed and cross-interface enums; bitfields also

@@ -115,6 +115,8 @@ fn emitInterface(
         \\        UnknownOpcode,
         \\        UnexpectedNull,
         \\        NullObject,
+        \\        UnknownObject,
+        \\        WrongInterface,
         \\    };
         \\    pub const EncodeError = wire.EncodeError || tx.Error || error{
         \\        LengthOverflow,
@@ -599,6 +601,10 @@ fn emitDirection(
     comptime direction: []const u8,
     messages: []const protocol_ir.Message,
 ) Error!void {
+    var has_objects = false;
+    for (messages) |message| for (message.arguments) |argument| {
+        if (argument.type == .object) has_objects = true;
+    };
     try add(output, allocator, "    pub const " ++ direction ++ " = union(enum) {\n");
     if (messages.len == 0) {
         try add(output, allocator, "        _none: void,\n");
@@ -625,7 +631,40 @@ fn emitDirection(
         try add(output, allocator, "    };\n\n");
     }
 
-    try add(output, allocator, "    pub fn decode" ++ direction ++ "(\n");
+    try emitDecoderSignature(output, allocator, direction, false);
+    if (has_objects) {
+        try add(output, allocator, "        return decode" ++ direction ++ "Impl(false, {}, message, fds);\n    }\n\n");
+        try emitDecoderSignature(output, allocator, direction, true);
+        try add(output, allocator, "        return decode" ++ direction ++ "Impl(true, namespace, message, fds);\n    }\n\n");
+        try add(output, allocator, "    fn decode" ++ direction ++ "Impl(comptime validate_objects: bool, namespace: anytype, message: wire.Message, fds: *ancillary.FdQueue) DecodeError!" ++ direction ++ " {\n");
+    }
+    var has_fds = false;
+    for (messages) |message| for (message.arguments) |argument| {
+        if (argument.type == .fd) has_fds = true;
+    };
+    if (!has_fds) try add(output, allocator, "        _ = fds;\n");
+    try add(output, allocator, "        return switch (message.header.opcode) {\n");
+    for (messages) |message| try emitDecoderCase(output, allocator, message, has_objects);
+    try add(output, allocator,
+        \\            else => error.UnknownOpcode,
+        \\        };
+        \\    }
+        \\
+    );
+    if (has_objects) try emitObjectValidator(output, allocator, direction, messages);
+    try emitEncoder(output, allocator, direction, messages);
+}
+
+fn emitDecoderSignature(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime direction: []const u8,
+    validated: bool,
+) Error!void {
+    try add(output, allocator, "    pub fn decode" ++ direction);
+    if (validated) try add(output, allocator, "Objects");
+    try add(output, allocator, "(\n");
+    if (validated) try add(output, allocator, "        namespace: anytype,\n");
     try add(output, allocator,
         \\        message: wire.Message,
         \\        fds: *ancillary.FdQueue,
@@ -633,20 +672,6 @@ fn emitDirection(
     );
     try add(output, allocator, direction);
     try add(output, allocator, " {\n");
-    var has_fds = false;
-    for (messages) |message| for (message.arguments) |argument| {
-        if (argument.type == .fd) has_fds = true;
-    };
-    if (!has_fds) try add(output, allocator, "        _ = fds;\n");
-    try add(output, allocator, "        return switch (message.header.opcode) {\n");
-    for (messages) |message| try emitDecoderCase(output, allocator, message);
-    try add(output, allocator,
-        \\            else => error.UnknownOpcode,
-        \\        };
-        \\    }
-        \\
-    );
-    try emitEncoder(output, allocator, direction, messages);
 }
 
 fn emitEncoder(
@@ -911,6 +936,7 @@ fn emitDecoderCase(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     message: protocol_ir.Message,
+    supports_object_validation: bool,
 ) Error!void {
     try add(output, allocator, "            ");
     try unsigned(output, allocator, message.opcode);
@@ -926,6 +952,23 @@ fn emitDecoderCase(
         try add(output, allocator, ";\n");
     }
     try add(output, allocator, "                try arguments.finish();\n");
+    if (supports_object_validation) {
+        var object_index: usize = 0;
+        for (message.arguments) |argument| {
+            if (argument.type != .object) continue;
+            try add(output, allocator, "                if (validate_objects) {\n");
+            try emitObjectValidation(
+                output,
+                allocator,
+                argument,
+                "decoded_",
+                object_index,
+                20,
+            );
+            try add(output, allocator, "                }\n");
+            object_index += 1;
+        }
+    }
     var fd_count: usize = 0;
     for (message.arguments) |argument| if (argument.type == .fd) {
         fd_count += 1;
@@ -955,6 +998,97 @@ fn emitDecoderCase(
     }
     if (message.arguments.len > 0) try add(output, allocator, "                ");
     try add(output, allocator, "} };\n            },\n");
+}
+
+fn emitObjectValidator(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime direction: []const u8,
+    messages: []const protocol_ir.Message,
+) Error!void {
+    try add(output, allocator, "    pub inline fn validate" ++ direction ++ "Objects(namespace: anytype, value: " ++ direction ++ ") !void {\n        switch (value) {\n");
+    for (messages) |message| {
+        var object_count: usize = 0;
+        for (message.arguments) |argument| if (argument.type == .object) {
+            object_count += 1;
+        };
+        if (object_count == 0) continue;
+        try add(output, allocator, "            .");
+        try identifier(output, allocator, message.name);
+        try add(output, allocator, " => |payload| {\n");
+        var object_index: usize = 0;
+        for (message.arguments) |argument| {
+            if (argument.type != .object) continue;
+            try emitObjectValidation(
+                output,
+                allocator,
+                argument,
+                "payload.",
+                object_index,
+                16,
+            );
+            object_index += 1;
+        }
+        try add(output, allocator, "            },\n");
+    }
+    try add(output, allocator, "            else => {},\n        }\n    }\n\n");
+}
+
+fn emitObjectValidation(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    argument: protocol_ir.Argument,
+    value_prefix: []const u8,
+    index: usize,
+    indent: usize,
+) Error!void {
+    try addSpaces(output, allocator, indent);
+    if (argument.allow_null) {
+        try add(output, allocator, "if (");
+        try emitObjectValue(output, allocator, argument.name, value_prefix);
+        try add(output, allocator, ") |object_id| {\n");
+    }
+    const body_indent = indent + @as(usize, if (argument.allow_null) 4 else 0);
+    try addSpaces(output, allocator, body_indent);
+    if (argument.interface != null) {
+        try add(output, allocator, "const referenced_");
+        try unsigned(output, allocator, index);
+        try add(output, allocator, " = ");
+    } else {
+        try add(output, allocator, "_ = ");
+    }
+    try add(output, allocator, "namespace.get(");
+    if (argument.allow_null) {
+        try add(output, allocator, "object_id");
+    } else {
+        try emitObjectValue(output, allocator, argument.name, value_prefix);
+    }
+    try add(output, allocator, ") orelse return error.UnknownObject;\n");
+    if (argument.interface) |interface| {
+        try addSpaces(output, allocator, body_indent);
+        try add(output, allocator, "if (!std.mem.eql(u8, referenced_");
+        try unsigned(output, allocator, index);
+        try add(output, allocator, ".interface.name, \"");
+        try add(output, allocator, interface);
+        try add(output, allocator, "\")) return error.WrongInterface;\n");
+    }
+    if (argument.allow_null) {
+        try addSpaces(output, allocator, indent);
+        try add(output, allocator, "}\n");
+    }
+}
+
+fn emitObjectValue(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    prefix: []const u8,
+) Error!void {
+    try add(output, allocator, prefix);
+    if (std.mem.eql(u8, prefix, "decoded_"))
+        try add(output, allocator, name)
+    else
+        try identifier(output, allocator, name);
 }
 
 fn emitType(
@@ -1065,6 +1199,14 @@ fn add(
     bytes: []const u8,
 ) Error!void {
     try output.appendSlice(allocator, bytes);
+}
+
+fn addSpaces(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    count: usize,
+) Error!void {
+    try output.appendNTimes(allocator, ' ', count);
 }
 
 test "generates direct typed request and event decoders" {

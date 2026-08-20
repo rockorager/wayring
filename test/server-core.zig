@@ -165,6 +165,19 @@ test "generic server requests finish generated destructor lifecycle" {
     const Interface = protocol.wp_wayring_test_v1;
 
     const client_object = try server_objects.insertClient(2, &Interface.info, 1, null);
+    try Interface.encodeRequest(&receive_queue, client_object.id, .{
+        .set_target = .{ .target = 99 },
+    });
+    try std.testing.expectError(
+        error.UnknownObject,
+        wayring.server.decodeRequest(
+            Interface,
+            &server_objects,
+            try firstMessage(&receive_queue),
+            &received_fds,
+        ),
+    );
+    try consume(&receive_queue);
     try Interface.encodeRequest(&receive_queue, client_object.id, .{ .destroy = .{} });
     var message = try firstMessage(&receive_queue);
     const client_request = try wayring.server.decodeRequest(

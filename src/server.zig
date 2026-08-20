@@ -191,9 +191,13 @@ pub fn decodeRequest(
     if (target.object.interface != &Interface.info) return error.WrongInterface;
     const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse
         return error.UnknownObject;
+    const value = if (@hasDecl(Interface, "decodeRequestObjects"))
+        try Interface.decodeRequestObjects(&server_objects.namespace, message, fds)
+    else
+        try Interface.decodeRequest(message, fds);
     return .{
         .handle = handle,
-        .value = try Interface.decodeRequest(message, fds),
+        .value = value,
         .destructor = target.message.destructor,
     };
 }
@@ -215,6 +219,8 @@ pub fn sendEvent(
     if (object.interface != &Interface.info) return error.WrongInterface;
     const opcode: u16 = @intCast(@intFromEnum(std.meta.activeTag(event)));
     const message = try object.interface.event(opcode, object.version);
+    if (@hasDecl(Interface, "validateEventObjects"))
+        try Interface.validateEventObjects(&server_objects.namespace, event);
 
     if (message.destructor and handle.id < objects.server_id_start) {
         const event_size = try Interface.eventSize(event);

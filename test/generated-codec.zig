@@ -114,6 +114,68 @@ test "generated encoder writes every argument directly into the TX queue" {
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(original, linux.F.GETFD, 0)));
 }
 
+test "validated decoding checks object references before taking descriptors" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 128, &descriptors, 1);
+    defer queue.deinit();
+    var namespace = try wayring.objects.Namespace.init(std.testing.allocator, 2);
+    defer namespace.deinit(std.testing.allocator);
+
+    const original_result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try expectSuccess(original_result);
+    const original: linux.fd_t = @intCast(original_result);
+    const received_result = linux.fcntl(original, linux.F.DUPFD_CLOEXEC, 0);
+    try expectSuccess(received_result);
+    const received: linux.fd_t = @intCast(received_result);
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 1);
+    try received_fds.append(received);
+
+    try Interface.encodeRequest(&queue, 7, .{ .all_arguments = .{
+        .signed = 0,
+        .count = .first,
+        .fixed_value = 0,
+        .title = "object validation",
+        .optional_title = null,
+        .target = 9,
+        .child = 10,
+        .dynamic_child = .{ .interface = Interface.info.name, .version = 1, .id = 11 },
+        .bytes = &.{},
+        .optional_bytes = null,
+        .descriptor = original,
+    } });
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+
+    try std.testing.expectError(
+        error.UnknownObject,
+        Interface.decodeRequestObjects(&namespace, message, &received_fds),
+    );
+    try std.testing.expectEqual(@as(usize, 1), received_fds.len());
+
+    const wrong = try namespace.insert(9, &Other.info, 1, null);
+    try std.testing.expectError(
+        error.WrongInterface,
+        Interface.decodeRequestObjects(&namespace, message, &received_fds),
+    );
+    try std.testing.expectEqual(@as(usize, 1), received_fds.len());
+    _ = namespace.remove(wrong);
+    _ = try namespace.insert(9, &Interface.info, 1, null);
+
+    const decoded = try Interface.decodeRequestObjects(&namespace, message, &received_fds);
+    const payload = switch (decoded) {
+        .all_arguments => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(?u32, 9), payload.target);
+    try std.testing.expectEqual(@as(usize, 0), received_fds.len());
+    _ = linux.close(payload.descriptor);
+}
+
 test "generated enum wrappers preserve unknown signed values" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 1);
     defer blocks.deinit(std.testing.allocator);

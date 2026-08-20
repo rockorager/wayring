@@ -60,7 +60,7 @@
       <arg name="fixed_value" type="fixed"/>
       <arg name="title" type="string"/>
       <arg name="optional_title" type="string" allow-null="true"/>
-      <arg name="target" type="object" allow-null="true"/>
+      <arg name="target" type="object" interface="wp_wayring_test_v1" allow-null="true"/>
       <arg name="child" type="new_id" interface="wp_wayring_test_v1"/>
       <arg name="dynamic_child" type="new_id"/>
       <arg name="bytes" type="array"/>
@@ -71,7 +71,7 @@
       <arg name="title" type="string"/>
     </request>
     <request name="set_target">
-      <arg name="target" type="object"/>
+      <arg name="target" type="object" interface="wp_wayring_test_v1"/>
     </request>
     <request name="set_direction">
       <arg name="direction" type="int" enum="wp_wayring_other_v1.direction"/>

@@ -43,6 +43,8 @@ pub fn sendRequest(
     if (object.interface != &Interface.info) return error.WrongInterface;
     const opcode: u16 = @intCast(@intFromEnum(std.meta.activeTag(request)));
     const message = try object.interface.request(opcode, object.version);
+    if (@hasDecl(Interface, "validateRequestObjects"))
+        try Interface.validateRequestObjects(&client_objects.namespace, request);
     try Interface.encodeRequest(queue, handle.id, request);
     if (message.destructor) retire(client_objects, handle);
 }
@@ -65,7 +67,10 @@ pub fn decodeEvent(
         message.header.opcode,
         object.version,
     );
-    const event = try Interface.decodeEvent(message, fds);
+    const event = if (@hasDecl(Interface, "decodeEventObjects"))
+        try Interface.decodeEventObjects(&client_objects.namespace, message, fds)
+    else
+        try Interface.decodeEvent(message, fds);
     if (metadata_message.destructor) retire(client_objects, handle);
     return event;
 }
@@ -311,7 +316,10 @@ pub fn Core(comptime protocol: type) type {
             fds: *ancillary.FdQueue,
         ) Error!Display.Event {
             try requireMessage(client_objects, message, &Display.info);
-            const event = try Display.decodeEvent(message, fds);
+            const event = if (@hasDecl(Display, "decodeEventObjects"))
+                try Display.decodeEventObjects(&client_objects.namespace, message, fds)
+            else
+                try Display.decodeEvent(message, fds);
             switch (event) {
                 .delete_id => |deleted| try client_objects.deleted(deleted.id),
                 .@"error" => {},
