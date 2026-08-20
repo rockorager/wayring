@@ -15,6 +15,10 @@ zig build-exe -OReleaseSafe --dep wayring \
     "$generated/wayring-benchmark.zig"
 "$out/wayring-scanner" "$wayland_datadir/wayland.xml" \
     "$generated/wayland-core.zig"
+protocols_datadir=$(pkg-config --variable=pkgdatadir wayland-protocols)
+xdg_shell="$protocols_datadir/stable/xdg-shell/xdg-shell.xml"
+"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" \
+    "$generated/wayland-xdg.zig"
 
 wayland-scanner client-header "$root/bench/protocol.xml" \
     "$generated/wayring-benchmark-client.h"
@@ -22,6 +26,10 @@ wayland-scanner server-header "$root/bench/protocol.xml" \
     "$generated/wayring-benchmark-server.h"
 wayland-scanner private-code "$root/bench/protocol.xml" \
     "$generated/wayring-benchmark-protocol.c"
+wayland-scanner client-header "$xdg_shell" \
+    "$generated/xdg-shell-client-protocol.h"
+wayland-scanner private-code "$xdg_shell" \
+    "$generated/xdg-shell-protocol.c"
 
 cflags="-std=c11 -O3 -DNDEBUG -D_GNU_SOURCE -Wall -Wextra -Werror"
 
@@ -48,15 +56,18 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep benchmark_protocol \
 # Keep libwayland out of the normal Wayring executable so mixed-interoperability
 # coverage cannot perturb its code layout or benchmark results.
 # shellcheck disable=SC2086
-zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep benchmark_protocol \
+zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard_protocol --dep benchmark_protocol \
     -I"$root/bench" -I"$generated" \
     -Mroot="$root/bench/interop.zig" \
     -cflags $cflags -DWAYRING_PEER_ONLY -I"$generated" \
     $(pkg-config --cflags wayland-client wayland-server) -- \
     "$root/bench/libwayland-client.c" \
     "$root/bench/libwayland-server.c" \
+    "$root/bench/xdg-interop-client.c" \
     "$generated/wayring-benchmark-protocol.c" \
+    "$generated/xdg-shell-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
+    --dep wayring -Mstandard_protocol="$generated/wayland-xdg.zig" \
     --dep wayring -Mbenchmark_protocol="$generated/wayring-benchmark.zig" \
     -Mwayring="$root/src/root.zig" \
     $(pkg-config --libs wayland-client wayland-server) \

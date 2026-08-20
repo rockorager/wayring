@@ -1,10 +1,12 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const core_protocol = @import("core_protocol");
+const standard_protocol = @import("standard_protocol");
 const benchmark_protocol = @import("benchmark_protocol");
 
 const ffi = @cImport({
     @cInclude("benchmark.h");
+    @cInclude("xdg-interop.h");
     @cInclude("stdio.h");
 });
 const c = std.c;
@@ -14,12 +16,14 @@ const ClientConnection = wayring.client.Connection(core_protocol);
 const ServerCore = wayring.server.Core(core_protocol);
 const ServerRuntime = wayring.server.Runtime(core_protocol);
 const Benchmark = benchmark_protocol.wp_wayring_benchmark_v1;
+const XdgServerCore = wayring.server.Core(standard_protocol);
+const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 
 const Options = struct {
     messages: u64 = 1_000_000,
     batch: u32 = 256,
     warmup: u64 = 100_000,
-    mode: enum { libwayland_client, libwayland_server } = .libwayland_client,
+    mode: enum { libwayland_client, libwayland_server, xdg_libwayland_client } = .libwayland_client,
     latency: bool = false,
 };
 
@@ -28,6 +32,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     return switch (options.mode) {
         .libwayland_client => wayringServer(options),
         .libwayland_server => wayringClient(options),
+        .xdg_libwayland_client => wayringXdgServer(),
     };
 }
 
@@ -292,6 +297,308 @@ const ServerHandler = struct {
                 },
             }
             try decoded.finish(core_protocol, handler.objects, handler.queue);
+        } else return error.UnexpectedRequest;
+        return .continue_dispatch;
+    }
+};
+
+fn wayringXdgServer() !u8 {
+    var path_storage: [100]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_storage,
+        "/tmp/wayring-xdg-interop-{d}",
+        .{linux.getpid()},
+    );
+    wayring.unix_socket.unlink(path) catch |err| if (err != error.NotFound) return err;
+    defer wayring.unix_socket.unlink(path) catch {};
+    const listener_fd = try wayring.unix_socket.listen(path, 1);
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = linux.close(listener_fd);
+        const connected_fd = wayring.unix_socket.connect(path) catch c._exit(1);
+        c._exit(ffi.xdg_client_fd(connected_fd));
+    }
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var runtime = try XdgServerRuntime.init(allocator, &reactor, listener_fd, .{
+        .actor = .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .object_capacity = 16,
+        .object_quota = 16,
+        .buckets_per_client = 32,
+        .max_globals = 2,
+        .registry_capacity = 2,
+    });
+    _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+    _ = try runtime.globals.add(&standard_protocol.xdg_wm_base.info, 5, null);
+    try runtime.prepareAccept();
+    _ = try reactor.ring.submit();
+    const accept_completion = try reactor.ring.copy_cqe();
+    switch (reactor.route(&runtime.endpoint.listener, accept_completion) orelse
+        return error.InvalidCompletion) {
+        .listener => {},
+        .connection => return error.InvalidCompletion,
+    }
+    const peer = (try runtime.completeListener(accept_completion, null)) orelse
+        return error.InvalidCompletion;
+    const actor = try reactor.getActor(peer);
+    var handler: XdgServerHandler = .{
+        .runtime = &runtime,
+        .peer = peer,
+        .objects = try runtime.clients.get(peer),
+        .queue = &actor.transmit,
+    };
+    _ = try reactor.ring.submit();
+
+    var disconnected = false;
+    while (!disconnected) {
+        const completion = try reactor.ring.copy_cqe();
+        const routed = switch (reactor.route(&runtime.endpoint.listener, completion) orelse
+            return error.InvalidCompletion) {
+            .listener => {
+                if (try runtime.completeListener(completion, null) != null)
+                    return error.UnexpectedClient;
+                continue;
+            },
+            .connection => |value| value,
+        };
+        const event = actor.completeRouted(routed.operation, completion) catch |err| {
+            if (err == error.IoFailure and actor.lifecycle == .closing) {
+                disconnected = true;
+                continue;
+            }
+            return err;
+        };
+        var prepared = false;
+        switch (event) {
+            .received => {
+                switch (try XdgServerCore.receivedRequests(
+                    actor,
+                    &handler.objects.namespace,
+                    try reactor.getReceiver(peer),
+                    completion,
+                    &handler,
+                )) {
+                    .dispatched => {},
+                    .terminal => |failure| return failure.cause,
+                }
+                if (!actor.receive_active) {
+                    try reactor.prepareReceive(peer);
+                    prepared = true;
+                }
+            },
+            .sent => |sent| if (sent.more_queued) {
+                try reactor.prepareSend(peer);
+                prepared = true;
+            },
+            .buffers_exhausted => {
+                try reactor.prepareReceive(peer);
+                prepared = true;
+            },
+            .disconnected => disconnected = true,
+            else => return error.InvalidCompletion,
+        }
+        if (!disconnected and actor.transmit.queuedBytes() > 0 and !actor.transmit.sendActive()) {
+            try reactor.prepareSend(peer);
+            prepared = true;
+        }
+        if (prepared) _ = try reactor.ring.submit();
+    }
+    if (!handler.ponged or !handler.configured) return error.IncompleteInterop;
+
+    _ = try runtime.prepareEndpointClose();
+    _ = try runtime.clients.prepareClose(peer);
+    _ = try reactor.ring.submit();
+    while (!runtime.endpoint.listener.canDeinit() or !actor.canDeinit()) {
+        const completion = try reactor.ring.copy_cqe();
+        switch (reactor.route(&runtime.endpoint.listener, completion) orelse
+            return error.InvalidCompletion) {
+            .listener => if (try runtime.completeListener(completion, null) != null)
+                return error.UnexpectedClient,
+            .connection => |routed| switch (try actor.completeRouted(routed.operation, completion)) {
+                .received => try (try reactor.getReceiver(peer)).buffers.put(completion),
+                .receive_stopped, .buffers_exhausted, .cancel_complete, .disconnected => {},
+                else => return error.InvalidCompletion,
+            },
+        }
+    }
+    try runtime.destroyClient(peer);
+    try runtime.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const XdgServerHandler = struct {
+    runtime: *XdgServerRuntime,
+    peer: wayring.io_uring.Peer,
+    objects: *wayring.objects.SharedServerObjects,
+    queue: *wayring.tx.Queue,
+    ponged: bool = false,
+    configured: bool = false,
+
+    pub fn request(
+        handler: *XdgServerHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgServerCore.Display.info) {
+            switch (try handler.runtime.decodeDisplayRequest(handler.peer, message, fds, null)) {
+                .sync => |callback| try XdgServerCore.completeSync(
+                    handler.objects,
+                    handler.queue,
+                    callback,
+                    0,
+                ),
+                .get_registry => while (true) switch (try handler.runtime.publishNext()) {
+                    .sent => {},
+                    .blocked => return error.ByteBudgetExceeded,
+                    .complete => break,
+                },
+            }
+        } else if (interface == &XdgServerCore.Registry.info) {
+            const registry = handler.objects.namespace.lookupHandle(message.header.object_id) orelse
+                return error.UnknownObject;
+            const registry_request = try XdgServerCore.decodeRegistryRequest(
+                handler.objects,
+                registry,
+                message,
+                fds,
+            );
+            const resource = try handler.runtime.bindGlobal(handler.peer, registry_request);
+            if (handler.objects.namespace.resolve(resource).?.interface ==
+                &standard_protocol.xdg_wm_base.info)
+            {
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.xdg_wm_base,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .ping = .{ .serial = 41 } },
+                );
+            }
+        } else if (interface == &standard_protocol.wl_compositor.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_compositor,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .create_surface => |value| _ = try standard_protocol.wl_compositor.admit_create_surface(
+                    handler.objects,
+                    decoded.handle,
+                    value,
+                    .{},
+                ),
+                .create_region => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.xdg_wm_base.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.xdg_wm_base,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .get_xdg_surface => |value| _ = try standard_protocol.xdg_wm_base.admit_get_xdg_surface(
+                    handler.objects,
+                    decoded.handle,
+                    value,
+                    .{},
+                ),
+                .pong => |value| {
+                    if (value.serial != 41) return error.InvalidSerial;
+                    handler.ponged = true;
+                },
+                .destroy => {},
+                .create_positioner => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.xdg_surface.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.xdg_surface,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .get_toplevel => |value| {
+                    const toplevel = (try standard_protocol.xdg_surface.admit_get_toplevel(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.xdg_toplevel,
+                        handler.objects,
+                        handler.queue,
+                        toplevel,
+                        .{ .configure = .{ .width = 0, .height = 0, .states = &.{} } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.xdg_surface,
+                        handler.objects,
+                        handler.queue,
+                        decoded.handle,
+                        .{ .configure = .{ .serial = 77 } },
+                    );
+                },
+                .ack_configure => |value| {
+                    if (value.serial != 77) return error.InvalidSerial;
+                    handler.configured = true;
+                },
+                .destroy, .set_window_geometry => {},
+                .get_popup => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.xdg_toplevel.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.xdg_toplevel,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                else => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_surface.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_surface,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .commit, .destroy => {},
+                else => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else return error.UnexpectedRequest;
         return .continue_dispatch;
     }
@@ -645,6 +952,8 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.eql(u8, value, "libwayland-server-latency")) {
             options.mode = .libwayland_server;
             options.latency = true;
+        } else if (std.mem.eql(u8, value, "xdg-libwayland-client")) {
+            options.mode = .xdg_libwayland_client;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

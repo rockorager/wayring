@@ -172,8 +172,11 @@ case "$mode" in
             sample=$((sample + 1))
         done
         ;;
+    xdg-interop)
+        "$root/zig-out/bench/wayring-interop" 1 1 1 xdg-libwayland-client
+        ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|xdg-interop]" >&2
         exit 2
         ;;
 esac
