@@ -237,6 +237,10 @@ walks the bucket chain to preserve collision unlinking. Allocation-free object
 iterators expose generation-tagged handles and context-bearing object metadata
 when applications need O(n) disconnect cleanup; callers that do not need hooks
 retain the O(1) chain release path.
+Server-created wire IDs are selected from the lowest free high-range value in
+each client namespace rather than derived from shared physical node indices.
+This keeps their externally visible sequence dense as required by libwayland,
+while preserving reactor-wide object pooling and adding no per-client storage.
 
 Logical per-client quotas prevent one connection from monopolizing the shared
 pool. One physical node per inactive reactor slot is reserved for `wl_display`;

@@ -682,9 +682,14 @@ pub const SharedNamespace = struct {
     ) NamespaceError!Handle {
         try interface.validateVersion(version);
         if (namespace.count == namespace.quota) return error.Full;
+        // libwayland clients store server-created objects in a dense high-ID map.
+        // Keep wire IDs independent of reactor-wide physical pool indices.
+        var id = server_id_start;
+        while (namespace.findUncached(id) != null) {
+            if (id == std.math.maxInt(u32)) return error.Full;
+            id += 1;
+        }
         const index = try namespace.pool.acquire();
-        const id = server_id_start + index;
-        std.debug.assert(namespace.find(id) == null);
         return namespace.insertAcquired(index, id, interface, version, context);
     }
 
@@ -1459,7 +1464,7 @@ test "server namespaces share physical objects with isolated quotas" {
         .requests = &.{},
         .events = &.{},
     };
-    var pool = try SharedObjectPool.init(std.testing.allocator, 5);
+    var pool = try SharedObjectPool.init(std.testing.allocator, 6);
     defer pool.deinit(std.testing.allocator);
     var first_buckets = [_]SharedObjectBucket{.{}} ** 4;
     var second_buckets = [_]SharedObjectBucket{.{}} ** 4;
@@ -1491,7 +1496,7 @@ test "server namespaces share physical objects with isolated quotas" {
     const second_child = try second.insertClient(2, &child_info, 1, null);
     try std.testing.expect(first.namespace.resolve(first_child) != null);
     try std.testing.expect(second.namespace.resolve(second_child) != null);
-    try std.testing.expectEqual(@as(usize, 1), pool.available());
+    try std.testing.expectEqual(@as(usize, 2), pool.available());
 
     var first_objects = first.iterator();
     const display_entry = first_objects.next().?;
@@ -1504,12 +1509,12 @@ test "server namespaces share physical objects with isolated quotas" {
 
     first.deinit();
     first_live = false;
-    try std.testing.expectEqual(@as(usize, 3), pool.available());
+    try std.testing.expectEqual(@as(usize, 4), pool.available());
     var reused = try SharedServerObjects.init(
         &pool,
         &first_buckets,
         2,
-        2,
+        3,
         &display_info,
         null,
     );
@@ -1518,8 +1523,14 @@ test "server namespaces share physical objects with isolated quotas" {
     try std.testing.expectError(error.UnknownObject, reused.namespace.request(2, 0));
 
     const local = try reused.createLocal(&child_info, 1, null);
-    try std.testing.expect(local.id >= server_id_start);
+    try std.testing.expectEqual(server_id_start, local.id);
+    const second_local = try reused.createLocal(&child_info, 1, null);
+    try std.testing.expectEqual(server_id_start + 1, second_local.id);
     _ = try reused.removeLocal(local);
+    const local_reused = try reused.createLocal(&child_info, 1, null);
+    try std.testing.expectEqual(server_id_start, local_reused.id);
+    _ = try reused.removeLocal(local_reused);
+    _ = try reused.removeLocal(second_local);
 
     const colliding = try second.insertClient(5, &child_info, 1, null);
     try std.testing.expect(second.namespace.resolve(second_child) != null);

@@ -466,7 +466,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             return error.IncompleteInterop,
         .dmabuf => if (!handler.params_created or !handler.plane_added or
             !handler.dmabuf_buffer_created or !handler.buffer_destroyed or
-            !handler.params_destroyed)
+            !handler.params_destroyed or !handler.async_buffer_created or
+            !handler.create_failed or handler.params_created_count != 3 or
+            handler.plane_added_count != 3 or handler.buffer_destroyed_count != 2 or
+            handler.params_destroyed_count != 3)
             return error.IncompleteInterop,
     }
 
@@ -513,6 +516,12 @@ const ProtocolServerHandler = struct {
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
     params_destroyed: bool = false,
+    async_buffer_created: bool = false,
+    create_failed: bool = false,
+    params_created_count: usize = 0,
+    plane_added_count: usize = 0,
+    buffer_destroyed_count: usize = 0,
+    params_destroyed_count: usize = 0,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -594,6 +603,7 @@ const ProtocolServerHandler = struct {
                         .{},
                     );
                     handler.params_created = true;
+                    handler.params_created_count += 1;
                 },
                 .destroy => {},
                 .get_default_feedback, .get_surface_feedback => return error.UnexpectedRequest,
@@ -616,6 +626,32 @@ const ProtocolServerHandler = struct {
                         value.modifier_lo != drm_format_modifier_invalid_lo)
                         return error.InvalidDmabufPlane;
                     handler.plane_added = true;
+                    handler.plane_added_count += 1;
+                },
+                .create => |value| {
+                    if (!handler.plane_added or value.height != 1 or
+                        value.format != drm_format_argb8888 or value.flags.value != 0)
+                        return error.InvalidDmabufBuffer;
+                    if (value.width == 1) {
+                        _ = try standard_protocol.zwp_linux_buffer_params_v1.construct_event_created(
+                            standard_protocol,
+                            handler.objects,
+                            handler.queue,
+                            decoded.handle,
+                            .{},
+                        );
+                        handler.async_buffer_created = true;
+                    } else if (value.width == 2) {
+                        try wayring.server.sendEvent(
+                            standard_protocol,
+                            standard_protocol.zwp_linux_buffer_params_v1,
+                            handler.objects,
+                            handler.queue,
+                            decoded.handle,
+                            .{ .failed = .{} },
+                        );
+                        handler.create_failed = true;
+                    } else return error.InvalidDmabufBuffer;
                 },
                 .create_immed => |value| {
                     if (!handler.plane_added or value.width != 1 or value.height != 1 or
@@ -629,8 +665,10 @@ const ProtocolServerHandler = struct {
                     );
                     handler.dmabuf_buffer_created = true;
                 },
-                .destroy => handler.params_destroyed = handler.buffer_destroyed,
-                .create => return error.UnexpectedRequest,
+                .destroy => {
+                    handler.params_destroyed = handler.buffer_destroyed;
+                    handler.params_destroyed_count += 1;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_shm.info) {
@@ -690,7 +728,10 @@ const ProtocolServerHandler = struct {
                 fds,
             );
             switch (decoded.value) {
-                .destroy => handler.buffer_destroyed = true,
+                .destroy => {
+                    handler.buffer_destroyed = true;
+                    handler.buffer_destroyed_count += 1;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_compositor.info) {
@@ -1418,6 +1459,146 @@ fn wayringDmabufClient() !u8 {
         params,
         .{ .destroy = .{} },
     );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const async_descriptor_result = linux.memfd_create(
+        "wayring-dmabuf-async",
+        linux.MFD.CLOEXEC,
+    );
+    if (linux.errno(async_descriptor_result) != .SUCCESS) return error.SystemCallFailed;
+    const async_descriptor: linux.fd_t = @intCast(async_descriptor_result);
+    if (linux.errno(linux.ftruncate(async_descriptor, 4096)) != .SUCCESS) {
+        _ = linux.close(async_descriptor);
+        return error.SystemCallFailed;
+    }
+    const async_params = (try standard_protocol.zwp_linux_dmabuf_v1.construct_create_params(
+        client_objects,
+        &actor.transmit,
+        handler.dmabuf.?,
+        .{},
+    )).params_id;
+    wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        async_params,
+        .{ .add = .{
+            .fd = async_descriptor,
+            .plane_idx = 0,
+            .offset = 0,
+            .stride = 4,
+            .modifier_hi = drm_format_modifier_invalid_hi,
+            .modifier_lo = drm_format_modifier_invalid_lo,
+        } },
+    ) catch |err| {
+        _ = linux.close(async_descriptor);
+        return err;
+    };
+    handler.active_params = async_params;
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        async_params,
+        .{ .create = .{
+            .width = 1,
+            .height = 1,
+            .format = drm_format_argb8888,
+            .flags = .fromInt(0),
+        } },
+    );
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.async_buffer == null)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_buffer,
+        client_objects,
+        &actor.transmit,
+        handler.async_buffer.?,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        async_params,
+        .{ .destroy = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const failed_descriptor_result = linux.memfd_create(
+        "wayring-dmabuf-failure",
+        linux.MFD.CLOEXEC,
+    );
+    if (linux.errno(failed_descriptor_result) != .SUCCESS) return error.SystemCallFailed;
+    const failed_descriptor: linux.fd_t = @intCast(failed_descriptor_result);
+    if (linux.errno(linux.ftruncate(failed_descriptor, 4096)) != .SUCCESS) {
+        _ = linux.close(failed_descriptor);
+        return error.SystemCallFailed;
+    }
+    const failed_params = (try standard_protocol.zwp_linux_dmabuf_v1.construct_create_params(
+        client_objects,
+        &actor.transmit,
+        handler.dmabuf.?,
+        .{},
+    )).params_id;
+    wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        failed_params,
+        .{ .add = .{
+            .fd = failed_descriptor,
+            .plane_idx = 0,
+            .offset = 0,
+            .stride = 4,
+            .modifier_hi = drm_format_modifier_invalid_hi,
+            .modifier_lo = drm_format_modifier_invalid_lo,
+        } },
+    ) catch |err| {
+        _ = linux.close(failed_descriptor);
+        return err;
+    };
+    handler.active_params = failed_params;
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        failed_params,
+        .{ .create = .{
+            .width = 2,
+            .height = 1,
+            .format = drm_format_argb8888,
+            .flags = .fromInt(0),
+        } },
+    );
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.create_failed)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.zwp_linux_buffer_params_v1,
+        client_objects,
+        &actor.transmit,
+        failed_params,
+        .{ .destroy = .{} },
+    );
     try wayring.client.sendRequest(
         standard_protocol.zwp_linux_dmabuf_v1,
         client_objects,
@@ -1446,7 +1627,10 @@ const DmabufClientHandler = struct {
     registry: wayring.objects.Handle,
     callback: wayring.objects.Handle,
     dmabuf: ?wayring.objects.Handle = null,
+    active_params: ?wayring.objects.Handle = null,
+    async_buffer: ?wayring.objects.Handle = null,
     modifier_seen: bool = false,
+    create_failed: bool = false,
     synced: bool = false,
     deleted: bool = false,
 
@@ -1512,6 +1696,26 @@ const DmabufClientHandler = struct {
                         handler.modifier_seen = true;
                 },
                 .format => {},
+            }
+        } else if (interface == &standard_protocol.zwp_linux_buffer_params_v1.info) {
+            const params = handler.active_params orelse return error.UnexpectedEvent;
+            const params_event = try wayring.client.decodeEvent(
+                standard_protocol.zwp_linux_buffer_params_v1,
+                handler.objects,
+                params,
+                message,
+                fds,
+            );
+            switch (params_event) {
+                .created => |value| {
+                    handler.async_buffer = (try standard_protocol.zwp_linux_buffer_params_v1.admit_event_created(
+                        handler.objects,
+                        params,
+                        value,
+                        .{},
+                    )).buffer;
+                },
+                .failed => handler.create_failed = true,
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;

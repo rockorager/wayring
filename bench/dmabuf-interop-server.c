@@ -20,6 +20,12 @@ struct dmabuf_server_state {
 	int buffer_destroyed;
 	int params_destroyed;
 	int dmabuf_destroyed;
+	int create_failed;
+	int params_created_count;
+	int plane_added_count;
+	int buffer_created_count;
+	int buffer_destroyed_count;
+	int params_destroyed_count;
 };
 
 static void
@@ -29,6 +35,7 @@ dmabuf_buffer_destroy(struct wl_client *client, struct wl_resource *resource)
 
 	(void) client;
 	state->buffer_destroyed = 1;
+	state->buffer_destroyed_count++;
 	wl_resource_destroy(resource);
 }
 
@@ -44,6 +51,7 @@ params_destroy(struct wl_client *client, struct wl_resource *resource)
 	(void) client;
 	if (state->buffer_destroyed)
 		state->params_destroyed = 1;
+	state->params_destroyed_count++;
 	wl_resource_destroy(resource);
 }
 
@@ -65,18 +73,36 @@ params_add(struct wl_client *client, struct wl_resource *resource, int fd,
 	}
 	close(fd);
 	state->plane_added = 1;
+	state->plane_added_count++;
 }
 
 static void
 params_create(struct wl_client *client, struct wl_resource *resource,
               int32_t width, int32_t height, uint32_t format, uint32_t flags)
 {
-	(void) resource;
-	(void) width;
-	(void) height;
-	(void) format;
-	(void) flags;
-	wl_client_post_implementation_error(client, "unexpected asynchronous create");
+	struct dmabuf_server_state *state = wl_resource_get_user_data(resource);
+	struct wl_resource *buffer;
+
+	if (!state->plane_added || height != 1 || format != DRM_FORMAT_ARGB8888 ||
+	    flags != 0 || (width != 1 && width != 2)) {
+		wl_client_post_implementation_error(client, "invalid async dmabuf buffer");
+		return;
+	}
+	if (width == 2) {
+		zwp_linux_buffer_params_v1_send_failed(resource);
+		state->create_failed = 1;
+		return;
+	}
+	buffer = wl_resource_create(client, &wl_buffer_interface, 1, 0);
+	if (buffer == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(
+		buffer, &dmabuf_buffer_implementation, state, NULL);
+	zwp_linux_buffer_params_v1_send_created(resource, buffer);
+	state->buffer_created = 1;
+	state->buffer_created_count++;
 }
 
 static void
@@ -100,6 +126,7 @@ params_create_immed(struct wl_client *client, struct wl_resource *resource,
 	wl_resource_set_implementation(
 		buffer, &dmabuf_buffer_implementation, state, NULL);
 	state->buffer_created = 1;
+	state->buffer_created_count++;
 }
 
 static const struct zwp_linux_buffer_params_v1_interface params_implementation = {
@@ -135,6 +162,7 @@ dmabuf_create_params(struct wl_client *client, struct wl_resource *resource,
 	}
 	wl_resource_set_implementation(params, &params_implementation, state, NULL);
 	state->params_created = 1;
+	state->params_created_count++;
 }
 
 static const struct zwp_linux_dmabuf_v1_interface dmabuf_implementation = {
@@ -194,5 +222,8 @@ dmabuf_server_fd(int fd)
 	wl_display_destroy(state.display);
 	return state.params_created && state.plane_added && state.buffer_created &&
 	       state.buffer_destroyed && state.params_destroyed &&
-	       state.dmabuf_destroyed ? EXIT_SUCCESS : EXIT_FAILURE;
+	       state.dmabuf_destroyed && state.create_failed &&
+	       state.params_created_count == 3 && state.plane_added_count == 3 &&
+	       state.buffer_created_count == 2 && state.buffer_destroyed_count == 2 &&
+	       state.params_destroyed_count == 3 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

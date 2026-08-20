@@ -14,7 +14,9 @@
 
 struct dmabuf_client_state {
 	struct zwp_linux_dmabuf_v1 *dmabuf;
+	struct wl_buffer *async_buffer;
 	int modifier_seen;
+	int create_failed;
 };
 
 static void
@@ -73,6 +75,30 @@ static const struct wl_registry_listener dmabuf_registry_listener = {
 	.global_remove = handle_dmabuf_global_remove,
 };
 
+static void
+handle_params_created(void *data, struct zwp_linux_buffer_params_v1 *params,
+                      struct wl_buffer *buffer)
+{
+	struct dmabuf_client_state *state = data;
+
+	(void) params;
+	state->async_buffer = buffer;
+}
+
+static void
+handle_params_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
+{
+	struct dmabuf_client_state *state = data;
+
+	(void) params;
+	state->create_failed = 1;
+}
+
+static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+	.created = handle_params_created,
+	.failed = handle_params_failed,
+};
+
 int
 dmabuf_client_fd(int fd)
 {
@@ -114,6 +140,52 @@ dmabuf_client_fd(int fd)
 	params = NULL;
 	if (wl_display_roundtrip(display) < 0)
 		goto cleanup;
+
+	memory_fd = memfd_create("wayring-dmabuf-async", MFD_CLOEXEC);
+	if (memory_fd < 0 || ftruncate(memory_fd, 4096) < 0)
+		goto cleanup;
+	params = zwp_linux_dmabuf_v1_create_params(state.dmabuf);
+	if (params == NULL)
+		goto cleanup;
+	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, &state);
+	zwp_linux_buffer_params_v1_add(
+		params, memory_fd, 0, 0, 4,
+		DRM_FORMAT_MOD_INVALID_HI, DRM_FORMAT_MOD_INVALID_LO);
+	close(memory_fd);
+	memory_fd = -1;
+	zwp_linux_buffer_params_v1_create(params, 1, 1, DRM_FORMAT_ARGB8888, 0);
+	while (state.async_buffer == NULL) {
+		if (wl_display_dispatch(display) < 0)
+			goto cleanup;
+	}
+	wl_buffer_destroy(state.async_buffer);
+	state.async_buffer = NULL;
+	zwp_linux_buffer_params_v1_destroy(params);
+	params = NULL;
+	if (wl_display_roundtrip(display) < 0)
+		goto cleanup;
+
+	memory_fd = memfd_create("wayring-dmabuf-failure", MFD_CLOEXEC);
+	if (memory_fd < 0 || ftruncate(memory_fd, 4096) < 0)
+		goto cleanup;
+	params = zwp_linux_dmabuf_v1_create_params(state.dmabuf);
+	if (params == NULL)
+		goto cleanup;
+	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, &state);
+	zwp_linux_buffer_params_v1_add(
+		params, memory_fd, 0, 0, 4,
+		DRM_FORMAT_MOD_INVALID_HI, DRM_FORMAT_MOD_INVALID_LO);
+	close(memory_fd);
+	memory_fd = -1;
+	zwp_linux_buffer_params_v1_create(params, 2, 1, DRM_FORMAT_ARGB8888, 0);
+	while (!state.create_failed) {
+		if (wl_display_dispatch(display) < 0)
+			goto cleanup;
+	}
+	zwp_linux_buffer_params_v1_destroy(params);
+	params = NULL;
+	if (wl_display_roundtrip(display) < 0)
+		goto cleanup;
 	status = EXIT_SUCCESS;
 
 cleanup:
@@ -121,6 +193,8 @@ cleanup:
 		close(memory_fd);
 	if (buffer != NULL)
 		wl_buffer_destroy(buffer);
+	if (state.async_buffer != NULL)
+		wl_buffer_destroy(state.async_buffer);
 	if (params != NULL)
 		zwp_linux_buffer_params_v1_destroy(params);
 	if (state.dmabuf != NULL)
