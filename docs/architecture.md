@@ -75,6 +75,13 @@ zig-out/bin/wayring-scanner protocol.xml protocol.zig
 - A terminal protocol error stops further dispatch before its `wl_display.error`
   event is drained and the connection closes.
 
+Server request dispatch converts malformed input and handler failures into an
+ordered terminal `wl_display.error`. Client event dispatch delivers a received
+`wl_display.error` to the application, then closes immediately without
+dispatching later frames from the same receive batch. Client-side framing,
+object lookup, decoding, and handler failures follow the same terminal close
+path.
+
 The descriptor stream is represented by a bounded FIFO with explicit
 ownership transfer. Receiving SCM_RIGHTS enqueues descriptors in kernel
 delivery order; generated decoders pop them only when their message signature

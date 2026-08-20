@@ -571,13 +571,16 @@ fn pumpClient(
     var prepared = false;
     switch (event) {
         .received => {
-            _ = try wayring.dispatch.receivedEvents(
+            switch (try ClientCore.receivedEvents(
                 actor,
                 &client_objects.namespace,
                 try reactor.getReceiver(peer),
                 completion,
                 handler,
-            );
+            )) {
+                .dispatched => {},
+                .terminal => |failure| return failure.cause,
+            }
             if (!actor.receive_active) {
                 try reactor.prepareReceive(peer);
                 prepared = true;

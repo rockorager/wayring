@@ -144,6 +144,96 @@ pub fn Core(comptime protocol: type) type {
             WrongObject,
         };
 
+        pub const EventResult = union(enum) {
+            dispatched: usize,
+            terminal: struct {
+                dispatched: usize,
+                object_id: ?u32,
+                cause: anyerror,
+            },
+        };
+
+        /// Dispatches complete events and closes on framing, object lookup,
+        /// decoding, handler, or server protocol errors. A wl_display.error is
+        /// delivered to the handler, then stops the current concatenated batch.
+        pub fn dispatchEvents(
+            actor: *connection_state.Actor,
+            namespace: anytype,
+            bytes: *[]const u8,
+            context: anytype,
+        ) EventResult {
+            if (!actor.canDispatch()) return .{ .dispatched = 0 };
+            var count: usize = 0;
+            while (true) {
+                const message = actor.nextMessage(bytes) catch |cause|
+                    return terminalEvent(actor, count, null, cause);
+                const complete = message orelse return .{ .dispatched = count };
+                const target = namespace.event(
+                    complete.header.object_id,
+                    complete.header.opcode,
+                ) catch |cause| return terminalEvent(
+                    actor,
+                    count,
+                    complete.header.object_id,
+                    cause,
+                );
+                const server_error = target.object.interface == &Display.info and
+                    complete.header.opcode == @intFromEnum(
+                        std.meta.Tag(Display.Event).@"error",
+                    );
+                const control = context.event(
+                    target,
+                    complete,
+                    &actor.received_fds,
+                ) catch |cause| return terminalEvent(
+                    actor,
+                    count,
+                    complete.header.object_id,
+                    cause,
+                );
+                count += 1;
+                if (server_error)
+                    return terminalEvent(actor, count, complete.header.object_id, error.ServerProtocolError);
+                if (control == .stop) return .{ .dispatched = count };
+            }
+        }
+
+        /// Selected-buffer counterpart to `dispatchEvents`. The kernel buffer
+        /// is returned exactly once; CQE routing and close cancellation remain
+        /// explicit at the caller boundary.
+        pub inline fn receivedEvents(
+            actor: *connection_state.Actor,
+            namespace: anytype,
+            receiver: anytype,
+            completion: std.os.linux.io_uring_cqe,
+            context: anytype,
+        ) !EventResult {
+            const received = receiver.decodeCompletion(completion) catch |cause|
+                return terminalEvent(actor, 0, null, cause);
+            _ = actor.ingestControl(received.control) catch |cause| {
+                receiver.release(received) catch {};
+                return terminalEvent(actor, 0, null, cause);
+            };
+            var payload = received.payload;
+            const result = dispatchEvents(actor, namespace, &payload, context);
+            try receiver.release(received);
+            return result;
+        }
+
+        fn terminalEvent(
+            actor: *connection_state.Actor,
+            dispatched: usize,
+            object_id: ?u32,
+            cause: anyerror,
+        ) EventResult {
+            actor.beginClose();
+            return .{ .terminal = .{
+                .dispatched = dispatched,
+                .object_id = object_id,
+                .cause = cause,
+            } };
+        }
+
         pub fn sync(
             client_objects: *objects.ClientObjects,
             queue: *tx.Queue,

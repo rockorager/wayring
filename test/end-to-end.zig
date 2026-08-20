@@ -110,13 +110,16 @@ test "client and server complete a core round trip on one reactor" {
                         .terminal => |failure| return failure.cause,
                     }
                 } else {
-                    _ = try wayring.dispatch.receivedEvents(
+                    switch (try ClientCore.receivedEvents(
                         actor,
                         &client_connection.objects.namespace,
                         receiver,
                         completion,
                         &client_handler,
-                    );
+                    )) {
+                        .dispatched => {},
+                        .terminal => |failure| return failure.cause,
+                    }
                 }
                 if (!actor.receive_active) {
                     try reactor.prepareReceive(peer);

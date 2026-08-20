@@ -171,6 +171,91 @@ test "generic client helpers apply generated destructor lifecycle" {
     try std.testing.expect(client_objects.namespace.resolve(callback) == null);
 }
 
+test "client terminal display error stops concatenated event dispatch" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+    defer queue.deinit();
+    var fragment_storage: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(
+        0,
+        1,
+        &fragment_storage,
+        &descriptors,
+        0,
+        &blocks,
+        64,
+        0,
+    );
+    defer actor.deinit();
+    var client_objects = try wayring.objects.ClientObjects.init(
+        std.testing.allocator,
+        4,
+        2,
+        &Core.Display.info,
+        null,
+    );
+    defer client_objects.deinit(std.testing.allocator);
+    const callback = try client_objects.createLocal(&Core.Callback.info, 1, null);
+
+    try Core.Display.encodeEvent(&queue, wayring.objects.display_id, .{
+        .@"error" = .{
+            .object_id = callback.id,
+            .code = 7,
+            .message = "terminal",
+        },
+    });
+    try Core.Display.encodeEvent(&queue, wayring.objects.display_id, .{
+        .delete_id = .{ .id = callback.id },
+    });
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+    var bytes = snapshot.first;
+    var handler: DisplayErrorHandler = .{ .objects = &client_objects };
+
+    const result = Core.dispatchEvents(
+        &actor,
+        &client_objects.namespace,
+        &bytes,
+        &handler,
+    );
+    const failure = switch (result) {
+        .terminal => |value| value,
+        .dispatched => return error.ExpectedTerminalEvent,
+    };
+    try std.testing.expectEqual(@as(usize, 1), failure.dispatched);
+    try std.testing.expectEqual(@as(?u32, wayring.objects.display_id), failure.object_id);
+    try std.testing.expectEqual(error.ServerProtocolError, failure.cause);
+    try std.testing.expectEqual(@as(usize, 1), handler.errors);
+    try std.testing.expectEqual(@as(usize, 0), handler.deleted);
+    try std.testing.expectEqual(@as(usize, 12), bytes.len);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle);
+    try std.testing.expect(client_objects.ids.isActive(callback.id));
+}
+
+const DisplayErrorHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    errors: usize = 0,
+    deleted: usize = 0,
+
+    pub fn event(
+        handler: *DisplayErrorHandler,
+        _: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const event_value = try Core.decodeDisplayEvent(handler.objects, message, fds);
+        switch (event_value) {
+            .@"error" => handler.errors += 1,
+            .delete_id => handler.deleted += 1,
+        }
+        return .continue_dispatch;
+    }
+};
+
 fn firstMessage(queue: *wayring.tx.Queue) !wayring.wire.Message {
     var descriptor_scratch: [1]linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
