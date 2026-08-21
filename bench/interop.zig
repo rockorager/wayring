@@ -402,7 +402,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             _ = try runtime.globals.add(&standard_protocol.xdg_wm_base.info, 5, null);
             _ = try runtime.globals.add(&standard_protocol.wp_presentation.info, 1, null);
         },
-        .shm => _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null),
+        .shm => {
+            _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+        },
         .dmabuf => _ = try runtime.globals.add(
             &standard_protocol.zwp_linux_dmabuf_v1.info,
             3,
@@ -511,7 +514,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             handler.feedback_count != 2)
             return error.IncompleteInterop,
         .shm => if (!handler.pool_created or !handler.buffer_created or
-            !handler.buffer_destroyed or !handler.pool_destroyed)
+            !handler.surface_created or !handler.surface_committed or
+            !handler.buffer_released or !handler.frame_completed or
+            !handler.surface_destroyed or !handler.buffer_destroyed or
+            !handler.pool_destroyed)
             return error.IncompleteInterop,
         .dmabuf => if (!handler.params_created or !handler.plane_added or
             !handler.dmabuf_buffer_created or !handler.buffer_destroyed or
@@ -581,6 +587,12 @@ const ProtocolServerHandler = struct {
     buffer_created: bool = false,
     buffer_destroyed: bool = false,
     pool_destroyed: bool = false,
+    surface_created: bool = false,
+    surface_committed: bool = false,
+    buffer_released: bool = false,
+    frame_completed: bool = false,
+    buffer: ?wayring.objects.Handle = null,
+    frame_callback: ?wayring.objects.Handle = null,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1391,12 +1403,13 @@ const ProtocolServerHandler = struct {
                         value.stride != 4 or value.format.value !=
                         standard_protocol.wl_shm.format.argb8888.value)
                         return error.InvalidShmBuffer;
-                    _ = try standard_protocol.wl_shm_pool.admit_create_buffer(
+                    const buffer = (try standard_protocol.wl_shm_pool.admit_create_buffer(
                         handler.objects,
                         decoded.handle,
                         value,
                         .{},
-                    );
+                    )).id;
+                    handler.buffer = buffer;
                     handler.buffer_created = true;
                 },
                 .destroy => handler.pool_destroyed = handler.buffer_destroyed,
@@ -1432,6 +1445,7 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).id;
+                    if (handler.kind == .shm) handler.surface_created = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch)
                         handler.surface = surface;
@@ -1522,11 +1536,56 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
+                    if (handler.kind == .shm) handler.surface_destroyed = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch)
                         handler.surface_destroyed = true;
                 },
-                .commit => {},
+                .attach => |value| {
+                    if (handler.kind != .shm or value.buffer == null or
+                        value.buffer.? != handler.buffer.?.id or value.x != 2 or value.y != -3)
+                        return error.InvalidSurface;
+                },
+                .damage => |value| {
+                    if (handler.kind != .shm or value.x != 1 or value.y != 2 or
+                        value.width != 3 or value.height != 4)
+                        return error.InvalidSurface;
+                },
+                .frame => |value| {
+                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    handler.frame_callback = (try standard_protocol.wl_surface.admit_frame(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).callback;
+                },
+                .damage_buffer => |value| {
+                    if (handler.kind != .shm or value.x != 5 or value.y != 6 or
+                        value.width != 7 or value.height != 8)
+                        return error.InvalidSurface;
+                },
+                .commit => {
+                    if (handler.kind == .shm) {
+                        try wayring.server.sendEvent(
+                            standard_protocol,
+                            standard_protocol.wl_buffer,
+                            handler.objects,
+                            handler.queue,
+                            handler.buffer orelse return error.MissingBuffer,
+                            .{ .release = .{} },
+                        );
+                        handler.buffer_released = true;
+                        try XdgServerCore.completeSync(
+                            handler.objects,
+                            handler.queue,
+                            handler.frame_callback orelse return error.MissingCallback,
+                            123,
+                        );
+                        handler.frame_completed = true;
+                        handler.surface_committed = true;
+                    }
+                },
                 else => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);

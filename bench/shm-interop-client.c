@@ -9,7 +9,37 @@
 
 struct shm_client_state {
 	struct wl_shm *shm;
+	struct wl_compositor *compositor;
 	int format_seen;
+	int buffer_released;
+	int frame_done;
+};
+
+static void
+handle_buffer_release(void *data, struct wl_buffer *buffer)
+{
+	struct shm_client_state *state = data;
+
+	(void) buffer;
+	state->buffer_released = 1;
+}
+
+static const struct wl_buffer_listener buffer_listener = {
+	.release = handle_buffer_release,
+};
+
+static void
+handle_frame_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+	struct shm_client_state *state = data;
+
+	if (time == 123)
+		state->frame_done = 1;
+	wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_listener = {
+	.done = handle_frame_done,
 };
 
 static void
@@ -32,11 +62,15 @@ handle_shm_global(void *data, struct wl_registry *registry, uint32_t name,
 {
 	struct shm_client_state *state = data;
 
-	if (strcmp(interface, wl_shm_interface.name) != 0)
-		return;
-	state->shm = wl_registry_bind(registry, name, &wl_shm_interface,
-	                              version < 1 ? version : 1);
-	wl_shm_add_listener(state->shm, &shm_listener, state);
+	if (strcmp(interface, wl_shm_interface.name) == 0) {
+		state->shm = wl_registry_bind(registry, name, &wl_shm_interface,
+		                              version < 1 ? version : 1);
+		wl_shm_add_listener(state->shm, &shm_listener, state);
+	} else if (strcmp(interface, wl_compositor_interface.name) == 0) {
+		state->compositor = wl_registry_bind(
+			registry, name, &wl_compositor_interface,
+			version < 4 ? version : 4);
+	}
 }
 
 static void
@@ -60,6 +94,8 @@ shm_client_fd(int fd)
 	struct wl_registry *registry;
 	struct wl_shm_pool *pool = NULL;
 	struct wl_buffer *buffer = NULL;
+	struct wl_surface *surface = NULL;
+	struct wl_callback *frame = NULL;
 	int memory_fd = -1;
 	int status = EXIT_FAILURE;
 
@@ -68,6 +104,7 @@ shm_client_fd(int fd)
 	registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &shm_registry_listener, &state);
 	if (wl_display_roundtrip(display) < 0 || state.shm == NULL ||
+	    state.compositor == NULL ||
 	    wl_display_roundtrip(display) < 0 || !state.format_seen)
 		goto cleanup;
 
@@ -81,9 +118,25 @@ shm_client_fd(int fd)
 		goto cleanup;
 	buffer = wl_shm_pool_create_buffer(
 		pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
-	if (buffer == NULL || wl_display_roundtrip(display) < 0)
+	surface = wl_compositor_create_surface(state.compositor);
+	if (buffer == NULL || surface == NULL)
 		goto cleanup;
+	wl_buffer_add_listener(buffer, &buffer_listener, &state);
+	wl_surface_attach(surface, buffer, 2, -3);
+	wl_surface_damage(surface, 1, 2, 3, 4);
+	frame = wl_surface_frame(surface);
+	if (frame == NULL)
+		goto cleanup;
+	wl_callback_add_listener(frame, &frame_listener, &state);
+	wl_surface_damage_buffer(surface, 5, 6, 7, 8);
+	wl_surface_commit(surface);
+	if (wl_display_roundtrip(display) < 0 || !state.buffer_released ||
+	    !state.frame_done)
+		goto cleanup;
+	frame = NULL;
 
+	wl_surface_destroy(surface);
+	surface = NULL;
 	wl_buffer_destroy(buffer);
 	buffer = NULL;
 	wl_shm_pool_destroy(pool);
@@ -99,8 +152,14 @@ cleanup:
 		wl_buffer_destroy(buffer);
 	if (pool != NULL)
 		wl_shm_pool_destroy(pool);
+	if (frame != NULL)
+		wl_callback_destroy(frame);
+	if (surface != NULL)
+		wl_surface_destroy(surface);
 	if (state.shm != NULL)
 		wl_shm_destroy(state.shm);
+	if (state.compositor != NULL)
+		wl_compositor_destroy(state.compositor);
 	wl_registry_destroy(registry);
 	wl_display_flush(display);
 	wl_display_disconnect(display);
