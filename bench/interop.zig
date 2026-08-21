@@ -534,12 +534,20 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
     const peer = (try runtime.completeListener(accept_completion, null)) orelse
         return error.InvalidCompletion;
     const actor = try reactor.getActor(peer);
+    var region_pool = try wayring.compositor.RegionPool.init(allocator, 16);
+    defer region_pool.deinit(allocator);
+    var region_state = wayring.compositor.Region.init(&region_pool);
+    defer region_state.deinit();
+    var surface_regions = wayring.compositor.SurfaceRegions.init(&region_pool);
+    defer surface_regions.deinit();
     var handler: ProtocolServerHandler = .{
         .kind = kind,
         .runtime = &runtime,
         .peer = peer,
         .objects = try runtime.clients.get(peer),
         .queue = &actor.transmit,
+        .region_state = &region_state,
+        .surface_regions = &surface_regions,
     };
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
@@ -719,6 +727,8 @@ const ProtocolServerHandler = struct {
     buffer_scaled: bool = false,
     surface_offset: bool = false,
     surface_state: wayring.compositor.Surface = .{},
+    region_state: *wayring.compositor.Region,
+    surface_regions: *wayring.compositor.SurfaceRegions,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1923,12 +1933,14 @@ const ProtocolServerHandler = struct {
                     if (handler.kind != .shm or value.region == null or
                         value.region.? != handler.region.?.id)
                         return error.InvalidSurface;
+                    try handler.surface_regions.setOpaque(handler.region_state);
                     handler.opaque_region_set = true;
                 },
                 .set_input_region => |value| {
                     if (handler.kind != .shm or value.region == null or
                         value.region.? != handler.region.?.id)
                         return error.InvalidSurface;
+                    try handler.surface_regions.setInput(handler.region_state);
                     handler.input_region_set = true;
                 },
                 .set_buffer_transform => |value| {
@@ -1960,6 +1972,12 @@ const ProtocolServerHandler = struct {
                             update.transform != .@"90" or update.scale != 2 or
                             update.offset.x != 2 or update.offset.y != -3)
                             return error.InvalidSurfaceState;
+                        const region_changes = try handler.surface_regions.commit();
+                        if (!region_changes.opaque_changed or !region_changes.input_changed or
+                            handler.surface_regions.current_opaque.count != 2 or
+                            handler.surface_regions.current_input.count != 2 or
+                            handler.surface_regions.current_input_infinite)
+                            return error.InvalidSurfaceRegions;
                         try wayring.server.sendEvent(
                             standard_protocol,
                             standard_protocol.wl_buffer,
@@ -2043,14 +2061,29 @@ const ProtocolServerHandler = struct {
                 .add => |value| {
                     if (value.x != 1 or value.y != 2 or value.width != 3 or value.height != 4)
                         return error.InvalidRegion;
+                    try handler.region_state.add(.{
+                        .x = value.x,
+                        .y = value.y,
+                        .width = value.width,
+                        .height = value.height,
+                    });
                     handler.region_added = true;
                 },
                 .subtract => |value| {
                     if (value.x != 5 or value.y != 6 or value.width != 7 or value.height != 8)
                         return error.InvalidRegion;
+                    try handler.region_state.subtract(.{
+                        .x = value.x,
+                        .y = value.y,
+                        .width = value.width,
+                        .height = value.height,
+                    });
                     handler.region_subtracted = true;
                 },
-                .destroy => handler.region_destroyed = true,
+                .destroy => {
+                    handler.region_state.clear();
+                    handler.region_destroyed = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_shell.info) {

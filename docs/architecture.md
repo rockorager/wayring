@@ -454,11 +454,16 @@ are extracted and reset as one content update.
 Damage uses one conservative bounding rectangle per coordinate space. This may
 overdraw but cannot miss changed pixels, requires no region allocation, and
 keeps the common surface commit path fixed-size. Exact opaque/input regions,
-frame callback chains, synchronized subsurface content-update graphs, and
-version-7 per-commit release callbacks remain separate composable state because
-their storage and scheduling policy differ by compositor. The SHM
-interoperability server exercises this state machine with real libwayland
-attach, dual damage, transform, scale, offset, and commit requests.
+which affect hit testing and occlusion correctness, use ordered add/subtract
+programs leased from one compositor-wide node pool. Idle regions and surfaces
+reserve no command nodes. Region-to-surface copies and double-buffered commits
+are transactional under pool pressure, and null input retains its distinct
+infinite-region semantics. Frame callback chains, synchronized subsurface
+content-update graphs, and version-7 per-commit release callbacks remain
+separate composable state because their storage and scheduling policy differ by
+compositor. The SHM interoperability server exercises both state machines with
+real libwayland region copies, attach, dual damage, transform, scale, offset,
+and commit requests, including destroying the source region after it is copied.
 
 ## Initial transport candidate
 
