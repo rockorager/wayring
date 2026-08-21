@@ -27,6 +27,7 @@ pub const io_uring = @import("io_uring.zig");
 pub const unix_socket = @import("unix_socket.zig");
 pub const compositor = @import("compositor.zig");
 pub const region = @import("region.zig");
+pub const frame = @import("frame.zig");
 
 test {
     _ = wire;
@@ -48,4 +49,5 @@ test {
     _ = unix_socket;
     _ = compositor;
     _ = region;
+    _ = frame;
 }

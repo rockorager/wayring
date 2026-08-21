@@ -458,12 +458,18 @@ which affect hit testing and occlusion correctness, use ordered add/subtract
 programs leased from one compositor-wide node pool. Idle regions and surfaces
 reserve no command nodes. Region-to-surface copies and double-buffered commits
 are transactional under pool pressure, and null input retains its distinct
-infinite-region semantics. Frame callback chains, synchronized subsurface
-content-update graphs, and version-7 per-commit release callbacks remain
-separate composable state because their storage and scheduling policy differ by
-compositor. The SHM interoperability server exercises both state machines with
-real libwayland region copies, attach, dual damage, transform, scale, offset,
-and commit requests, including destroying the source region after it is copied.
+infinite-region semantics. Frame callbacks similarly lease nodes from one
+shared pool. Commit splices a surface's pending callbacks onto its ready queue
+in O(1), preserving request and commit order. Compositors peek the oldest ready
+handle, transactionally enqueue `done` plus `delete_id`, and consume it only
+after TX succeeds, so backpressure cannot lose a callback.
+
+Synchronized subsurface content-update graphs and version-7 per-commit release
+callbacks remain separate composable state because their storage and scheduling
+policy differ by compositor. The SHM interoperability server exercises all
+current state machines with real libwayland region copies, frame callbacks,
+attach, dual damage, transform, scale, offset, and commit requests, including
+destroying the source region after it is copied.
 
 ## Initial transport candidate
 

@@ -540,6 +540,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
     defer region_state.deinit();
     var surface_regions = wayring.compositor.SurfaceRegions.init(&region_pool);
     defer surface_regions.deinit();
+    var frame_pool = try wayring.compositor.FramePool.init(allocator, 4);
+    defer frame_pool.deinit(allocator);
+    var frame_queue = wayring.compositor.FrameQueue.init(&frame_pool);
+    defer frame_queue.deinit();
     var handler: ProtocolServerHandler = .{
         .kind = kind,
         .runtime = &runtime,
@@ -548,6 +552,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .queue = &actor.transmit,
         .region_state = &region_state,
         .surface_regions = &surface_regions,
+        .frame_queue = &frame_queue,
     };
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
@@ -729,6 +734,7 @@ const ProtocolServerHandler = struct {
     surface_state: wayring.compositor.Surface = .{},
     region_state: *wayring.compositor.Region,
     surface_regions: *wayring.compositor.SurfaceRegions,
+    frame_queue: *wayring.compositor.FrameQueue,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1922,6 +1928,7 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).callback;
+                    try handler.frame_queue.addPending(handler.frame_callback.?);
                 },
                 .damage_buffer => |value| {
                     if (handler.kind != .shm or value.x != 5 or value.y != 6 or
@@ -1964,6 +1971,12 @@ const ProtocolServerHandler = struct {
                 },
                 .commit => {
                     if (handler.kind == .shm) {
+                        const region_changes = try handler.surface_regions.commit();
+                        if (!region_changes.opaque_changed or !region_changes.input_changed or
+                            handler.surface_regions.current_opaque.count != 2 or
+                            handler.surface_regions.current_input.count != 2 or
+                            handler.surface_regions.current_input_infinite)
+                            return error.InvalidSurfaceRegions;
                         const update = handler.surface_state.commit();
                         if (update.attachment == null or
                             update.attachment.?.buffer == null or
@@ -1972,12 +1985,8 @@ const ProtocolServerHandler = struct {
                             update.transform != .@"90" or update.scale != 2 or
                             update.offset.x != 2 or update.offset.y != -3)
                             return error.InvalidSurfaceState;
-                        const region_changes = try handler.surface_regions.commit();
-                        if (!region_changes.opaque_changed or !region_changes.input_changed or
-                            handler.surface_regions.current_opaque.count != 2 or
-                            handler.surface_regions.current_input.count != 2 or
-                            handler.surface_regions.current_input_infinite)
-                            return error.InvalidSurfaceRegions;
+                        if (handler.frame_queue.commit() != 1)
+                            return error.InvalidFrameCallbacks;
                         try wayring.server.sendEvent(
                             standard_protocol,
                             standard_protocol.wl_buffer,
@@ -1990,8 +1999,11 @@ const ProtocolServerHandler = struct {
                         try XdgServerCore.completeSync(
                             handler.objects,
                             handler.queue,
-                            handler.frame_callback orelse return error.MissingCallback,
+                            handler.frame_queue.peekReady() orelse return error.MissingCallback,
                             123,
+                        );
+                        try handler.frame_queue.consumeReady(
+                            handler.frame_callback orelse return error.MissingCallback,
                         );
                         handler.frame_completed = true;
                         handler.surface_committed = true;
