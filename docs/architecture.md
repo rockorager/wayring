@@ -496,7 +496,10 @@ DCU; unreachable SCUs become DCUs and lose incoming cross-surface dependencies
 exactly as required by version 7. The relationship graph reports precisely the
 surfaces whose effective mode changed, stopping at explicit synchronization
 barriers, so callers can feed those keys directly to their scheduler queues
-without embedding scheduler policy in relationship storage.
+without embedding scheduler policy in relationship storage. Effective-mode
+queries determine CU kind, while direct-child enumeration includes pending
+associations and supplies the child queues whose newest unclaimed SCUs become
+dependencies of the parent commit.
 The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and
