@@ -29,6 +29,7 @@ pub const compositor = @import("compositor.zig");
 pub const region = @import("region.zig");
 pub const frame = @import("frame.zig");
 pub const subsurface = @import("subsurface.zig");
+pub const release = @import("release.zig");
 
 test {
     _ = wire;
@@ -52,4 +53,5 @@ test {
     _ = region;
     _ = frame;
     _ = subsurface;
+    _ = release;
 }
