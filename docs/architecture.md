@@ -502,6 +502,16 @@ associations and supplies the child queues whose newest unclaimed SCUs become
 dependencies of the parent commit. Recursive visibility accounts for pending
 ancestor associations, inactive ancestor role objects, and destroyed parent
 surfaces without eagerly walking or rewriting the descendant tree.
+
+The transactional `CommitState` boundary composes scalar surface state, exact
+region snapshots, frame callbacks, per-commit release callbacks, and DAG
+admission. Scheduler capacity and dependencies are preflighted without
+mutation; region replacements are prepared in temporary shared-pool nodes; and
+the release callback's same-commit buffer requirement is validated before the
+infallible publish phase. Frame callbacks remain owned by their CU and become
+ready only when that CU applies, rather than when a synchronized request is
+merely queued. Unapplied queue teardown explicitly discards callback batches,
+so shared pools do not leak under disconnect or protocol-error cleanup.
 The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and

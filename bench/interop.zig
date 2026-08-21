@@ -22,6 +22,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 const InteropSubsurfaceGraph = wayring.compositor.SubsurfaceGraph(wayring.objects.Handle, u32);
+const InteropCommitState = wayring.compositor.CommitState(u32);
 const subsurface_role_id = 1;
 
 const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
@@ -546,6 +547,14 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
     defer frame_pool.deinit(allocator);
     var frame_queue = wayring.compositor.FrameQueue.init(&frame_pool);
     defer frame_queue.deinit();
+    var release_pool = try wayring.compositor.ReleasePool.init(allocator, 4);
+    defer release_pool.deinit(allocator);
+    var release_queue = wayring.compositor.ReleaseQueue.init(&release_pool);
+    defer release_queue.deinit();
+    var commit_scheduler = try InteropCommitState.Scheduler.init(allocator, 4, 4);
+    defer commit_scheduler.deinit(allocator);
+    var commit_queue = InteropCommitState.Scheduler.Queue.init(&commit_scheduler, 1);
+    defer InteropCommitState.deinitQueue(&commit_queue);
     var subsurface_graph = try InteropSubsurfaceGraph.init(allocator, 4, 4);
     defer subsurface_graph.deinit(allocator);
     var handler: ProtocolServerHandler = .{
@@ -557,6 +566,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .region_state = &region_state,
         .surface_regions = &surface_regions,
         .frame_queue = &frame_queue,
+        .release_queue = &release_queue,
+        .commit_scheduler = &commit_scheduler,
+        .commit_queue = &commit_queue,
         .subsurface_graph = &subsurface_graph,
     };
     defer {
@@ -741,6 +753,9 @@ const ProtocolServerHandler = struct {
     region_state: *wayring.compositor.Region,
     surface_regions: *wayring.compositor.SurfaceRegions,
     frame_queue: *wayring.compositor.FrameQueue,
+    release_queue: *wayring.compositor.ReleaseQueue,
+    commit_scheduler: *InteropCommitState.Scheduler,
+    commit_queue: *InteropCommitState.Scheduler.Queue,
     subsurface_graph: *InteropSubsurfaceGraph,
     params_created: bool = false,
     plane_added: bool = false,
@@ -1989,13 +2004,32 @@ const ProtocolServerHandler = struct {
                 },
                 .commit => {
                     if (handler.kind == .shm) {
-                        const region_changes = try handler.surface_regions.commit();
+                        _ = try InteropCommitState.commit(
+                            handler.commit_scheduler,
+                            handler.commit_queue,
+                            &handler.surface_state,
+                            handler.surface_regions,
+                            handler.frame_queue,
+                            handler.release_queue,
+                            .desync,
+                            &.{},
+                            0,
+                        );
+                        var applied: [1]InteropCommitState.Scheduler.Applied = undefined;
+                        const updates = try handler.commit_scheduler.tryApply(
+                            handler.commit_queue,
+                            &applied,
+                        );
+                        if (updates.len != 1) return error.InvalidSurfaceState;
+                        var content = updates[0].payload;
+                        defer content.deinit();
+                        const region_changes = content.regions;
                         if (!region_changes.opaque_changed or !region_changes.input_changed or
                             handler.surface_regions.current_opaque.count != 2 or
                             handler.surface_regions.current_input.count != 2 or
                             handler.surface_regions.current_input_infinite)
                             return error.InvalidSurfaceRegions;
-                        const update = handler.surface_state.commit();
+                        const update = content.surface;
                         if (update.attachment == null or
                             update.attachment.?.buffer == null or
                             !std.meta.eql(update.attachment.?.buffer.?, handler.buffer.?) or
@@ -2003,7 +2037,7 @@ const ProtocolServerHandler = struct {
                             update.transform != .@"90" or update.scale != 2 or
                             update.offset.x != 2 or update.offset.y != -3)
                             return error.InvalidSurfaceState;
-                        if (handler.frame_queue.commit() != 1)
+                        if (content.activateFrames(handler.frame_queue) != 1)
                             return error.InvalidFrameCallbacks;
                         try wayring.server.sendEvent(
                             standard_protocol,
