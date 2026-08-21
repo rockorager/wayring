@@ -401,6 +401,116 @@ pub fn Core(comptime protocol: type) type {
     };
 }
 
+/// Allocation-free asynchronous `wl_display.sync` helper. It owns one internal
+/// callback at a time, consumes its `done` and matching `delete_id` events, and
+/// forwards every other event and optional driver hook to `handler`.
+pub fn Roundtrip(comptime protocol: type, comptime Handler: type) type {
+    return struct {
+        const Self = @This();
+        const ProtocolCore = Core(protocol);
+
+        pub const State = enum {
+            idle,
+            waiting_done,
+            waiting_delete,
+            complete,
+        };
+
+        connection: *Connection(protocol),
+        handler: Handler,
+        callback: objects.Handle = undefined,
+        state: State = .idle,
+        callback_data: u32 = 0,
+
+        pub fn init(connection: *Connection(protocol), handler: Handler) Self {
+            return .{ .connection = connection, .handler = handler };
+        }
+
+        /// Queues a sync request without preparing or submitting its send.
+        /// A prior roundtrip must have received both `done` and `delete_id`.
+        pub fn begin(roundtrip: *Self) !objects.Handle {
+            if (roundtrip.state == .waiting_done or roundtrip.state == .waiting_delete)
+                return error.RoundtripPending;
+            const actor = try roundtrip.connection.actor();
+            const callback = try ProtocolCore.sync(
+                &roundtrip.connection.objects,
+                &actor.transmit,
+                null,
+            );
+            roundtrip.callback = callback;
+            roundtrip.callback_data = 0;
+            roundtrip.state = .waiting_done;
+            return callback;
+        }
+
+        /// True after callback.done; the callback ID may still await delete_id.
+        pub fn done(roundtrip: *const Self) bool {
+            return roundtrip.state == .waiting_delete or roundtrip.state == .complete;
+        }
+
+        /// True after the server has also released the callback ID.
+        pub fn settled(roundtrip: *const Self) bool {
+            return roundtrip.state == .complete;
+        }
+
+        pub fn event(
+            roundtrip: *Self,
+            target: objects.Dispatch,
+            message: wire.Message,
+            fds: *ancillary.FdQueue,
+        ) !@import("dispatch.zig").Control {
+            if (roundtrip.state == .waiting_done and
+                target.object.interface == &ProtocolCore.Callback.info and
+                message.header.object_id == roundtrip.callback.id)
+            {
+                const value = try ProtocolCore.decodeCallbackEvent(
+                    &roundtrip.connection.objects,
+                    roundtrip.callback,
+                    message,
+                    fds,
+                );
+                roundtrip.callback_data = switch (value) {
+                    .done => |done_value| done_value.callback_data,
+                };
+                roundtrip.state = .waiting_delete;
+                return .continue_dispatch;
+            }
+
+            if (roundtrip.state == .waiting_delete and
+                target.object.interface == &ProtocolCore.Display.info)
+            {
+                const value = try ProtocolCore.Display.decodeEvent(message, fds);
+                const deleted: ?u32 = switch (value) {
+                    .delete_id => |delete_value| delete_value.id,
+                    .@"error" => null,
+                };
+                if (deleted) |id| {
+                    if (id == roundtrip.callback.id) {
+                        try roundtrip.connection.objects.deleted(id);
+                        roundtrip.state = .complete;
+                        return .continue_dispatch;
+                    }
+                }
+            }
+            return roundtrip.handler.event(target, message, fds);
+        }
+
+        pub fn eventError(
+            roundtrip: *Self,
+            peer: io_uring.Peer,
+            failure: ProtocolCore.EventFailure,
+        ) void {
+            if (@hasDecl(@TypeOf(roundtrip.handler.*), "eventError"))
+                roundtrip.handler.eventError(peer, failure);
+        }
+
+        pub fn disconnected(roundtrip: *Self, peer: io_uring.Peer) void {
+            if (@hasDecl(@TypeOf(roundtrip.handler.*), "disconnected"))
+                roundtrip.handler.disconnected(peer);
+        }
+    };
+}
+
 /// Allocation-free completion driver for one client `Connection`. The driver
 /// borrows both connection and ring, keeps submission explicit, and leaves
 /// final `Connection.deinit` to the owner once `Progress.quiescent` is true.

@@ -314,6 +314,22 @@ median was 5.39 million messages/second versus 5.31 million for the handwritten
 loop. A longer alternating latency run measured median p50 of 54.5 microseconds
 for both paths and p99 of 85.0 versus 82.8 microseconds, preserving the manual
 path's latency profile within orb scheduling noise.
+The client also provides a composable asynchronous roundtrip adapter rather
+than a blocking `wl_display_roundtrip` call. It owns one internal callback,
+intercepts `callback.done` and the matching `display.delete_id`, forwards all
+unrelated events and driver hooks, and performs no allocation beyond the
+connection's existing bounded object table. Sending and waiting remain under
+the caller's ring loop, so a roundtrip cannot hide a syscall or deadlock another
+consumer sharing the ring.
+
+Wayring does not copy libwayland's retained event-queue architecture into the
+default path. Deferring raw events would require copying receive bytes, holding
+or transferring descriptors, and partially applying constructor/destructor
+object transitions before later events can be validated. Direct generated
+dispatch instead exposes each object's context for immediate application-level
+routing while preserving zero-copy selected-buffer processing. An optional
+owned-event adapter may be added for cross-thread consumers, but its memory and
+copying costs will remain explicit rather than taxing every connection.
 Wayring operation tokens reserve low `user_data` bytes 1 through 5; borrowed-ring
 consumers must use a disjoint tag namespace and pass only Wayring candidates to
 reactor routing.

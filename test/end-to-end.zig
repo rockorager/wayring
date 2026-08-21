@@ -7,6 +7,7 @@ const ClientCore = wayring.client.Core(protocol);
 const ServerCore = wayring.server.Core(protocol);
 const ClientConnection = wayring.client.Connection(protocol);
 const ClientDriver = wayring.client.Driver(protocol);
+const ClientRoundtrip = wayring.client.Roundtrip(protocol, *EmptyClientHandler);
 const ServerConnections = wayring.server.SharedClients(protocol);
 
 test "client and server complete a core round trip on one reactor" {
@@ -63,30 +64,24 @@ test "client and server complete a core round trip on one reactor" {
     const client_peer = client_connection.peer;
     const server_objects = try server_connections.get(server_peer);
 
-    const client_actor = try client_connection.actor();
-    const callback = try ClientCore.sync(
-        &client_connection.objects,
-        &client_actor.transmit,
-        null,
-    );
     var server_handler: ServerHandler = .{
         .objects = server_objects,
         .queue = &(try reactor.getActor(server_peer)).transmit,
     };
-    var client_handler: ClientHandler = .{
-        .objects = &client_connection.objects,
-        .callback = callback,
-    };
+    var client_handler: EmptyClientHandler = .{};
+    var roundtrip = ClientRoundtrip.init(&client_connection, &client_handler);
+    const callback = try roundtrip.begin();
+    try std.testing.expectError(error.RoundtripPending, roundtrip.begin());
     var client_driver = ClientDriver.init(&client_connection);
     _ = try client_driver.schedule();
-    var client_progress = try client_driver.prepare(&client_handler);
+    var client_progress = try client_driver.prepare(&roundtrip);
     try std.testing.expectEqual(@as(usize, 1), client_progress.prepared);
     const nop_tag: u64 = 0xffff_ffff_ffff_ff00;
     _ = try ring.nop(nop_tag);
     _ = try reactor.ring.submit();
     var nop_seen = false;
 
-    while (!client_handler.done or !client_handler.deleted) {
+    while (!roundtrip.settled()) {
         const completion = try reactor.ring.copy_cqe();
         if (completion.user_data == nop_tag) {
             nop_seen = true;
@@ -96,7 +91,7 @@ test "client and server complete a core round trip on one reactor" {
             return error.InvalidCompletion).connection;
         const peer = reactor.routedPeer(routed);
         if (peer.slot == client_peer.slot) {
-            client_progress = try client_driver.dispatch(&.{completion}, &client_handler);
+            client_progress = try client_driver.dispatch(&.{completion}, &roundtrip);
             if (client_progress.event_errors != 0) return error.UnexpectedEventError;
             if (client_progress.prepared != 0 or client_progress.pending)
                 _ = try reactor.ring.submit();
@@ -141,7 +136,8 @@ test "client and server complete a core round trip on one reactor" {
     }
 
     try std.testing.expect(nop_seen);
-    try std.testing.expectEqual(@as(u32, 91), client_handler.callback_data);
+    try std.testing.expect(roundtrip.done());
+    try std.testing.expectEqual(@as(u32, 91), roundtrip.callback_data);
     try std.testing.expect(client_connection.objects.namespace.resolve(callback) == null);
     try std.testing.expect(!client_connection.objects.ids.isActive(callback.id));
     try std.testing.expectEqual(@as(usize, 1), server_objects.namespace.count);
@@ -372,45 +368,14 @@ const ServerHandler = struct {
     }
 };
 
-const ClientHandler = struct {
-    objects: *wayring.objects.ClientObjects,
-    callback: wayring.objects.Handle,
-    callback_data: u32 = 0,
-    done: bool = false,
-    deleted: bool = false,
-
+const EmptyClientHandler = struct {
     pub fn event(
-        handler: *ClientHandler,
-        target: wayring.objects.Dispatch,
-        message: wayring.wire.Message,
-        fds: *wayring.ancillary.FdQueue,
+        _: *EmptyClientHandler,
+        _: wayring.objects.Dispatch,
+        _: wayring.wire.Message,
+        _: *wayring.ancillary.FdQueue,
     ) !wayring.dispatch.Control {
-        if (target.object.interface == &ClientCore.Callback.info) {
-            const event_value = try ClientCore.decodeCallbackEvent(
-                handler.objects,
-                handler.callback,
-                message,
-                fds,
-            );
-            handler.callback_data = switch (event_value) {
-                .done => |value| value.callback_data,
-            };
-            handler.done = true;
-        } else if (target.object.interface == &ClientCore.Display.info) {
-            const event_value = try ClientCore.decodeDisplayEvent(
-                handler.objects,
-                message,
-                fds,
-            );
-            switch (event_value) {
-                .delete_id => |value| {
-                    if (value.id != handler.callback.id) return error.UnexpectedObject;
-                    handler.deleted = true;
-                },
-                .@"error" => return error.ProtocolError,
-            }
-        } else return error.UnexpectedEvent;
-        return .continue_dispatch;
+        return error.UnexpectedEvent;
     }
 };
 
