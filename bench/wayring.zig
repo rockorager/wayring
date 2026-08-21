@@ -55,6 +55,8 @@ const Options = struct {
         rx_pressure_deferred,
         rx_pool_latency,
         rx_pool_idle,
+        fixed_files,
+        fixed_files_latency,
     };
 
     warmup: u64 = 100_000,
@@ -75,7 +77,8 @@ fn isReceivePoolMode(mode: Options.Mode) bool {
 }
 
 fn isLatencyMode(mode: Options.Mode) bool {
-    return mode == .latency or mode == .rx_pool_latency;
+    return mode == .latency or mode == .rx_pool_latency or
+        mode == .fixed_files_latency;
 }
 
 fn isIdleMode(mode: Options.Mode) bool {
@@ -189,6 +192,7 @@ fn flushMultiActorSend(
     ring: *linux.IoUring,
     owner: *IoReactor,
     deferred_rearm: bool,
+    fixed_files: bool,
     target_slot: usize,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -200,7 +204,10 @@ fn flushMultiActorSend(
         .generation = actor.generation,
     };
     while (actor.transmit.queuedBytes() > 0) {
-        try owner.prepareSend(peer);
+        if (fixed_files)
+            try owner.prepareSendFixed(peer)
+        else
+            try owner.prepareSend(peer);
         _ = try ring.submit_and_wait(1);
 
         while (true) {
@@ -220,6 +227,13 @@ fn flushMultiActorSend(
                 .receive => switch (event) {
                     .buffers_exhausted => if (deferred_rearm) {
                         _ = try owner.deferReceive(owner.routedPeer(routed));
+                    } else if (fixed_files) {
+                        try receivers[routed_slot].prepareFixed(
+                            ring,
+                            @intCast(routed_slot),
+                            routed_actor,
+                        );
+                        _ = try ring.submit();
                     } else try receivers[routed_slot].arm(
                         ring,
                         fds[routed_slot],
@@ -794,6 +808,7 @@ fn serverMultiHandshake(
     ring: *linux.IoUring,
     owner: *IoReactor,
     deferred_rearm: bool,
+    fixed_files: bool,
     fds: []const c.fd_t,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -831,13 +846,23 @@ fn serverMultiHandshake(
     try Benchmark.encodeEvent(&actor.transmit, object_id, .{
         .pong = .{ .sequence = 0 },
     });
-    try flushMultiActorSend(ring, owner, deferred_rearm, 0, actors, receivers, fds);
+    try flushMultiActorSend(
+        ring,
+        owner,
+        deferred_rearm,
+        fixed_files,
+        0,
+        actors,
+        receivers,
+        fds,
+    );
 }
 
 fn serverMultiPhase(
     ring: *linux.IoUring,
     owner: *IoReactor,
     deferred_rearm: bool,
+    fixed_files: bool,
     fds: []const c.fd_t,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -884,6 +909,7 @@ fn serverMultiPhase(
         ring,
         owner,
         deferred_rearm,
+        fixed_files,
         index,
         actors,
         receivers,
@@ -967,6 +993,8 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
     const receive_pressure = isReceivePoolMode(options.mode);
     const deferred_rearm = receive_pressure and options.mode != .rx_pressure_immediate;
+    const fixed_files = options.mode == .fixed_files or
+        options.mode == .fixed_files_latency;
     const receive_buffer_count: u16 = if (receive_pressure)
         options.receive_buffers
     else
@@ -989,6 +1017,13 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         .send_descriptor_capacity = 16,
     });
     const ring = owner.ring;
+    if (fixed_files) {
+        const registration_start = try monotonicNs();
+        try ring.register_files(fds);
+        const registration_elapsed = try monotonicNs() - registration_start;
+        try printFixedRegistration("server", options.connections, registration_elapsed);
+    }
+    defer if (fixed_files) ring.unregister_files() catch unreachable;
     const slots = owner.slots;
     const actors = owner.actor_storage[0..options.connections];
     const receivers = owner.receiver_storage[0..options.connections];
@@ -1021,7 +1056,10 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             1,
         );
         _ = try namespace.insert(object_id, &Benchmark.info, Benchmark.info.version, null);
-        try receiver.prepare(ring, fds[index], actor);
+        if (fixed_files)
+            try receiver.prepareFixed(ring, @intCast(index), actor)
+        else
+            try receiver.prepare(ring, fds[index], actor);
     }
     _ = try ring.submit();
 
@@ -1029,6 +1067,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         ring,
         &owner,
         deferred_rearm,
+        fixed_files,
         fds,
         actors,
         receivers,
@@ -1039,6 +1078,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             ring,
             &owner,
             deferred_rearm,
+            fixed_files,
             fds,
             actors,
             receivers,
@@ -1051,6 +1091,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             ring,
             &owner,
             deferred_rearm,
+            fixed_files,
             fds,
             actors,
             receivers,
@@ -1064,6 +1105,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             ring,
             &owner,
             deferred_rearm,
+            fixed_files,
             fds,
             actors,
             receivers,
@@ -1076,6 +1118,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             ring,
             &owner,
             deferred_rearm,
+            fixed_files,
             fds,
             actors,
             receivers,
@@ -1107,10 +1150,22 @@ fn monotonicNs() !u64 {
         @as(u64, @intCast(time.nsec));
 }
 
+fn printFixedRegistration(role: []const u8, connections: usize, elapsed: u64) !void {
+    var storage: [192]u8 = undefined;
+    const line = try std.fmt.bufPrint(
+        &storage,
+        "backend=wayring-multishot scope=fixed-file-registration role={s} connections={} elapsed_ns={}\n",
+        .{ role, connections, elapsed },
+    );
+    if (c.write(1, line.ptr, line.len) != @as(isize, @intCast(line.len)))
+        return error.SystemCallFailed;
+}
+
 fn sendMultiPhase(
     allocator: std.mem.Allocator,
     ring: *Ring,
     fds: []const c.fd_t,
+    fixed_files: bool,
     count: u64,
     batch: u32,
     sequence: u32,
@@ -1146,7 +1201,12 @@ fn sendMultiPhase(
                 .flags = 0,
             };
             const submission = try ring.io.get_sqe();
-            submission.prep_sendmsg(fd, &messages[index], 0);
+            submission.prep_sendmsg(
+                if (fixed_files) @intCast(index) else fd,
+                &messages[index],
+                0,
+            );
+            if (fixed_files) submission.flags |= linux.IOSQE_FIXED_FILE;
             submission.user_data = index;
         }
         _ = try ring.io.submit_and_wait(@intCast(fds.len));
@@ -1175,6 +1235,7 @@ fn sendMultiPhase(
 fn latencyMultiRound(
     ring: *Ring,
     fds: []const c.fd_t,
+    fixed_files: bool,
     sequence: u32,
     request: *[message_size]u8,
     iovecs: []std.posix.iovec_const,
@@ -1195,7 +1256,12 @@ fn latencyMultiRound(
             .flags = 0,
         };
         const submission = try ring.io.get_sqe();
-        submission.prep_sendmsg(fd, &messages[index], 0);
+        submission.prep_sendmsg(
+            if (fixed_files) @intCast(index) else fd,
+            &messages[index],
+            0,
+        );
+        if (fixed_files) submission.flags |= linux.IOSQE_FIXED_FILE;
         submission.user_data = index;
     }
     _ = try ring.io.submit_and_wait(@intCast(fds.len));
@@ -1229,6 +1295,7 @@ fn runMultiLatency(
     fds: []const c.fd_t,
     options: Options,
 ) !void {
+    const fixed_files = options.mode == .fixed_files_latency;
     const iovecs = try allocator.alloc(std.posix.iovec_const, fds.len);
     defer allocator.free(iovecs);
     const messages = try allocator.alloc(linux.msghdr_const, fds.len);
@@ -1242,6 +1309,7 @@ fn runMultiLatency(
     for (0..options.warmup) |round| try latencyMultiRound(
         ring,
         fds,
+        fixed_files,
         @intCast(round + 1),
         &request,
         iovecs,
@@ -1254,6 +1322,7 @@ fn runMultiLatency(
         try latencyMultiRound(
             ring,
             fds,
+            fixed_files,
             @intCast(options.warmup + round + 1),
             &request,
             iovecs,
@@ -1281,9 +1350,21 @@ fn runMultiLatency(
             percentile(samples, 99),
             samples[samples.len - 1],
         );
+    } else if (options.mode == .fixed_files_latency) {
+        _ = c.printf(
+            "backend=wayring-multishot file_mode=fixed connections=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+            options.connections,
+            options.messages,
+            operations,
+            mean,
+            percentile(samples, 50),
+            percentile(samples, 95),
+            percentile(samples, 99),
+            samples[samples.len - 1],
+        );
     } else {
         _ = c.printf(
-            "backend=wayring-multishot connections=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+            "backend=wayring-multishot file_mode=normal connections=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
             options.connections,
             options.messages,
             operations,
@@ -1298,6 +1379,8 @@ fn runMultiLatency(
 
 fn multiMain(options: Options) !u8 {
     const allocator = std.heap.c_allocator;
+    const fixed_files = options.mode == .fixed_files or
+        options.mode == .fixed_files_latency;
     const pairs = try allocator.alloc([2]c.fd_t, options.connections);
     defer allocator.free(pairs);
     const parent_fds = try allocator.alloc(c.fd_t, options.connections);
@@ -1327,6 +1410,13 @@ fn multiMain(options: Options) !u8 {
 
     var ring = try Ring.init(multi_ring_entries);
     defer ring.deinit();
+    if (fixed_files) {
+        const registration_start = try monotonicNs();
+        try ring.io.register_files(parent_fds);
+        const registration_elapsed = try monotonicNs() - registration_start;
+        try printFixedRegistration("client", options.connections, registration_elapsed);
+    }
+    defer if (fixed_files) ring.io.unregister_files() catch unreachable;
     try validateFdLane(&ring, parent_fds[0]);
     if (isIdleMode(options.mode) and benchmark_resource_sample(
         "wayring-multishot",
@@ -1338,7 +1428,15 @@ fn multiMain(options: Options) !u8 {
     if (isLatencyMode(options.mode)) {
         try runMultiLatency(allocator, &ring, parent_fds, options);
     } else {
-        try sendMultiPhase(allocator, &ring, parent_fds, options.warmup, options.batch, 1);
+        try sendMultiPhase(
+            allocator,
+            &ring,
+            parent_fds,
+            fixed_files,
+            options.warmup,
+            options.batch,
+            1,
+        );
         if (isIdleMode(options.mode) and benchmark_resource_sample(
             "wayring-multishot",
             "active",
@@ -1347,7 +1445,15 @@ fn multiMain(options: Options) !u8 {
             0,
         ) != 0) return error.SystemCallFailed;
         const start = try monotonicNs();
-        try sendMultiPhase(allocator, &ring, parent_fds, options.messages, options.batch, 2);
+        try sendMultiPhase(
+            allocator,
+            &ring,
+            parent_fds,
+            fixed_files,
+            options.messages,
+            options.batch,
+            2,
+        );
         const elapsed = try monotonicNs() - start;
         const total_messages = try std.math.mul(u64, options.messages, options.connections);
         if (!isIdleMode(options.mode)) {
@@ -1371,8 +1477,17 @@ fn multiMain(options: Options) !u8 {
                     elapsed,
                     throughput,
                 );
+            } else if (fixed_files) {
+                _ = c.printf(
+                    "backend=wayring-multishot file_mode=fixed connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                    options.connections,
+                    total_messages,
+                    options.batch,
+                    elapsed,
+                    throughput,
+                );
             } else _ = c.printf(
-                "backend=wayring-multishot connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                "backend=wayring-multishot file_mode=normal connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
                 options.connections,
                 total_messages,
                 options.batch,
@@ -1415,6 +1530,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .rx_pool_latency
         else if (std.mem.eql(u8, value, "rx-pool-idle"))
             options.mode = .rx_pool_idle
+        else if (std.mem.eql(u8, value, "fixed-files"))
+            options.mode = .fixed_files
+        else if (std.mem.eql(u8, value, "fixed-files-latency"))
+            options.mode = .fixed_files_latency
         else if (!std.mem.eql(u8, value, "round-trip"))
             return error.InvalidMessage;
     }
@@ -1443,7 +1562,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (options.mode == .client_tx) return clientTransmitMain(options);
     if (options.mode == .client_rx) return clientReceiveMain(options);
     if (options.connections > 1 or isLatencyMode(options.mode) or isIdleMode(options.mode) or
-        isReceivePoolMode(options.mode))
+        isReceivePoolMode(options.mode) or options.mode == .fixed_files)
         return multiMain(options);
     var sockets: [2]c.fd_t = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)

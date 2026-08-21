@@ -32,6 +32,9 @@ bench/run.sh rx-pool
 bench/run.sh rx-pool-syscalls
 bench/run.sh rx-pool-latency
 bench/run.sh rx-pool-resources
+bench/run.sh fixed-files
+bench/run.sh fixed-files-perf
+bench/run.sh fixed-files-latency
 bench/run.sh resources
 bench/run.sh idle-perf
 bench/run.sh latency
@@ -84,6 +87,12 @@ memory, throughput, syscall, and all-client tail-latency knee. Configure their
 matrix with `RX_CONNECTIONS="8 16 32"` and `RX_BUFFERS="2 4 8 16"`. Output
 includes exact reserved receive-pool capacity because process RSS is generally
 too coarse and noisy to distinguish these 64 KiB buffer-count increments.
+
+Fixed-file modes compare ordinary socket descriptors with a slot-aligned
+registered-file table used by both benchmark processes. Registration time is
+reported separately and excluded from message throughput and latency. Configure
+the throughput and latency matrix with `FIXED_CONNECTIONS="8 32 64"`. Samples
+alternate execution order to avoid systematically favoring the first mode.
 
 Resource mode samples initialized client/server pairs while idle and again
 after `RESOURCE_WARMUP` messages per connection. It reports the resident memory

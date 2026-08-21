@@ -391,6 +391,16 @@ the same orb.
 - No default `SQPOLL`, zero-copy send, or fixed-file registration until each is
   shown to improve the relevant benchmark profile.
 
+The fixed-file experiment registers one slot-aligned socket table in each
+benchmark process and marks persistent receive and send SQEs with
+`IOSQE_FIXED_FILE`. A balanced six-sample, 32-connection run measured median
+throughput of 85.1 million messages/second with ordinary descriptors and 84.1
+million with fixed files. All-client tail latency was unchanged across 8 and 32
+connections, while table registration cost roughly 3–8 microseconds per
+process. Fixed files therefore remain an explicit caller-owned experiment; the
+reactor does not acquire table-update syscalls or registered-file lifetime
+complexity without evidence of a hot-path win.
+
 An epoll plus `recvmsg`/`sendmsg` implementation will serve as the measurement
 control rather than as a compatibility backend.
 

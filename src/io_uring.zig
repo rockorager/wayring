@@ -73,6 +73,25 @@ pub const SendState = struct {
             ring,
             fd,
             actor,
+            false,
+        );
+    }
+
+    pub inline fn prepareFixed(
+        sender: *SendState,
+        ring: *linux.IoUring,
+        index: u32,
+        actor: *connection.Actor,
+    ) !void {
+        try prepareSendOperation(
+            sender.descriptor_scratch,
+            sender.control_storage,
+            &sender.iovecs,
+            &sender.message,
+            ring,
+            @intCast(index),
+            actor,
+            true,
         );
     }
 };
@@ -311,6 +330,14 @@ pub const Reactor = struct {
         try receiver.prepare(owner.ring, owner.fd_storage[peer.slot], actor);
     }
 
+    /// Prepares against `peer.slot` in a file table already registered by the
+    /// caller on this ring. The reactor does not own registered-file lifetime.
+    pub inline fn prepareReceiveFixed(owner: *Reactor, peer: Peer) !void {
+        const actor = try owner.getActor(peer);
+        const receiver = &owner.receiver_storage[peer.slot];
+        try receiver.prepareFixed(owner.ring, peer.slot, actor);
+    }
+
     pub inline fn armReceive(owner: *Reactor, peer: Peer) !void {
         try owner.prepareReceive(peer);
         _ = try owner.ring.submit();
@@ -468,6 +495,13 @@ pub const Reactor = struct {
             owner.fd_storage[peer.slot],
             actor,
         );
+    }
+
+    /// Prepares against `peer.slot` in a file table already registered by the
+    /// caller on this ring. The reactor does not own registered-file lifetime.
+    pub inline fn prepareSendFixed(owner: *Reactor, peer: Peer) !void {
+        const actor = try owner.getActor(peer);
+        try owner.sender_storage[peer.slot].prepareFixed(owner.ring, peer.slot, actor);
     }
 
     pub inline fn armSend(owner: *Reactor, peer: Peer) !void {
@@ -1250,6 +1284,7 @@ inline fn prepareSendOperation(
     ring: *linux.IoUring,
     fd: linux.fd_t,
     actor: *connection.Actor,
+    fixed_file: bool,
 ) !void {
     if (actor.transmit.sendActive()) return error.SendAlreadyActive;
     const snapshot = try actor.transmit.snapshot(descriptor_scratch, control_storage);
@@ -1278,6 +1313,7 @@ inline fn prepareSendOperation(
         .flags = 0,
     };
     submission.prep_sendmsg(fd, message, 0);
+    if (fixed_file) submission.flags |= linux.IOSQE_FIXED_FILE;
     submission.user_data = tag;
 }
 
@@ -1309,6 +1345,7 @@ pub fn Sender(
                 ring,
                 fd,
                 actor,
+                false,
             );
         }
 
@@ -1379,12 +1416,32 @@ pub const Receiver = struct {
         fd: linux.fd_t,
         actor: *connection.Actor,
     ) !void {
+        try receiver.prepareOperation(ring, fd, actor, false);
+    }
+
+    pub inline fn prepareFixed(
+        receiver: *Receiver,
+        ring: *linux.IoUring,
+        index: u32,
+        actor: *connection.Actor,
+    ) !void {
+        try receiver.prepareOperation(ring, @intCast(index), actor, true);
+    }
+
+    inline fn prepareOperation(
+        receiver: *Receiver,
+        ring: *linux.IoUring,
+        fd: linux.fd_t,
+        actor: *connection.Actor,
+        fixed_file: bool,
+    ) !void {
         const receive_tag = try actor.armReceive();
         errdefer actor.receive_active = false;
         const submission = try ring.get_sqe();
         receiver.message.iov = @ptrCast(&receiver.dummy_iov);
         receiver.receive_tag = receive_tag;
         submission.prep_recvmsg_multishot(fd, &receiver.message, linux.MSG.CMSG_CLOEXEC);
+        if (fixed_file) submission.flags |= linux.IOSQE_FIXED_FILE;
         submission.flags |= linux.IOSQE_BUFFER_SELECT;
         submission.buf_index = receiver.buffer_group_id;
         submission.user_data = receiver.receive_tag;

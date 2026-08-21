@@ -15,6 +15,7 @@ resource_connections=${RESOURCE_CONNECTIONS:-"1 8 32 64"}
 resource_warmup=${RESOURCE_WARMUP:-10000}
 rx_connections=${RX_CONNECTIONS:-"8 16 32"}
 rx_buffers=${RX_BUFFERS:-"2 4 8 16"}
+fixed_connections=${FIXED_CONNECTIONS:-"8 32 64"}
 mode=${1:-throughput}
 
 (cd "$root" && zig build benchmarks)
@@ -133,6 +134,55 @@ case "$mode" in
                 "$root/zig-out/bench/wayring-ping" \
                     1 1 "$resource_warmup" "$rx_connection_count" \
                     rx-pool-idle 1 "$idle_ms" "$rx_buffer_count"
+            done
+        done
+        ;;
+    fixed-files)
+        for fixed_connection_count in $fixed_connections; do
+            sample=1
+            while [ "$sample" -le "$repeats" ]; do
+                echo "# sample=$sample connections=$fixed_connection_count" >&2
+                if [ $((sample % 2)) -eq 1 ]; then
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$messages" "$batch" "$warmup" "$fixed_connection_count"
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$messages" "$batch" "$warmup" "$fixed_connection_count" fixed-files
+                else
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$messages" "$batch" "$warmup" "$fixed_connection_count" fixed-files
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$messages" "$batch" "$warmup" "$fixed_connection_count"
+                fi
+                sample=$((sample + 1))
+            done
+        done
+        ;;
+    fixed-files-perf)
+        events=task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions,branches,branch-misses
+        perf stat -e "$events" "$root/zig-out/bench/wayring-ping" \
+            "$messages" "$batch" "$warmup" "$connections"
+        perf stat -e "$events" "$root/zig-out/bench/wayring-ping" \
+            "$messages" "$batch" "$warmup" "$connections" fixed-files
+        ;;
+    fixed-files-latency)
+        for fixed_connection_count in $fixed_connections; do
+            sample=1
+            while [ "$sample" -le "$repeats" ]; do
+                echo "# sample=$sample connections=$fixed_connection_count latency_rounds=$latency_messages" >&2
+                if [ $((sample % 2)) -eq 1 ]; then
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$latency_messages" 1 "$latency_warmup" "$fixed_connection_count" latency
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$latency_messages" 1 "$latency_warmup" "$fixed_connection_count" \
+                        fixed-files-latency
+                else
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$latency_messages" 1 "$latency_warmup" "$fixed_connection_count" \
+                        fixed-files-latency
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$latency_messages" 1 "$latency_warmup" "$fixed_connection_count" latency
+                fi
+                sample=$((sample + 1))
             done
         done
         ;;
