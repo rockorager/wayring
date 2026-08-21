@@ -366,3 +366,372 @@ fn expectSuccess(result: usize) !void {
     const errno = linux.errno(result);
     if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
 }
+
+test "fuzz reactor slot generations against a free-list model" {
+    try std.testing.fuzz({}, fuzzReactorSlots, .{});
+}
+
+fn fuzzReactorSlots(_: void, smith: *std.testing.Smith) !void {
+    var storage: [8]wayring.reactor.Slot = undefined;
+    const capacity = smith.valueRangeAtMost(u8, 1, storage.len);
+    var slots = wayring.reactor.Slots.init(storage[0..capacity]);
+    var active = [_]bool{false} ** storage.len;
+    var generations = [_]u32{0} ** storage.len;
+    var free: [8]u8 = undefined;
+    for (0..capacity) |index| free[index] = capacity - 1 - @as(u8, @intCast(index));
+    var free_len: usize = capacity;
+
+    var steps: usize = 0;
+    while (steps < 128 and !smith.eosWeightedSimple(16, 1)) : (steps += 1) {
+        const index = smith.valueRangeAtMost(u8, 0, capacity - 1);
+        switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => {
+                if (free_len == 0) {
+                    try std.testing.expectError(error.Exhausted, slots.acquire());
+                } else {
+                    const expected_index = free[free_len - 1];
+                    free_len -= 1;
+                    generations[expected_index] = wayring.completion.nextGeneration(
+                        generations[expected_index],
+                    );
+                    active[expected_index] = true;
+                    const acquired = try slots.acquire();
+                    try std.testing.expectEqual(@as(u24, expected_index), acquired.index);
+                    try std.testing.expectEqual(generations[expected_index], acquired.generation);
+                }
+            },
+            1 => if (active[index]) {
+                try slots.deactivate(index, generations[index]);
+                active[index] = false;
+                free[free_len] = index;
+                free_len += 1;
+            } else {
+                try std.testing.expectError(
+                    error.SlotInactive,
+                    slots.deactivate(index, generations[index]),
+                );
+            },
+            2 => if (active[index]) {
+                const wrong = wayring.completion.nextGeneration(generations[index]);
+                try std.testing.expectError(
+                    error.WrongGeneration,
+                    slots.deactivate(index, wrong),
+                );
+            } else {
+                try std.testing.expectError(
+                    error.SlotInactive,
+                    slots.deactivate(index, generations[index]),
+                );
+            },
+            3 => {
+                const use_current = smith.boolWeighted(1, 1);
+                const generation = if (use_current)
+                    generations[index]
+                else
+                    generations[index] -% 1;
+                const token = (wayring.completion.Token{
+                    .slot = index,
+                    .generation = generation,
+                    .operation = .receive,
+                }).encode();
+                const routed = slots.route(token);
+                if (active[index] and generation == generations[index]) {
+                    try std.testing.expectEqual(index, routed.?.slot);
+                    try std.testing.expectEqual(
+                        wayring.completion.Operation.receive,
+                        routed.?.operation,
+                    );
+                } else try std.testing.expectEqual(null, routed);
+            },
+            else => unreachable,
+        }
+        try std.testing.expectEqual(capacity - free_len, slots.active_count);
+        for (active[0..capacity], 0..) |is_active, model_index| {
+            const current = (wayring.completion.Token{
+                .slot = @intCast(model_index),
+                .generation = generations[model_index],
+                .operation = .send,
+            }).encode();
+            try std.testing.expectEqual(is_active, slots.route(current) != null);
+        }
+    }
+
+    for (active[0..capacity], 0..) |is_active, index| {
+        if (is_active) try slots.deactivate(@intCast(index), generations[index]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), slots.active_count);
+}
+
+test "fuzz connection completion state against a lifecycle model" {
+    try std.testing.fuzz({}, fuzzConnectionState, .{});
+}
+
+fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 16, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment_storage: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(
+        2,
+        7,
+        &fragment_storage,
+        &descriptors,
+        0,
+        &blocks,
+        64,
+        0,
+    );
+
+    var lifecycle: wayring.connection.Lifecycle = .open;
+    var receive_active = false;
+    var cancel_requested = false;
+    var cancel_active = false;
+    var queued_bytes: usize = 0;
+    var send_active = false;
+    var send_bytes: usize = 0;
+
+    var steps: usize = 0;
+    while (steps < 128 and !smith.eosWeightedSimple(16, 1)) : (steps += 1) {
+        switch (smith.valueRangeAtMost(u8, 0, 10)) {
+            0 => {
+                var bytes: [16]u8 = undefined;
+                const len = smith.valueRangeAtMost(u8, 1, bytes.len);
+                smith.bytes(bytes[0..len]);
+                if (lifecycle != .open) {
+                    try std.testing.expectError(error.Closing, actor.enqueue(bytes[0..len], &.{}));
+                } else if (queued_bytes + len > 64) {
+                    try std.testing.expectError(
+                        error.ByteBudgetExceeded,
+                        actor.enqueue(bytes[0..len], &.{}),
+                    );
+                } else {
+                    try actor.enqueue(bytes[0..len], &.{});
+                    queued_bytes += len;
+                }
+            },
+            1 => if (lifecycle != .open) {
+                try std.testing.expectError(error.Closing, actor.armReceive());
+            } else if (receive_active) {
+                try std.testing.expectError(error.ReceiveAlreadyActive, actor.armReceive());
+            } else {
+                _ = try actor.armReceive();
+                receive_active = true;
+            },
+            2 => {
+                const kind = smith.valueRangeAtMost(u8, 0, 4);
+                const more = smith.boolWeighted(1, 1);
+                const result: i32 = switch (kind) {
+                    0 => smith.valueRangeAtMost(i32, 1, 64),
+                    1 => 0,
+                    2 => -@as(i32, @intFromEnum(linux.E.CANCELED)),
+                    3 => -@as(i32, @intFromEnum(linux.E.NOBUFS)),
+                    4 => -@as(i32, @intFromEnum(linux.E.IO)),
+                    else => unreachable,
+                };
+                const completion = cqe(.receive, result, if (more) linux.IORING_CQE_F_MORE else 0);
+                if (!receive_active) {
+                    try std.testing.expectError(
+                        error.ReceiveNotActive,
+                        actor.completeRouted(.receive, completion),
+                    );
+                } else switch (kind) {
+                    0 => {
+                        const event = try actor.completeRouted(.receive, completion);
+                        try std.testing.expectEqual(@as(usize, @intCast(result)), event.received.length);
+                        try std.testing.expectEqual(more, event.received.more);
+                        receive_active = more;
+                    },
+                    1 => {
+                        try std.testing.expectEqual(
+                            wayring.connection.Event.disconnected,
+                            try actor.completeRouted(.receive, completion),
+                        );
+                        receive_active = false;
+                        lifecycle = .closing;
+                    },
+                    2 => {
+                        receive_active = false;
+                        if (lifecycle == .open) {
+                            try std.testing.expectError(
+                                error.IoFailure,
+                                actor.completeRouted(.receive, completion),
+                            );
+                            lifecycle = .closing;
+                        } else try std.testing.expectEqual(
+                            wayring.connection.Event.receive_stopped,
+                            try actor.completeRouted(.receive, completion),
+                        );
+                    },
+                    3 => {
+                        try std.testing.expectEqual(
+                            wayring.connection.Event.buffers_exhausted,
+                            try actor.completeRouted(.receive, completion),
+                        );
+                        receive_active = false;
+                    },
+                    4 => {
+                        try std.testing.expectError(
+                            error.IoFailure,
+                            actor.completeRouted(.receive, completion),
+                        );
+                        receive_active = false;
+                        lifecycle = .closing;
+                    },
+                    else => unreachable,
+                }
+            },
+            3 => if (queued_bytes != 0) {
+                var descriptor_scratch: [1]linux.fd_t = undefined;
+                var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+                const snapshot = try actor.transmit.snapshot(&descriptor_scratch, &control);
+                if (lifecycle == .protocol_error) {
+                    try std.testing.expectError(error.ProtocolErrorPending, actor.beginSend(snapshot));
+                } else if (lifecycle == .closing) {
+                    try std.testing.expectError(error.Closing, actor.beginSend(snapshot));
+                } else if (send_active) {
+                    try std.testing.expectError(error.SendAlreadyActive, actor.beginSend(snapshot));
+                } else {
+                    _ = try actor.beginSend(snapshot);
+                    send_active = true;
+                    send_bytes = snapshot.byteCount();
+                }
+            },
+            4 => {
+                const fail = smith.boolWeighted(3, 1);
+                if (!send_active) {
+                    try std.testing.expectError(
+                        error.NoSendActive,
+                        actor.completeRouted(.send, cqe(.send, if (fail) -1 else 1, 0)),
+                    );
+                } else if (fail) {
+                    try std.testing.expectError(
+                        error.IoFailure,
+                        actor.completeRouted(.send, cqe(.send, -1, 0)),
+                    );
+                    send_active = false;
+                    lifecycle = .closing;
+                } else {
+                    const written = smith.valueRangeAtMost(u16, 1, @intCast(send_bytes));
+                    const event = try actor.completeRouted(
+                        .send,
+                        cqe(.send, @intCast(written), 0),
+                    );
+                    queued_bytes -= written;
+                    send_active = false;
+                    send_bytes = 0;
+                    try std.testing.expectEqual(queued_bytes != 0, event.sent.more_queued);
+                    if (lifecycle == .draining and queued_bytes == 0) lifecycle = .closing;
+                }
+            },
+            5 => if (lifecycle == .open) {
+                try actor.beginProtocolError();
+                lifecycle = .protocol_error;
+            } else try std.testing.expectError(error.Closing, actor.beginProtocolError()),
+            6 => if (lifecycle != .protocol_error) {
+                try std.testing.expectError(error.NoProtocolError, actor.commitProtocolError());
+            } else if (queued_bytes == 0) {
+                try std.testing.expectError(error.EmptyMessage, actor.commitProtocolError());
+            } else {
+                try actor.commitProtocolError();
+                lifecycle = .draining;
+            },
+            7 => {
+                actor.beginClose();
+                lifecycle = .closing;
+            },
+            8 => {
+                actor.beginClose();
+                lifecycle = .closing;
+                if (receive_active and !cancel_requested) {
+                    actor.cancel_requested = true;
+                    actor.cancel_active = true;
+                    cancel_requested = true;
+                    cancel_active = true;
+                }
+            },
+            9 => {
+                const kind = smith.valueRangeAtMost(u8, 0, 3);
+                const result: i32 = switch (kind) {
+                    0 => 0,
+                    1 => -@as(i32, @intFromEnum(linux.E.NOENT)),
+                    2 => -@as(i32, @intFromEnum(linux.E.ALREADY)),
+                    3 => -@as(i32, @intFromEnum(linux.E.IO)),
+                    else => unreachable,
+                };
+                if (!cancel_active) {
+                    try std.testing.expectError(
+                        error.CancelNotActive,
+                        actor.completeRouted(.cancel, cqe(.cancel, result, 0)),
+                    );
+                } else if (kind == 3) {
+                    try std.testing.expectError(
+                        error.IoFailure,
+                        actor.completeRouted(.cancel, cqe(.cancel, result, 0)),
+                    );
+                    cancel_active = false;
+                    lifecycle = .closing;
+                } else {
+                    try std.testing.expectEqual(
+                        wayring.connection.Event.cancel_complete,
+                        try actor.completeRouted(.cancel, cqe(.cancel, result, 0)),
+                    );
+                    cancel_active = false;
+                }
+            },
+            10 => {
+                const stale = (wayring.completion.Token{
+                    .slot = actor.slot,
+                    .generation = actor.generation -% 1,
+                    .operation = .receive,
+                }).encode();
+                try std.testing.expectError(error.StaleCompletion, actor.complete(.{
+                    .user_data = stale,
+                    .res = 1,
+                    .flags = linux.IORING_CQE_F_MORE,
+                }));
+            },
+            else => unreachable,
+        }
+        try std.testing.expectEqual(lifecycle, actor.lifecycle);
+        try std.testing.expectEqual(receive_active, actor.receive_active);
+        try std.testing.expectEqual(cancel_requested, actor.cancel_requested);
+        try std.testing.expectEqual(cancel_active, actor.cancel_active);
+        try std.testing.expectEqual(queued_bytes, actor.transmit.queuedBytes());
+        try std.testing.expectEqual(send_active, actor.transmit.sendActive());
+    }
+
+    actor.beginClose();
+    if (actor.receive_active) {
+        _ = try actor.completeRouted(
+            .receive,
+            cqe(.receive, -@as(i32, @intFromEnum(linux.E.CANCELED)), 0),
+        );
+    }
+    if (actor.cancel_active) {
+        _ = try actor.completeRouted(.cancel, cqe(.cancel, 0, 0));
+    }
+    if (actor.transmit.sendActive()) {
+        _ = actor.completeRouted(.send, cqe(.send, -1, 0)) catch {};
+    }
+    try std.testing.expect(actor.canDeinit());
+    actor.deinit();
+    try std.testing.expectEqual(@as(usize, 8), blocks.available());
+    try std.testing.expectEqual(@as(usize, 2), descriptors.available());
+}
+
+fn cqe(
+    operation: wayring.completion.Operation,
+    result: i32,
+    flags: u32,
+) linux.io_uring_cqe {
+    return .{
+        .user_data = (wayring.completion.Token{
+            .slot = 2,
+            .generation = 7,
+            .operation = operation,
+        }).encode(),
+        .res = result,
+        .flags = flags,
+    };
+}
