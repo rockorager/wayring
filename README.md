@@ -17,3 +17,7 @@ across the complete stable, staging, unstable, and experimental XML corpus.
 `zig build fuzz` runs each fuzz target once as a deterministic seed check.
 Use `zig build fuzz --fuzz=1M` for one million coverage-guided iterations per
 target, or omit the limit for continuous fuzzing with Zig's web interface.
+
+`zig build soak` exercises randomized multi-connection traffic, descriptor
+transfer, cancellation, and slot reuse against the real kernel io_uring path.
+Use `-Dsoak-rounds=N` and `-Dsoak-seed=N` to extend or reproduce a run.

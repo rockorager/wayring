@@ -114,6 +114,32 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Fuzz wire and connection state machines");
     fuzz_step.dependOn(&run_fuzz_tests.step);
 
+    const soak_options = b.addOptions();
+    soak_options.addOption(usize, "rounds", b.option(
+        usize,
+        "soak-rounds",
+        "Number of randomized io_uring soak rounds",
+    ) orelse 32);
+    soak_options.addOption(u64, "seed", b.option(
+        u64,
+        "soak-seed",
+        "PRNG seed for the io_uring soak test",
+    ) orelse 0x7761_7972_696e_6701);
+    const soak_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/io-uring-soak.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "soak_options", .module = soak_options.createModule() },
+            },
+        }),
+    });
+    const run_soak_tests = b.addRunArtifact(soak_tests);
+    const soak_step = b.step("soak", "Run randomized real io_uring lifecycle tests");
+    soak_step.dependOn(&run_soak_tests.step);
+
     const protocol_compat_test = b.addSystemCommand(&.{ "/bin/sh", "test/protocol-compat.sh" });
     protocol_compat_test.addArtifactArg(scanner);
     protocol_compat_test.addDirectoryArg(wayland_source.path(""));
