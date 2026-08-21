@@ -25,6 +25,10 @@ pub const StoreError = Error || std.mem.Allocator.Error || std.posix.MMapError |
     ResourceDestroyed,
     ResizePending,
     UnsafeAccess,
+    DestinationTooSmall,
+    InvalidCompletion,
+    CopyFailed,
+    ShortRead,
 };
 
 /// Compositor-supplied metadata for an advertised wl_shm format. Keeping the
@@ -406,6 +410,59 @@ pub const Store = struct {
         store.releasePoolIfUnused(pool_index);
     }
 
+    pub const Copy = struct {
+        pin: Pin,
+        destination: []u8,
+        expected_len: usize,
+        user_data: u64,
+    };
+
+    /// Queues, but does not submit, one positional read into caller-owned
+    /// memory. This is the SIGBUS-safe path for ordinary unsealed pools and can
+    /// be batched with the consumer's other SQEs on a borrowed ring.
+    pub fn prepareCopy(
+        store: *Store,
+        ring: *linux.IoUring,
+        token: BufferToken,
+        destination: []u8,
+        user_data: u64,
+    ) !Copy {
+        const pin_value = try store.pin(token);
+        errdefer store.unpin(pin_value) catch unreachable;
+        const pin_node = try store.resolvePin(pin_value.token);
+        if (destination.len < pin_node.metadata.extent)
+            return error.DestinationTooSmall;
+        const pool = try store.resolvePool(pin_node.pool);
+        _ = try ring.read(
+            user_data,
+            pool.fd,
+            .{ .buffer = destination[0..pin_node.metadata.extent] },
+            pin_node.metadata.offset,
+        );
+        return .{
+            .pin = pin_value,
+            .destination = destination,
+            .expected_len = pin_node.metadata.extent,
+            .user_data = user_data,
+        };
+    }
+
+    /// Completes a copy selected by the caller's CQE router and releases its
+    /// mapping pin. Short reads safely report concurrent backing truncation.
+    pub fn completeCopy(
+        store: *Store,
+        copy: Copy,
+        completion: linux.io_uring_cqe,
+    ) StoreError![]const u8 {
+        if (completion.user_data != copy.user_data) return error.InvalidCompletion;
+        const result = completion.res;
+        try store.unpin(copy.pin);
+        if (result < 0) return error.CopyFailed;
+        const actual: usize = @intCast(result);
+        if (actual != copy.expected_len) return error.ShortRead;
+        return copy.destination[0..actual];
+    }
+
     fn resolvePool(store: *Store, token: PoolToken) StoreError!*PoolNode {
         if (token.index >= store.pools.len) return error.StalePool;
         const node = &store.pools[token.index];
@@ -549,7 +606,13 @@ test "pins retain destroyed unsealed pools without exposing raw bytes" {
         1,
     );
     defer store.deinit(std.testing.allocator);
-    const pool = try store.addPool(try testMemfd(4096, false), 4096);
+    const fd = try testMemfd(4096, false);
+    const payload = [_]u8{ 1, 2, 3, 4 };
+    try std.testing.expectEqual(
+        @as(usize, payload.len),
+        linux.write(fd, &payload, payload.len),
+    );
+    const pool = try store.addPool(fd, 4096);
     const buffer = try store.addBuffer(
         pool,
         .{ .value = 0, .bytes_per_pixel = 4 },
@@ -560,13 +623,37 @@ test "pins retain destroyed unsealed pools without exposing raw bytes" {
     );
     const pin_value = try store.pin(buffer);
     try std.testing.expectError(error.UnsafeAccess, store.bytes(pin_value));
+    try store.unpin(pin_value);
+
+    var ring = try linux.IoUring.init(4, 0);
+    defer ring.deinit();
+    var destination: [4]u8 = undefined;
+    var undersized: [3]u8 = undefined;
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        store.prepareCopy(&ring, buffer, &undersized, 0xff),
+    );
+    try std.testing.expectEqual(@as(usize, 0), store.active_pins);
+    const copy = try store.prepareCopy(&ring, buffer, &destination, 0x100);
+    _ = try ring.submit();
+    const copied = try store.completeCopy(copy, try ring.copy_cqe());
+    try std.testing.expectEqualSlices(u8, &payload, copied);
+
+    const truncated_copy = try store.prepareCopy(&ring, buffer, &destination, 0x101);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 0)));
+    _ = try ring.submit();
+    try std.testing.expectError(
+        error.ShortRead,
+        store.completeCopy(truncated_copy, try ring.copy_cqe()),
+    );
+    const retained = try store.pin(buffer);
     try store.destroyPoolResource(pool);
     try store.destroyBuffer(buffer);
     try std.testing.expectEqual(@as(usize, 1), store.active_pools);
-    try store.unpin(pin_value);
+    try store.unpin(retained);
     try std.testing.expectEqual(@as(usize, 0), store.active_pools);
     try std.testing.expectError(error.StalePool, store.poolInfo(pool));
-    try std.testing.expectError(error.StalePin, store.unpin(pin_value));
+    try std.testing.expectError(error.StalePin, store.unpin(retained));
 }
 
 fn testMemfd(size: usize, sealed: bool) !linux.fd_t {

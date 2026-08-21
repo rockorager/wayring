@@ -536,8 +536,13 @@ resource may be destroyed first. Generation-checked tokens reject stale slot
 reuse. Growth uses `mremap` immediately when idle and is deferred while pinned,
 preventing address movement beneath an importer. Shrink-sealed files whose
 length covers the complete mapping expose a zero-copy read-only slice; unsealed
-files deliberately return `UnsafeAccess` until the fault-safe access path is
-active rather than exposing a potentially fatal raw mapping. The real SHM
+files deliberately reject raw access. Their fault-safe path pins the backing
+and queues one positional io_uring read into caller-owned memory, without
+submitting the ring. Consumers can batch that copy with unrelated SQEs and
+route it in their own user-data namespace. Completion requires the full
+validated extent; backing truncation becomes `ShortRead` instead of SIGBUS.
+This keeps a process-wide signal handler out of the compositor and reserves
+zero-copy for inputs where the kernel can guarantee safety. The real SHM
 libwayland-server interop path owns its received descriptor and resource
 lifetime through this store.
 
