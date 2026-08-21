@@ -464,12 +464,23 @@ in O(1), preserving request and commit order. Compositors peek the oldest ready
 handle, transactionally enqueue `done` plus `delete_id`, and consume it only
 after TX succeeds, so backpressure cannot lose a callback.
 
-Synchronized subsurface content-update graphs and version-7 per-commit release
-callbacks remain separate composable state because their storage and scheduling
-policy differ by compositor. The SHM interoperability server exercises all
-current state machines with real libwayland region copies, frame callbacks,
-attach, dual damage, transform, scale, offset, and commit requests, including
-destroying the source region after it is copied.
+Synchronized subsurface state is also a separate composable graph with generic
+application payloads. Surface relationships and queued content updates lease
+nodes from compositor-wide bounded pools, so idle clients reserve no graph
+storage. It rejects duplicate roles, self-parenting, and ancestor cycles;
+tracks inherited effective synchronization; preserves every cached commit in
+order; and atomically returns parent-latched update batches through
+caller-provided storage. Generic keys may include a client identity when the
+pool spans clients. Generation-checked tokens let the hot commit path bypass
+key lookup without making stale storage references valid. Relationship
+visibility and position are double-buffered on the parent, while role-object
+destruction is immediate.
+The graph implements the established synchronized-subtree behavior; exact
+version-7 per-content-update dependency edges, constraints, and release
+callbacks remain the next scheduler layer. The SHM interoperability server
+exercises all current surface state machines with real libwayland region
+copies, frame callbacks, attach, dual damage, transform, scale, offset, and
+commit requests, including destroying the source region after it is copied.
 
 ## Initial transport candidate
 

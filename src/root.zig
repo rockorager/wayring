@@ -28,6 +28,7 @@ pub const unix_socket = @import("unix_socket.zig");
 pub const compositor = @import("compositor.zig");
 pub const region = @import("region.zig");
 pub const frame = @import("frame.zig");
+pub const subsurface = @import("subsurface.zig");
 
 test {
     _ = wire;
@@ -50,4 +51,5 @@ test {
     _ = compositor;
     _ = region;
     _ = frame;
+    _ = subsurface;
 }
