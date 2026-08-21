@@ -40,6 +40,7 @@ bench/run.sh xdg-interop
 bench/run.sh data-device-interop
 bench/run.sh output-interop
 bench/run.sh pointer-interop
+bench/run.sh keyboard-interop
 ```
 
 Configure a run through environment variables:
@@ -171,3 +172,8 @@ Pointer interoperability mode runs both library pairings. Each advertises seat
 capabilities and name, creates a surface and pointer, and validates focus,
 fixed-point motion, button, wheel source, axis, discrete and value120 scroll
 data, stop, and frame events before ordered pointer, surface, and seat teardown.
+
+Keyboard interoperability mode runs both library pairings. Each advertises seat
+capabilities and name, creates a surface and keyboard, transfers a close-on-exec
+XKB keymap FD, and validates pressed-key arrays, focus, modifiers, key state,
+repeat metadata, and leave before ordered keyboard, surface, and seat teardown.

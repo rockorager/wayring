@@ -92,6 +92,8 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/output-interop-server.c" \
     "$root/bench/pointer-interop-client.c" \
     "$root/bench/pointer-interop-server.c" \
+    "$root/bench/keyboard-interop-client.c" \
+    "$root/bench/keyboard-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     "$generated/presentation-time-protocol.c" \

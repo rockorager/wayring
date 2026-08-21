@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -45,6 +45,8 @@ const Options = struct {
         output_libwayland_server,
         pointer_libwayland_client,
         pointer_libwayland_server,
+        keyboard_libwayland_client,
+        keyboard_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -66,6 +68,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .output_libwayland_server => wayringOutputClient(),
         .pointer_libwayland_client => wayringProtocolServer(.pointer),
         .pointer_libwayland_server => wayringPointerClient(),
+        .keyboard_libwayland_client => wayringProtocolServer(.keyboard),
+        .keyboard_libwayland_server => wayringKeyboardClient(),
     };
 }
 
@@ -357,6 +361,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .data_device => ffi.data_device_client_fd(connected_fd),
             .output => ffi.output_client_fd(connected_fd),
             .pointer => ffi.pointer_client_fd(connected_fd),
+            .keyboard => ffi.keyboard_client_fd(connected_fd),
         });
     }
 
@@ -404,6 +409,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         },
         .output => _ = try runtime.globals.add(&standard_protocol.wl_output.info, 4, null),
         .pointer => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
+        },
+        .keyboard => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
         },
@@ -513,6 +522,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.pointer_sent or !handler.pointer_released or !handler.surface_destroyed or
             !handler.seat_released)
             return error.IncompleteInterop,
+        .keyboard => if (!handler.seat_advertised or !handler.keyboard_created or
+            !handler.keyboard_sent or !handler.keyboard_released or !handler.surface_destroyed or
+            !handler.seat_released)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -584,6 +597,9 @@ const ProtocolServerHandler = struct {
     pointer_created: bool = false,
     pointer_sent: bool = false,
     pointer_released: bool = false,
+    keyboard_created: bool = false,
+    keyboard_sent: bool = false,
+    keyboard_released: bool = false,
     surface: ?wayring.objects.Handle = null,
     surface_destroyed: bool = false,
 
@@ -725,15 +741,19 @@ const ProtocolServerHandler = struct {
                 );
                 handler.output_sent = true;
             } else if (resource_interface == &standard_protocol.wl_seat.info and
-                handler.kind == .pointer)
+                (handler.kind == .pointer or handler.kind == .keyboard))
             {
+                const capability = if (handler.kind == .pointer)
+                    standard_protocol.wl_seat.capability.pointer
+                else
+                    standard_protocol.wl_seat.capability.keyboard;
                 try wayring.server.sendEvent(
                     standard_protocol,
                     standard_protocol.wl_seat,
                     handler.objects,
                     handler.queue,
                     resource,
-                    .{ .capabilities = .{ .capabilities = .pointer } },
+                    .{ .capabilities = .{ .capabilities = capability } },
                 );
                 try wayring.server.sendEvent(
                     standard_protocol,
@@ -989,8 +1009,106 @@ const ProtocolServerHandler = struct {
                     );
                     handler.pointer_sent = true;
                 },
+                .get_keyboard => |value| {
+                    const surface = handler.surface orelse return error.MissingSurface;
+                    const keyboard = (try standard_protocol.wl_seat.admit_get_keyboard(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    handler.keyboard_created = true;
+                    const keymap = "xkb_keymap {}\x00";
+                    const descriptor_result = linux.memfd_create(
+                        "wayring-keymap",
+                        linux.MFD.CLOEXEC,
+                    );
+                    if (linux.errno(descriptor_result) != .SUCCESS)
+                        return error.SystemCallFailed;
+                    const descriptor: linux.fd_t = @intCast(descriptor_result);
+                    writeExactInterop(descriptor, keymap) catch |err| {
+                        _ = linux.close(descriptor);
+                        return err;
+                    };
+                    const seek_result = linux.lseek(descriptor, 0, 0);
+                    if (linux.errno(seek_result) != .SUCCESS) {
+                        _ = linux.close(descriptor);
+                        return error.SystemCallFailed;
+                    }
+                    wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .repeat_info = .{ .rate = 25, .delay = 600 } },
+                    ) catch |err| {
+                        _ = linux.close(descriptor);
+                        return err;
+                    };
+                    wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .keymap = .{
+                            .format = .xkb_v1,
+                            .fd = descriptor,
+                            .size = keymap.len,
+                        } },
+                    ) catch |err| {
+                        _ = linux.close(descriptor);
+                        return err;
+                    };
+                    const keys = [_]u8{ 30, 0, 0, 0, 31, 0, 0, 0 };
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .enter = .{ .serial = 41, .surface = surface.id, .keys = &keys } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .modifiers = .{
+                            .serial = 42,
+                            .mods_depressed = 1,
+                            .mods_latched = 2,
+                            .mods_locked = 4,
+                            .group = 3,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .key = .{
+                            .serial = 43,
+                            .time = 100,
+                            .key = 30,
+                            .state = .pressed,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_keyboard,
+                        handler.objects,
+                        handler.queue,
+                        keyboard,
+                        .{ .leave = .{ .serial = 44, .surface = surface.id } },
+                    );
+                    handler.keyboard_sent = true;
+                },
                 .release => handler.seat_released = true,
-                .get_keyboard, .get_touch => return error.UnexpectedRequest,
+                .get_touch => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_pointer.info) {
@@ -1003,6 +1121,17 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .release => handler.pointer_released = true,
                 .set_cursor => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_keyboard.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_keyboard,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .release => handler.keyboard_released = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_output.info) {
@@ -1178,7 +1307,8 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).id;
-                    if (handler.kind == .pointer) handler.surface = surface;
+                    if (handler.kind == .pointer or handler.kind == .keyboard)
+                        handler.surface = surface;
                 },
                 .create_region => return error.UnexpectedRequest,
             }
@@ -1266,7 +1396,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
-                    if (handler.kind == .pointer) handler.surface_destroyed = true;
+                    if (handler.kind == .pointer or handler.kind == .keyboard)
+                        handler.surface_destroyed = true;
                 },
                 .commit => {},
                 else => return error.UnexpectedRequest,
@@ -1943,6 +2074,270 @@ const PointerClientHandler = struct {
                 },
                 .frame => handler.frame = true,
                 .leave => return error.UnexpectedEvent,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
+fn wayringKeyboardClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.keyboard_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: KeyboardClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.compositor == null or handler.seat == null or
+        !handler.capabilities or !handler.name or !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const surface = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const keyboard = (try standard_protocol.wl_seat.construct_get_keyboard(
+        client_objects,
+        &actor.transmit,
+        handler.seat.?,
+        .{},
+    )).id;
+    handler.surface = surface;
+    handler.keyboard = keyboard;
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.keymap or !handler.enter or !handler.modifiers or !handler.key or
+        !handler.repeat_info or !handler.leave or !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_keyboard,
+        client_objects,
+        &actor.transmit,
+        keyboard,
+        .{ .release = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_seat,
+        client_objects,
+        &actor.transmit,
+        handler.seat.?,
+        .{ .release = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const KeyboardClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
+    synced: bool = false,
+    deleted: bool = false,
+    capabilities: bool = false,
+    name: bool = false,
+    keymap: bool = false,
+    enter: bool = false,
+    modifiers: bool = false,
+    key: bool = false,
+    repeat_info: bool = false,
+    leave: bool = false,
+
+    pub fn event(
+        handler: *KeyboardClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, standard_protocol.wl_compositor.info.name)) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
+                    } else if (std.mem.eql(u8, global.interface, standard_protocol.wl_seat.info.name)) {
+                        handler.seat = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_seat.info,
+                            @min(global.version, 8),
+                            null,
+                        );
+                    }
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.wl_seat.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_seat,
+                handler.objects,
+                handler.seat orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .capabilities => |value| {
+                    if (value.capabilities.value != standard_protocol.wl_seat.capability.keyboard.value)
+                        return error.InvalidCapabilities;
+                    handler.capabilities = true;
+                },
+                .name => |value| {
+                    if (!std.mem.eql(u8, value.name, "wayring-seat")) return error.InvalidSeat;
+                    handler.name = true;
+                },
+            }
+        } else if (interface == &standard_protocol.wl_keyboard.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_keyboard,
+                handler.objects,
+                handler.keyboard orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .keymap => |value| {
+                    defer _ = linux.close(value.fd);
+                    const expected = "xkb_keymap {}\x00";
+                    var keymap: [expected.len]u8 = undefined;
+                    const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
+                    if (value.format.value != standard_protocol.wl_keyboard.keymap_format.xkb_v1.value or
+                        value.size != expected.len or linux.errno(flags) != .SUCCESS or
+                        flags & linux.FD_CLOEXEC == 0)
+                        return error.InvalidKeymap;
+                    try readExactInterop(value.fd, &keymap);
+                    if (!std.mem.eql(u8, &keymap, expected)) return error.InvalidKeymap;
+                    handler.keymap = true;
+                },
+                .enter => |value| {
+                    const expected = [_]u8{ 30, 0, 0, 0, 31, 0, 0, 0 };
+                    if (!handler.keymap or value.serial != 41 or
+                        value.surface != handler.surface.?.id or
+                        !std.mem.eql(u8, value.keys, &expected))
+                        return error.InvalidKeyboard;
+                    handler.enter = true;
+                },
+                .modifiers => |value| {
+                    if (!handler.enter or value.serial != 42 or value.mods_depressed != 1 or
+                        value.mods_latched != 2 or value.mods_locked != 4 or value.group != 3)
+                        return error.InvalidKeyboard;
+                    handler.modifiers = true;
+                },
+                .key => |value| {
+                    if (!handler.repeat_info or !handler.modifiers or value.serial != 43 or
+                        value.time != 100 or value.key != 30 or value.state.value !=
+                        standard_protocol.wl_keyboard.key_state.pressed.value)
+                        return error.InvalidKeyboard;
+                    handler.key = true;
+                },
+                .repeat_info => |value| {
+                    if (value.rate != 25 or value.delay != 600) return error.InvalidKeyboard;
+                    handler.repeat_info = true;
+                },
+                .leave => |value| {
+                    if (!handler.key or value.serial != 44 or value.surface != handler.surface.?.id)
+                        return error.InvalidKeyboard;
+                    handler.leave = true;
+                },
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
@@ -3411,6 +3806,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .pointer_libwayland_client;
         } else if (std.mem.eql(u8, value, "pointer-libwayland-server")) {
             options.mode = .pointer_libwayland_server;
+        } else if (std.mem.eql(u8, value, "keyboard-libwayland-client")) {
+            options.mode = .keyboard_libwayland_client;
+        } else if (std.mem.eql(u8, value, "keyboard-libwayland-server")) {
+            options.mode = .keyboard_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or
