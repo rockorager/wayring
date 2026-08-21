@@ -3467,7 +3467,7 @@ fn wayringDataDeviceClient() !u8 {
     };
     try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (handler.seat == null or handler.manager == null or
+    while (handler.seat == null or handler.manager == null or handler.compositor == null or
         !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
@@ -3483,6 +3483,18 @@ fn wayringDataDeviceClient() !u8 {
         handler.manager.?,
         .{ .seat = handler.seat.?.id },
     )).id;
+    const origin = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const icon = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
     handler.source = source;
     handler.device = device;
     try wayring.client.sendRequest(
@@ -3493,18 +3505,39 @@ fn wayringDataDeviceClient() !u8 {
         .{ .offer = .{ .mime_type = "text/plain" } },
     );
     try wayring.client.sendRequest(
+        standard_protocol.wl_data_source,
+        client_objects,
+        &actor.transmit,
+        source,
+        .{ .set_actions = .{ .dnd_actions = .fromInt(3) } },
+    );
+    try wayring.client.sendRequest(
         standard_protocol.wl_data_device,
         client_objects,
         &actor.transmit,
         device,
         .{ .set_selection = .{ .source = source.id, .serial = 77 } },
     );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_data_device,
+        client_objects,
+        &actor.transmit,
+        device,
+        .{ .start_drag = .{
+            .source = source.id,
+            .origin = origin.id,
+            .icon = icon.id,
+            .serial = 88,
+        } },
+    );
     handler.synced = false;
     handler.deleted = false;
     handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (!handler.source_sent or handler.offer == null or !handler.offer_mime or
+    while (!handler.source_sent or !handler.source_target or !handler.source_action or
+        !handler.source_drop_performed or !handler.source_finished or
+        handler.offer == null or !handler.offer_mime or
         !handler.selection_received or !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
@@ -3538,6 +3571,20 @@ fn wayringDataDeviceClient() !u8 {
     if (!std.mem.eql(u8, &offer_bytes, "libwayland-offer\x00"))
         return error.InvalidSelection;
 
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        icon,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        origin,
+        .{ .destroy = .{} },
+    );
     try wayring.client.sendRequest(
         standard_protocol.wl_data_offer,
         client_objects,
@@ -3588,12 +3635,17 @@ const DataDeviceClientHandler = struct {
     callback: wayring.objects.Handle,
     seat: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
+    compositor: ?wayring.objects.Handle = null,
     source: ?wayring.objects.Handle = null,
     device: ?wayring.objects.Handle = null,
     offer: ?wayring.objects.Handle = null,
     synced: bool = false,
     deleted: bool = false,
     source_sent: bool = false,
+    source_target: bool = false,
+    source_action: bool = false,
+    source_drop_performed: bool = false,
+    source_finished: bool = false,
     offer_mime: bool = false,
     selection_received: bool = false,
 
@@ -3643,6 +3695,20 @@ const DataDeviceClientHandler = struct {
                             @min(global.version, 3),
                             null,
                         );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wl_compositor.info.name,
+                    )) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
                     }
                 },
                 .global_remove => {},
@@ -3673,7 +3739,21 @@ const DataDeviceClientHandler = struct {
                     try writeExactInterop(value.fd, "wayring-selection\x00");
                     handler.source_sent = true;
                 },
-                else => return error.UnexpectedEvent,
+                .target => |value| {
+                    if (value.mime_type == null or
+                        !std.mem.eql(u8, value.mime_type.?, "text/plain"))
+                        return error.InvalidDrag;
+                    handler.source_target = true;
+                },
+                .action => |value| {
+                    if (value.dnd_action.value !=
+                        standard_protocol.wl_data_device_manager.dnd_action.move.value)
+                        return error.InvalidDrag;
+                    handler.source_action = true;
+                },
+                .dnd_drop_performed => handler.source_drop_performed = true,
+                .dnd_finished => handler.source_finished = true,
+                .cancelled => return error.UnexpectedEvent,
             }
         } else if (interface == &standard_protocol.wl_data_device.info) {
             const device = handler.device orelse return error.UnexpectedEvent;

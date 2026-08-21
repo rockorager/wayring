@@ -13,6 +13,9 @@ static const char offer_data[] = "libwayland-offer";
 struct data_device_server_state {
 	struct wl_display *display;
 	struct wl_listener client_destroy;
+	struct wl_resource *source;
+	struct wl_resource *origin;
+	struct wl_resource *icon;
 	int source_read_fd;
 	int source_created;
 	int device_created;
@@ -24,6 +27,10 @@ struct data_device_server_state {
 	int source_destroyed;
 	int device_released;
 	int seat_released;
+	int source_actions;
+	int drag_started;
+	int drag_events;
+	int surfaces_destroyed;
 };
 
 static void
@@ -122,9 +129,12 @@ static void
 source_set_actions(struct wl_client *client, struct wl_resource *resource,
                    uint32_t actions)
 {
-	(void) resource;
-	(void) actions;
-	wl_client_post_implementation_error(client, "unexpected data source actions");
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	if (actions != (WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+	                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE))
+		wl_client_post_implementation_error(client, "invalid data source actions");
+	else
+		state->source_actions = 1;
 }
 
 static const struct wl_data_source_interface source_implementation = {
@@ -138,12 +148,18 @@ device_start_drag(struct wl_client *client, struct wl_resource *resource,
                   struct wl_resource *source, struct wl_resource *origin,
                   struct wl_resource *icon, uint32_t serial)
 {
-	(void) resource;
-	(void) source;
-	(void) origin;
-	(void) icon;
-	(void) serial;
-	wl_client_post_implementation_error(client, "unexpected start drag");
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	if (!state->source_actions || source != state->source || origin != state->origin ||
+	    icon != state->icon || serial != 88) {
+		wl_client_post_implementation_error(client, "invalid start drag");
+		return;
+	}
+	wl_data_source_send_target(source, "text/plain");
+	wl_data_source_send_action(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+	wl_data_source_send_dnd_drop_performed(source);
+	wl_data_source_send_dnd_finished(source);
+	state->drag_started = 1;
+	state->drag_events = 1;
 }
 
 static void
@@ -194,6 +210,7 @@ manager_create_source(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 	wl_resource_set_implementation(source, &source_implementation, state, NULL);
+	state->source = source;
 	state->source_created = 1;
 }
 
@@ -301,6 +318,63 @@ bind_seat(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 }
 
 static void
+surface_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	(void) client;
+	state->surfaces_destroyed++;
+	wl_resource_destroy(resource);
+}
+
+static const struct wl_surface_interface surface_implementation = {
+	.destroy = surface_destroy,
+};
+
+static void
+compositor_create_surface(struct wl_client *client, struct wl_resource *resource,
+                          uint32_t id)
+{
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	struct wl_resource *surface = wl_resource_create(
+		client, &wl_surface_interface, wl_resource_get_version(resource), id);
+	if (surface == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(surface, &surface_implementation, state, NULL);
+	if (state->origin == NULL)
+		state->origin = surface;
+	else
+		state->icon = surface;
+}
+
+static void
+compositor_create_region(struct wl_client *client, struct wl_resource *resource,
+                         uint32_t id)
+{
+	(void) resource;
+	(void) id;
+	wl_client_post_implementation_error(client, "unexpected region");
+}
+
+static const struct wl_compositor_interface compositor_implementation = {
+	.create_surface = compositor_create_surface,
+	.create_region = compositor_create_region,
+};
+
+static void
+bind_compositor(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(
+		client, &wl_compositor_interface, version < 4 ? (int) version : 4, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &compositor_implementation, data, NULL);
+}
+
+static void
 handle_client_destroy(struct wl_listener *listener, void *data)
 {
 	struct data_device_server_state *state =
@@ -322,7 +396,9 @@ data_device_server_fd(int fd)
 	if (wl_global_create(state.display, &wl_seat_interface, 7,
 	                     &state, bind_seat) == NULL ||
 	    wl_global_create(state.display, &wl_data_device_manager_interface, 3,
-	                     &state, bind_manager) == NULL) {
+	                     &state, bind_manager) == NULL ||
+	    wl_global_create(state.display, &wl_compositor_interface, 4,
+	                     &state, bind_compositor) == NULL) {
 		wl_display_destroy(state.display);
 		return EXIT_FAILURE;
 	}
@@ -340,5 +416,7 @@ data_device_server_fd(int fd)
 	return state.source_created && state.device_created && state.source_offered &&
 	       state.selection_set && state.source_sent && state.offer_received &&
 	       state.offer_destroyed && state.source_destroyed &&
-	       state.device_released && state.seat_released ? EXIT_SUCCESS : EXIT_FAILURE;
+	       state.device_released && state.seat_released && state.source_actions &&
+	       state.drag_started && state.drag_events && state.surfaces_destroyed == 2 ?
+	       EXIT_SUCCESS : EXIT_FAILURE;
 }
