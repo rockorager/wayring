@@ -419,6 +419,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .data_device => {
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 7, null);
             _ = try runtime.globals.add(&standard_protocol.wl_data_device_manager.info, 3, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
         },
         .output => _ = try runtime.globals.add(&standard_protocol.wl_output.info, 4, null),
         .pointer => {
@@ -542,6 +543,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             return error.IncompleteInterop,
         .data_device => if (!handler.data_source_created or !handler.data_device_created or
             !handler.mime_offered or !handler.selection_set or !handler.selection_sent or
+            !handler.source_actions_set or !handler.drag_started or !handler.drag_events_sent or
             !handler.data_source_destroyed or !handler.data_device_released or
             !handler.seat_released)
             return error.IncompleteInterop,
@@ -643,6 +645,12 @@ const ProtocolServerHandler = struct {
     mime_offered: bool = false,
     selection_set: bool = false,
     selection_sent: bool = false,
+    source_actions_set: bool = false,
+    drag_started: bool = false,
+    drag_events_sent: bool = false,
+    drag_origin: ?wayring.objects.Handle = null,
+    drag_icon: ?wayring.objects.Handle = null,
+    drag_surface_count: usize = 0,
     data_source_destroyed: bool = false,
     data_device_released: bool = false,
     seat_released: bool = false,
@@ -938,7 +946,10 @@ const ProtocolServerHandler = struct {
                         return error.InvalidSelection;
                     handler.data_source_destroyed = true;
                 },
-                .set_actions => return error.UnexpectedRequest,
+                .set_actions => |value| {
+                    if (value.dnd_actions.value != 3) return error.InvalidDragActions;
+                    handler.source_actions_set = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_data_device.info) {
@@ -974,7 +985,48 @@ const ProtocolServerHandler = struct {
                     handler.selection_sent = true;
                 },
                 .release => handler.data_device_released = true,
-                .start_drag => return error.UnexpectedRequest,
+                .start_drag => |value| {
+                    if (!handler.source_actions_set or value.serial != 88 or
+                        value.source == null or value.origin != handler.drag_origin.?.id or
+                        value.icon == null or value.icon.? != handler.drag_icon.?.id)
+                        return error.InvalidDrag;
+                    const source = handler.objects.namespace.lookupHandle(value.source.?) orelse
+                        return error.UnknownObject;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_source,
+                        handler.objects,
+                        handler.queue,
+                        source,
+                        .{ .target = .{ .mime_type = "text/plain" } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_source,
+                        handler.objects,
+                        handler.queue,
+                        source,
+                        .{ .action = .{ .dnd_action = .move } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_source,
+                        handler.objects,
+                        handler.queue,
+                        source,
+                        .{ .dnd_drop_performed = .{} },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_source,
+                        handler.objects,
+                        handler.queue,
+                        source,
+                        .{ .dnd_finished = .{} },
+                    );
+                    handler.drag_started = true;
+                    handler.drag_events_sent = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_seat.info) {
@@ -1488,6 +1540,15 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).id;
+                    if (handler.kind == .data_device) {
+                        if (handler.drag_surface_count == 0)
+                            handler.drag_origin = surface
+                        else if (handler.drag_surface_count == 1)
+                            handler.drag_icon = surface
+                        else
+                            return error.UnexpectedRequest;
+                        handler.drag_surface_count += 1;
+                    }
                     if (handler.kind == .subsurface) {
                         if (handler.subsurface_surfaces_created == 0)
                             handler.subsurface_parent = surface

@@ -13,15 +13,21 @@ static const char selection_data[] = "libwayland-selection";
 struct data_device_client_state {
 	struct wl_seat *seat;
 	struct wl_data_device_manager *manager;
+	struct wl_compositor *compositor;
 	int sent;
+	int target;
+	int drop_performed;
+	int finished;
+	int action;
 };
 
 static void
 source_target(void *data, struct wl_data_source *source, const char *mime_type)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) source;
-	(void) mime_type;
+	if (mime_type != NULL && strcmp(mime_type, "text/plain") == 0)
+		state->target = 1;
 }
 
 static void
@@ -53,23 +59,26 @@ source_cancelled(void *data, struct wl_data_source *source)
 static void
 source_dnd_drop_performed(void *data, struct wl_data_source *source)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) source;
+	state->drop_performed = 1;
 }
 
 static void
 source_dnd_finished(void *data, struct wl_data_source *source)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) source;
+	state->finished = 1;
 }
 
 static void
 source_action(void *data, struct wl_data_source *source, uint32_t action)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) source;
-	(void) action;
+	if (action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+		state->action = 1;
 }
 
 static const struct wl_data_source_listener source_listener = {
@@ -160,6 +169,10 @@ registry_global(void *data, struct wl_registry *registry, uint32_t name,
 		state->manager = wl_registry_bind(
 			registry, name, &wl_data_device_manager_interface,
 			version < 3 ? version : 3);
+	} else if (strcmp(interface, wl_compositor_interface.name) == 0) {
+		state->compositor = wl_registry_bind(
+			registry, name, &wl_compositor_interface,
+			version < 4 ? version : 4);
 	}
 }
 
@@ -184,6 +197,8 @@ data_device_client_fd(int fd)
 	struct wl_registry *registry;
 	struct wl_data_source *source = NULL;
 	struct wl_data_device *device = NULL;
+	struct wl_surface *origin = NULL;
+	struct wl_surface *icon = NULL;
 	int status = EXIT_FAILURE;
 
 	if (display == NULL)
@@ -191,7 +206,7 @@ data_device_client_fd(int fd)
 	registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &registry_listener, &state);
 	if (wl_display_roundtrip(display) < 0 || state.seat == NULL ||
-	    state.manager == NULL)
+	    state.manager == NULL || state.compositor == NULL)
 		goto cleanup;
 
 	source = wl_data_device_manager_create_data_source(state.manager);
@@ -200,9 +215,18 @@ data_device_client_fd(int fd)
 		goto cleanup;
 	wl_data_source_add_listener(source, &source_listener, &state);
 	wl_data_device_add_listener(device, &device_listener, &state);
+	origin = wl_compositor_create_surface(state.compositor);
+	icon = wl_compositor_create_surface(state.compositor);
+	if (origin == NULL || icon == NULL)
+		goto cleanup;
 	wl_data_source_offer(source, "text/plain");
+	wl_data_source_set_actions(source,
+		WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+		WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
 	wl_data_device_set_selection(device, source, 77);
-	if (wl_display_roundtrip(display) < 0 || !state.sent)
+	wl_data_device_start_drag(device, source, origin, icon, 88);
+	if (wl_display_roundtrip(display) < 0 || !state.sent || !state.target ||
+	    !state.drop_performed || !state.finished || !state.action)
 		goto cleanup;
 	status = EXIT_SUCCESS;
 
@@ -211,10 +235,16 @@ cleanup:
 		wl_data_source_destroy(source);
 	if (device != NULL)
 		wl_data_device_release(device);
+	if (icon != NULL)
+		wl_surface_destroy(icon);
+	if (origin != NULL)
+		wl_surface_destroy(origin);
 	if (state.manager != NULL)
 		wl_data_device_manager_destroy(state.manager);
 	if (state.seat != NULL)
 		wl_seat_release(state.seat);
+	if (state.compositor != NULL)
+		wl_compositor_destroy(state.compositor);
 	wl_registry_destroy(registry);
 	wl_display_flush(display);
 	wl_display_disconnect(display);
