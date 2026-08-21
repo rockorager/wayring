@@ -409,7 +409,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         },
         .shm => {
             _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null);
-            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 5, null);
         },
         .dmabuf => _ = try runtime.globals.add(
             &standard_protocol.zwp_linux_dmabuf_v1.info,
@@ -528,6 +528,8 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.region_created or !handler.region_added or
             !handler.region_subtracted or !handler.opaque_region_set or
             !handler.input_region_set or !handler.region_destroyed or
+            !handler.buffer_transformed or !handler.buffer_scaled or
+            !handler.surface_offset or
             !handler.surface_destroyed or !handler.buffer_destroyed or
             !handler.pool_destroyed)
             return error.IncompleteInterop,
@@ -619,6 +621,9 @@ const ProtocolServerHandler = struct {
     region_destroyed: bool = false,
     opaque_region_set: bool = false,
     input_region_set: bool = false,
+    buffer_transformed: bool = false,
+    buffer_scaled: bool = false,
+    surface_offset: bool = false,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1601,7 +1606,7 @@ const ProtocolServerHandler = struct {
                 },
                 .attach => |value| {
                     if (handler.kind != .shm or value.buffer == null or
-                        value.buffer.? != handler.buffer.?.id or value.x != 2 or value.y != -3)
+                        value.buffer.? != handler.buffer.?.id or value.x != 0 or value.y != 0)
                         return error.InvalidSurface;
                 },
                 .damage => |value| {
@@ -1635,6 +1640,22 @@ const ProtocolServerHandler = struct {
                         return error.InvalidSurface;
                     handler.input_region_set = true;
                 },
+                .set_buffer_transform => |value| {
+                    if (handler.kind != .shm or value.transform.value !=
+                        standard_protocol.wl_output.transform.@"90".value)
+                        return error.InvalidSurface;
+                    handler.buffer_transformed = true;
+                },
+                .set_buffer_scale => |value| {
+                    if (handler.kind != .shm or value.scale != 2)
+                        return error.InvalidSurface;
+                    handler.buffer_scaled = true;
+                },
+                .offset => |value| {
+                    if (handler.kind != .shm or value.x != 2 or value.y != -3)
+                        return error.InvalidSurface;
+                    handler.surface_offset = true;
+                },
                 .commit => {
                     if (handler.kind == .shm) {
                         try wayring.server.sendEvent(
@@ -1656,7 +1677,6 @@ const ProtocolServerHandler = struct {
                         handler.surface_committed = true;
                     }
                 },
-                else => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_subcompositor.info) {
@@ -3756,7 +3776,7 @@ fn wayringShmClient() !u8 {
         client_objects,
         &actor.transmit,
         surface,
-        .{ .attach = .{ .buffer = buffer.id, .x = 2, .y = -3 } },
+        .{ .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 } },
     );
     try wayring.client.sendRequest(
         standard_protocol.wl_surface,
@@ -3778,6 +3798,27 @@ fn wayringShmClient() !u8 {
         &actor.transmit,
         surface,
         .{ .set_input_region = .{ .region = region.id } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .set_buffer_transform = .{ .transform = .@"90" } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .set_buffer_scale = .{ .scale = 2 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .offset = .{ .x = 2, .y = -3 } },
     );
     handler.frame = (try standard_protocol.wl_surface.construct_frame(
         client_objects,
@@ -3910,7 +3951,7 @@ const ShmClientHandler = struct {
                             handler.registry,
                             global.name,
                             &standard_protocol.wl_compositor.info,
-                            @min(global.version, 4),
+                            @min(global.version, 5),
                             null,
                         );
                     }

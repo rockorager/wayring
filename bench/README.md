@@ -146,10 +146,10 @@ Shm interoperability mode runs both a libwayland client against a Wayring
 server and a Wayring client against a libwayland server. Each pairing performs
 `wl_shm` format advertisement, close-on-exec shared-memory descriptor transfer,
 pool and buffer construction, surface attachment, surface- and buffer-coordinate
-damage, opaque and input region geometry, frame completion, commit, buffer
-release, synchronization, and ordered destruction. This exercises production
-FD ownership, asynchronous presentation, and nested core object lifecycles in
-both directions.
+damage, opaque and input region geometry, buffer transform and scale, surface
+offset, frame completion, commit, buffer release, synchronization, and ordered
+destruction. This exercises production FD ownership, asynchronous presentation,
+and nested core object lifecycles in both directions.
 
 Linux-dmabuf interoperability mode runs both a libwayland client against a
 Wayring server and a Wayring client against a libwayland server. Each pairing

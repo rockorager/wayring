@@ -69,7 +69,7 @@ handle_shm_global(void *data, struct wl_registry *registry, uint32_t name,
 	} else if (strcmp(interface, wl_compositor_interface.name) == 0) {
 		state->compositor = wl_registry_bind(
 			registry, name, &wl_compositor_interface,
-			version < 4 ? version : 4);
+			version < 5 ? version : 5);
 	}
 }
 
@@ -128,10 +128,13 @@ shm_client_fd(int fd)
 		goto cleanup;
 	wl_region_add(region, 1, 2, 3, 4);
 	wl_region_subtract(region, 5, 6, 7, 8);
-	wl_surface_attach(surface, buffer, 2, -3);
+	wl_surface_attach(surface, buffer, 0, 0);
 	wl_surface_damage(surface, 1, 2, 3, 4);
 	wl_surface_set_opaque_region(surface, region);
 	wl_surface_set_input_region(surface, region);
+	wl_surface_set_buffer_transform(surface, WL_OUTPUT_TRANSFORM_90);
+	wl_surface_set_buffer_scale(surface, 2);
+	wl_surface_offset(surface, 2, -3);
 	frame = wl_surface_frame(surface);
 	if (frame == NULL)
 		goto cleanup;

@@ -27,6 +27,9 @@ struct shm_server_state {
 	int region_destroyed;
 	int opaque_region_set;
 	int input_region_set;
+	int transformed;
+	int scaled;
+	int offset;
 };
 
 static void
@@ -148,7 +151,7 @@ surface_attach(struct wl_client *client, struct wl_resource *resource,
 {
 	struct shm_server_state *state = wl_resource_get_user_data(resource);
 
-	if (buffer != state->buffer || x != 2 || y != -3) {
+	if (buffer != state->buffer || x != 0 || y != 0) {
 		wl_client_post_implementation_error(client, "invalid surface attach");
 		return;
 	}
@@ -234,6 +237,39 @@ surface_damage_buffer(struct wl_client *client, struct wl_resource *resource,
 	state->damaged_buffer = 1;
 }
 
+static void
+surface_set_buffer_transform(struct wl_client *client, struct wl_resource *resource,
+                             int32_t transform)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+	if (transform != WL_OUTPUT_TRANSFORM_90)
+		wl_client_post_implementation_error(client, "invalid buffer transform");
+	else
+		state->transformed = 1;
+}
+
+static void
+surface_set_buffer_scale(struct wl_client *client, struct wl_resource *resource,
+                         int32_t scale)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+	if (scale != 2)
+		wl_client_post_implementation_error(client, "invalid buffer scale");
+	else
+		state->scaled = 1;
+}
+
+static void
+surface_offset(struct wl_client *client, struct wl_resource *resource,
+               int32_t x, int32_t y)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+	if (x != 2 || y != -3)
+		wl_client_post_implementation_error(client, "invalid surface offset");
+	else
+		state->offset = 1;
+}
+
 static const struct wl_surface_interface surface_implementation = {
 	.destroy = surface_destroy,
 	.attach = surface_attach,
@@ -242,7 +278,10 @@ static const struct wl_surface_interface surface_implementation = {
 	.set_opaque_region = surface_set_opaque_region,
 	.set_input_region = surface_set_input_region,
 	.commit = surface_commit,
+	.set_buffer_transform = surface_set_buffer_transform,
+	.set_buffer_scale = surface_set_buffer_scale,
 	.damage_buffer = surface_damage_buffer,
+	.offset = surface_offset,
 };
 
 static void
@@ -328,7 +367,7 @@ static void
 bind_compositor(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 {
 	struct wl_resource *resource = wl_resource_create(
-		client, &wl_compositor_interface, version < 4 ? (int) version : 4, id);
+		client, &wl_compositor_interface, version < 5 ? (int) version : 5, id);
 
 	if (resource == NULL) {
 		wl_client_post_no_memory(client);
@@ -358,7 +397,7 @@ shm_server_fd(int fd)
 		return EXIT_FAILURE;
 	if (wl_global_create(state.display, &wl_shm_interface, 1,
 	                     &state, bind_shm) == NULL ||
-	    wl_global_create(state.display, &wl_compositor_interface, 4,
+	    wl_global_create(state.display, &wl_compositor_interface, 5,
 	                     &state, bind_compositor) == NULL) {
 		wl_display_destroy(state.display);
 		return EXIT_FAILURE;
@@ -376,5 +415,6 @@ shm_server_fd(int fd)
 	       state.pool_destroyed && state.surface_created && state.surface_destroyed &&
 	       state.committed && state.region_added && state.region_subtracted &&
 	       state.region_destroyed && state.opaque_region_set && state.input_region_set ?
-	       EXIT_SUCCESS : EXIT_FAILURE;
+	       (state.transformed && state.scaled && state.offset ? EXIT_SUCCESS : EXIT_FAILURE) :
+	       EXIT_FAILURE;
 }
