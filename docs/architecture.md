@@ -129,6 +129,8 @@ time.
 - Object IDs are validated before generated handlers execute.
 - Client-created IDs are not reused before `wl_display.delete_id`.
 - Every queued or in-flight file descriptor is closed exactly once.
+- Failed SQE preparation leaves both the submission queue and operation state
+  unchanged, including queued byte and descriptor ownership.
 - CQE identities include a connection generation; stale completions never
   dereference recycled connection storage.
 - Per-connection byte, descriptor, and object budgets bound resource use.

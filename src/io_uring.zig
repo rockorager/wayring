@@ -296,7 +296,9 @@ pub const Reactor = struct {
     /// enter. Returns false when no operation needs cancellation.
     pub inline fn prepareClose(owner: *Reactor, peer: Peer) !bool {
         const actor = try owner.getActor(peer);
+        const previous_lifecycle = actor.lifecycle;
         actor.beginClose();
+        errdefer actor.lifecycle = previous_lifecycle;
         if (!actor.receive_active and !actor.transmit.sendActive()) return false;
         if (actor.cancel_requested) return error.CancelAlreadyActive;
 
@@ -482,6 +484,130 @@ test "borrowed reactor unregisters resources without closing caller ring" {
     const cqe = try ring.copy_cqe();
     try std.testing.expectEqual(@as(u64, user_data), cqe.user_data);
     try std.testing.expectEqual(@as(i32, 0), cqe.res);
+}
+
+test "SQE preparation failures preserve ring and operation state" {
+    const allocator = std.testing.allocator;
+    var owner: Reactor = undefined;
+    try owner.initOwned(allocator, .{ .entries = 8 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 2,
+        .descriptor_count = 1,
+        .send_descriptor_capacity = 1,
+    });
+    defer owner.deinit(allocator);
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    defer _ = linux.close(sockets[1]);
+    const peer = try owner.attach(sockets[0], .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 128,
+        .transmit_fd_budget = 1,
+    });
+    const actor = try owner.getActor(peer);
+    const receiver = try owner.getReceiver(peer);
+    const descriptor_result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(descriptor_result));
+    const descriptor: linux.fd_t = @intCast(descriptor_result);
+    try actor.enqueue("queued", &.{descriptor});
+
+    const empty_ready = owner.ring.sq_ready();
+    _ = try actor.armReceive();
+    try std.testing.expectError(error.ReceiveAlreadyActive, owner.prepareReceive(peer));
+    try std.testing.expectEqual(empty_ready, owner.ring.sq_ready());
+    try std.testing.expect(actor.receive_active);
+    actor.receive_active = false;
+
+    try actor.beginProtocolError();
+    try std.testing.expectError(error.ProtocolErrorPending, owner.prepareSend(peer));
+    try std.testing.expectEqual(empty_ready, owner.ring.sq_ready());
+    try std.testing.expect(!actor.transmit.sendActive());
+    try std.testing.expectEqual(@as(usize, "queued".len), actor.transmit.queuedBytes());
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)),
+    );
+    actor.lifecycle = .open;
+
+    while (true) {
+        _ = owner.ring.nop(0xfeed) catch |err| {
+            if (err != error.SubmissionQueueFull) return err;
+            break;
+        };
+    }
+    const full_ready = owner.ring.sq_ready();
+    try std.testing.expect(full_ready > 0);
+
+    try std.testing.expectError(error.SubmissionQueueFull, owner.prepareReceive(peer));
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expect(!actor.receive_active);
+
+    try std.testing.expectError(error.SubmissionQueueFull, owner.prepareSend(peer));
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expect(!actor.transmit.sendActive());
+    try std.testing.expectEqual(@as(usize, "queued".len), actor.transmit.queuedBytes());
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)),
+    );
+
+    _ = try actor.armReceive();
+    try std.testing.expectError(error.SubmissionQueueFull, owner.prepareClose(peer));
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle);
+    try std.testing.expect(actor.receive_active);
+    try std.testing.expect(!actor.cancel_requested);
+    try std.testing.expect(!actor.cancel_active);
+    actor.receive_active = false;
+
+    receiver.receive_tag = try actor.armReceive();
+    try std.testing.expectError(
+        error.SubmissionQueueFull,
+        receiver.prepareStop(owner.ring, actor),
+    );
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle);
+    try std.testing.expect(actor.receive_active);
+    try std.testing.expect(!actor.cancel_requested);
+    try std.testing.expect(!actor.cancel_active);
+    actor.receive_active = false;
+
+    var listener: Listener = .{};
+    try std.testing.expectError(
+        error.SubmissionQueueFull,
+        listener.prepare(owner.ring, sockets[1]),
+    );
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expectEqual(@as(u32, 0), listener.generation);
+    try std.testing.expect(!listener.accept_active);
+    try std.testing.expect(!listener.cancel_active);
+    try std.testing.expect(!listener.closing);
+
+    listener.generation = 1;
+    listener.accept_tag = Listener.token(1, .accept);
+    listener.accept_active = true;
+    try std.testing.expectError(error.SubmissionQueueFull, listener.prepareStop(owner.ring));
+    try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
+    try std.testing.expect(listener.accept_active);
+    try std.testing.expect(!listener.cancel_active);
+    try std.testing.expect(!listener.closing);
+
+    try owner.destroyPeer(peer);
+    try std.testing.expectEqual(
+        linux.E.BADF,
+        linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)),
+    );
 }
 
 test "reactor admits peers and closes descriptors rejected by capacity" {
@@ -728,14 +854,17 @@ pub const Listener = struct {
     /// Queues cancellation without submitting so it can be batched with other
     /// reactor teardown operations. Returns false when no accept is active.
     pub fn prepareStop(listener: *Listener, ring: *linux.IoUring) !bool {
-        listener.closing = true;
-        if (!listener.accept_active) return false;
+        if (!listener.accept_active) {
+            listener.closing = true;
+            return false;
+        }
         if (listener.cancel_active) return error.CancelAlreadyActive;
         _ = try ring.cancel(
             token(listener.generation, .accept_cancel),
             listener.accept_tag,
             0,
         );
+        listener.closing = true;
         listener.cancel_active = true;
         return true;
     }
@@ -1000,6 +1129,9 @@ inline fn prepareSendOperation(
 ) !void {
     if (actor.transmit.sendActive()) return error.SendAlreadyActive;
     const snapshot = try actor.transmit.snapshot(descriptor_scratch, control_storage);
+    const tag = try actor.beginSend(snapshot);
+    errdefer actor.transmit.failed() catch unreachable;
+    const submission = try ring.get_sqe();
     iovecs[0] = .{
         .base = snapshot.first.ptr,
         .len = snapshot.first.len,
@@ -1021,8 +1153,6 @@ inline fn prepareSendOperation(
         .controllen = snapshot.control.len,
         .flags = 0,
     };
-    const submission = try ring.get_sqe();
-    const tag = try actor.beginSend(snapshot);
     submission.prep_sendmsg(fd, message, 0);
     submission.user_data = tag;
 }
@@ -1125,9 +1255,11 @@ pub const Receiver = struct {
         fd: linux.fd_t,
         actor: *connection.Actor,
     ) !void {
-        receiver.message.iov = @ptrCast(&receiver.dummy_iov);
+        const receive_tag = try actor.armReceive();
+        errdefer actor.receive_active = false;
         const submission = try ring.get_sqe();
-        receiver.receive_tag = try actor.armReceive();
+        receiver.message.iov = @ptrCast(&receiver.dummy_iov);
+        receiver.receive_tag = receive_tag;
         submission.prep_recvmsg_multishot(fd, &receiver.message, linux.MSG.CMSG_CLOEXEC);
         submission.flags |= linux.IOSQE_BUFFER_SELECT;
         submission.buf_index = receiver.buffer_group_id;
@@ -1198,7 +1330,9 @@ pub const Receiver = struct {
         ring: *linux.IoUring,
         actor: *connection.Actor,
     ) !bool {
+        const previous_lifecycle = actor.lifecycle;
         actor.beginClose();
+        errdefer actor.lifecycle = previous_lifecycle;
         if (!actor.receive_active) return false;
         if (actor.cancel_requested) return error.CancelAlreadyActive;
 
