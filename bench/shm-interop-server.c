@@ -11,6 +11,7 @@ struct shm_server_state {
 	struct wl_listener client_destroy;
 	struct wl_resource *buffer;
 	struct wl_resource *frame;
+	struct wl_resource *region;
 	int pool_created;
 	int buffer_created;
 	int buffer_destroyed;
@@ -21,6 +22,11 @@ struct shm_server_state {
 	int damaged;
 	int damaged_buffer;
 	int committed;
+	int region_added;
+	int region_subtracted;
+	int region_destroyed;
+	int opaque_region_set;
+	int input_region_set;
 };
 
 static void
@@ -173,6 +179,32 @@ surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t i
 }
 
 static void
+surface_set_opaque_region(struct wl_client *client, struct wl_resource *resource,
+                          struct wl_resource *region)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (region != state->region) {
+		wl_client_post_implementation_error(client, "invalid opaque region");
+		return;
+	}
+	state->opaque_region_set = 1;
+}
+
+static void
+surface_set_input_region(struct wl_client *client, struct wl_resource *resource,
+                         struct wl_resource *region)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (region != state->region) {
+		wl_client_post_implementation_error(client, "invalid input region");
+		return;
+	}
+	state->input_region_set = 1;
+}
+
+static void
 surface_commit(struct wl_client *client, struct wl_resource *resource)
 {
 	struct shm_server_state *state = wl_resource_get_user_data(resource);
@@ -207,8 +239,53 @@ static const struct wl_surface_interface surface_implementation = {
 	.attach = surface_attach,
 	.damage = surface_damage,
 	.frame = surface_frame,
+	.set_opaque_region = surface_set_opaque_region,
+	.set_input_region = surface_set_input_region,
 	.commit = surface_commit,
 	.damage_buffer = surface_damage_buffer,
+};
+
+static void
+region_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	(void) client;
+	state->region_destroyed = 1;
+	state->region = NULL;
+	wl_resource_destroy(resource);
+}
+
+static void
+region_add(struct wl_client *client, struct wl_resource *resource,
+           int32_t x, int32_t y, int32_t width, int32_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (x != 1 || y != 2 || width != 3 || height != 4) {
+		wl_client_post_implementation_error(client, "invalid region add");
+		return;
+	}
+	state->region_added = 1;
+}
+
+static void
+region_subtract(struct wl_client *client, struct wl_resource *resource,
+                int32_t x, int32_t y, int32_t width, int32_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (x != 5 || y != 6 || width != 7 || height != 8) {
+		wl_client_post_implementation_error(client, "invalid region subtract");
+		return;
+	}
+	state->region_subtracted = 1;
+}
+
+static const struct wl_region_interface region_implementation = {
+	.destroy = region_destroy,
+	.add = region_add,
+	.subtract = region_subtract,
 };
 
 static void
@@ -231,9 +308,15 @@ static void
 compositor_create_region(struct wl_client *client, struct wl_resource *resource,
                          uint32_t id)
 {
-	(void) resource;
-	(void) id;
-	wl_client_post_implementation_error(client, "unexpected region");
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	state->region = wl_resource_create(client, &wl_region_interface, 1, id);
+	if (state->region == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(
+		state->region, &region_implementation, state, NULL);
 }
 
 static const struct wl_compositor_interface compositor_implementation = {
@@ -291,5 +374,7 @@ shm_server_fd(int fd)
 	wl_display_destroy(state.display);
 	return state.pool_created && state.buffer_created && state.buffer_destroyed &&
 	       state.pool_destroyed && state.surface_created && state.surface_destroyed &&
-	       state.committed ? EXIT_SUCCESS : EXIT_FAILURE;
+	       state.committed && state.region_added && state.region_subtracted &&
+	       state.region_destroyed && state.opaque_region_set && state.input_region_set ?
+	       EXIT_SUCCESS : EXIT_FAILURE;
 }

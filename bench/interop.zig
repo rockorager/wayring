@@ -3417,8 +3417,28 @@ fn wayringShmClient() !u8 {
         handler.compositor.?,
         .{},
     )).id;
+    const region = (try standard_protocol.wl_compositor.construct_create_region(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
     handler.buffer = buffer;
     handler.surface = surface;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_region,
+        client_objects,
+        &actor.transmit,
+        region,
+        .{ .add = .{ .x = 1, .y = 2, .width = 3, .height = 4 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_region,
+        client_objects,
+        &actor.transmit,
+        region,
+        .{ .subtract = .{ .x = 5, .y = 6, .width = 7, .height = 8 } },
+    );
     try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
@@ -3433,12 +3453,33 @@ fn wayringShmClient() !u8 {
         surface,
         .{ .damage = .{ .x = 1, .y = 2, .width = 3, .height = 4 } },
     );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .set_opaque_region = .{ .region = region.id } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .set_input_region = .{ .region = region.id } },
+    );
     handler.frame = (try standard_protocol.wl_surface.construct_frame(
         client_objects,
         &actor.transmit,
         surface,
         .{},
     )).callback;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_region,
+        client_objects,
+        &actor.transmit,
+        region,
+        .{ .destroy = .{} },
+    );
     try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
