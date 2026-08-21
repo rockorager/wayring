@@ -382,8 +382,10 @@ dispatches batches of already-filtered Wayring CQEs, and prepares resulting
 sends, cancellation, destruction, and deferred receives without submitting.
 Application handlers receive the peer, resolved target, message, and descriptor
 queue directly; optional connection, disconnection, and protocol-error hooks
-remain statically dispatched. External event producers queue output through the
-runtime and explicitly schedule the affected peer. Borrowed-ring users must
+remain statically dispatched. The driver advances the runtime's initial and
+incremental global-publication cursors and schedules each affected peer, so
+registry backpressure resumes on later send completions. External producers of
+other events explicitly schedule the affected peer. Borrowed-ring users must
 filter unrelated CQEs before dispatch and retain control of `submit`; if a
 batch reports pending work because the SQ filled, they submit and call
 `prepare` again. Thus the driver removes repetitive compositor event-loop code

@@ -1513,6 +1513,7 @@ pub fn Driver(comptime protocol: type) type {
             requests: usize = 0,
             protocol_errors: usize = 0,
             destroyed: usize = 0,
+            published: usize = 0,
             prepared: usize = 0,
             pending: bool = false,
 
@@ -1522,6 +1523,7 @@ pub fn Driver(comptime protocol: type) type {
                 progress.requests += other.requests;
                 progress.protocol_errors += other.protocol_errors;
                 progress.destroyed += other.destroyed;
+                progress.published += other.published;
                 progress.prepared += other.prepared;
                 progress.pending = other.pending;
             }
@@ -1590,6 +1592,17 @@ pub fn Driver(comptime protocol: type) type {
         pub fn prepare(driver: *Self, handler: anytype) !Progress {
             var progress: Progress = .{};
             const reactor = driver.runtime.clients.reactor;
+            while (true) switch (try driver.runtime.publishNext()) {
+                .sent => |peer| {
+                    _ = try driver.schedule(peer);
+                    progress.published += 1;
+                },
+                .blocked => |peer| {
+                    _ = try driver.schedule(peer);
+                    break;
+                },
+                .complete => break,
+            };
             while (driver.pending_head != queue_end) {
                 const slot = driver.pending_head;
                 const node = &driver.pending_storage[slot];

@@ -187,6 +187,7 @@ fn wayringServer(options: Options) !u8 {
         .warmup = options.warmup,
         .target = options.warmup + options.messages,
         .latency = options.latency,
+        .driver_publication = options.mode == .libwayland_client_driver,
     };
     _ = try reactor.ring.submit();
     if (options.mode == .libwayland_client_driver)
@@ -335,6 +336,7 @@ const ServerHandler = struct {
     warmup: u64,
     target: u64,
     latency: bool,
+    driver_publication: bool,
     received: u64 = 0,
 
     pub fn request(
@@ -357,11 +359,12 @@ const ServerHandler = struct {
                     callback,
                     0,
                 ),
-                .get_registry => while (true) switch (try handler.runtime.publishNext()) {
-                    .sent => {},
-                    .blocked => return error.ByteBudgetExceeded,
-                    .complete => break,
-                },
+                .get_registry => if (!handler.driver_publication)
+                    while (true) switch (try handler.runtime.publishNext()) {
+                        .sent => {},
+                        .blocked => return error.ByteBudgetExceeded,
+                        .complete => break,
+                    },
             }
         } else if (target.object.interface == &ServerCore.Registry.info) {
             const handle = handler.objects.namespace.lookupHandle(message.header.object_id) orelse
