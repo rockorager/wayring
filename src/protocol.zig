@@ -219,12 +219,13 @@ const Parser = struct {
         switch (tag.kind) {
             .start => {
                 if (parser.interface != null) return error.UnexpectedElement;
-                try tag.attributes.ensureOnly(&.{ "name", "version" });
+                try tag.attributes.ensureOnly(&.{ "name", "version", "frozen" });
                 const name = try tag.attributes.required("name");
                 try validateName(name);
                 try ensureUniqueInterface(parser.interfaces.items, name);
                 const version = try tag.attributes.requiredUnsigned("version");
                 if (version == 0) return error.InvalidVersion;
+                _ = try tag.attributes.optionalBoolean("frozen");
                 parser.interface = .{ .name = name, .version = version };
             },
             .end => try parser.finishInterface(),
@@ -617,7 +618,7 @@ test "parses messages, arguments, enums, and versions" {
     const xml =
         \\<?xml version="1.0"?>
         \\<protocol name="sample">
-        \\  <interface name="wl_sample" version="3">
+        \\  <interface name="wl_sample" version="3" frozen="true">
         \\    <request name="destroy" type="destructor"/>
         \\    <request name="set_title" since="2">
         \\      <arg name="title" type="string" allow-null="true"/>

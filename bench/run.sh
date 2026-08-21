@@ -15,7 +15,7 @@ resource_connections=${RESOURCE_CONNECTIONS:-"1 8 32 64"}
 resource_warmup=${RESOURCE_WARMUP:-10000}
 mode=${1:-throughput}
 
-"$root/bench/build.sh"
+(cd "$root" && zig build benchmarks)
 
 echo "# kernel=$(uname -r) libwayland=$(pkg-config --modversion wayland-client) messages=$messages batch=$batch warmup=$warmup" >&2
 

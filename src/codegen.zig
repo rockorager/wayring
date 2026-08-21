@@ -856,7 +856,11 @@ fn emitEnums(
         try add(output, allocator, backing);
         try add(output, allocator, ") @This() {\n            return .{ .value = value };\n        }\n\n        pub inline fn toInt(value: @This()) ");
         try add(output, allocator, backing);
-        try add(output, allocator, " {\n            return value.value;\n        }\n");
+        try add(output, allocator, " {\n            return value.value;\n        }\n\n        pub inline fn fromWire(value: u32) @This() {\n            return .{ .value = ");
+        if (signed) try add(output, allocator, "@bitCast(value)") else try add(output, allocator, "value");
+        try add(output, allocator, " };\n        }\n\n        pub inline fn toWire(value: @This()) u32 {\n            return ");
+        if (signed) try add(output, allocator, "@bitCast(value.value)") else try add(output, allocator, "value.value");
+        try add(output, allocator, ";\n        }\n");
         if (protocol_enum.bitfield) {
             try add(output, allocator,
                 \\
@@ -912,9 +916,7 @@ fn inspectEnumArguments(
             .uint => false,
             else => return error.InvalidEnumType,
         };
-        if (signed.*) |previous| {
-            if (previous != current) return error.InvalidEnumType;
-        } else signed.* = current;
+        if (current or signed.* == null) signed.* = current;
     }
 }
 
@@ -1248,13 +1250,9 @@ fn emitEncodeArgument(
         return;
     }
     if (argument.enum_name != null) {
-        try add(output, allocator, "        try writeU32(&reservation, ");
-        if (argument.type == .int) try add(output, allocator, "@bitCast(");
-        try add(output, allocator, "payload.");
+        try add(output, allocator, "        try writeU32(&reservation, payload.");
         try identifier(output, allocator, argument.name);
-        try add(output, allocator, ".value");
-        if (argument.type == .int) try add(output, allocator, ")");
-        try add(output, allocator, ");\n");
+        try add(output, allocator, ".toWire());\n");
         return;
     }
     try add(output, allocator, "        ");
@@ -1475,10 +1473,9 @@ fn emitDecodeExpression(
 ) Error!void {
     if (argument.enum_name) |enum_name| {
         try emitEnumReference(output, allocator, enum_name);
-        try add(output, allocator, ".fromInt(");
+        try add(output, allocator, ".fromWire(");
         switch (argument.type) {
-            .int => try add(output, allocator, "try arguments.int()"),
-            .uint => try add(output, allocator, "try arguments.uint()"),
+            .int, .uint => try add(output, allocator, "try arguments.uint()"),
             else => return error.InvalidEnumType,
         }
         try add(output, allocator, ")");
@@ -1610,6 +1607,22 @@ test "omits unreachable object validator fallback" {
     const generated = try generate(std.testing.allocator, protocol);
     defer std.testing.allocator.free(generated);
     try std.testing.expect(std.mem.indexOf(u8, generated, "else => {},") == null);
+}
+
+test "generates enums used by signed and unsigned arguments" {
+    const xml =
+        \\<protocol name="sample"><interface name="sample_v1" version="1">
+        \\<enum name="direction"><entry name="normal" value="0"/></enum>
+        \\<request name="set"><arg name="direction" type="int" enum="direction"/></request>
+        \\<event name="preferred"><arg name="direction" type="uint" enum="direction"/></event>
+        \\</interface></protocol>
+    ;
+    var protocol = try protocol_ir.Protocol.parse(std.testing.allocator, xml);
+    defer protocol.deinit(std.testing.allocator);
+    const generated = try generate(std.testing.allocator, protocol);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub inline fn fromWire(value: u32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".toWire()") != null);
 }
 
 test "composes protocol interfaces and rejects duplicates" {

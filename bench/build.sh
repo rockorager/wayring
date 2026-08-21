@@ -4,7 +4,8 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 out="$root/zig-out/bench"
 generated="$out/generated"
-wayland_datadir=$(pkg-config --variable=pkgdatadir wayland-client)
+wayland_source=$1
+protocols_source=$2
 mkdir -p "$generated"
 
 zig build-exe -OReleaseSafe --dep wayring \
@@ -13,13 +14,15 @@ zig build-exe -OReleaseSafe --dep wayring \
     -femit-bin="$out/wayring-scanner"
 "$out/wayring-scanner" "$root/bench/protocol.xml" \
     "$generated/wayring-benchmark.zig"
-"$out/wayring-scanner" "$wayland_datadir/wayland.xml" \
+"$out/wayring-scanner" "$wayland_source/protocol/wayland.xml" \
     "$generated/wayland-core.zig"
-protocols_datadir=$(pkg-config --variable=pkgdatadir wayland-protocols)
-xdg_shell="$protocols_datadir/stable/xdg-shell/xdg-shell.xml"
-presentation_time="$protocols_datadir/stable/presentation-time/presentation-time.xml"
-linux_dmabuf="$protocols_datadir/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
-"$out/wayring-scanner" "$wayland_datadir/wayland.xml" "$xdg_shell" \
+xdg_shell="$protocols_source/stable/xdg-shell/xdg-shell.xml"
+presentation_time="$protocols_source/stable/presentation-time/presentation-time.xml"
+linux_dmabuf="$protocols_source/stable/linux-dmabuf/linux-dmabuf-v1.xml"
+# The installed libwayland scanner may predate the stable XML's DTD additions.
+# Its deprecated unstable spelling has the same interfaces exercised at v3.
+linux_dmabuf_c="$protocols_source/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
+"$out/wayring-scanner" "$wayland_source/protocol/wayland.xml" "$xdg_shell" \
     "$presentation_time" "$linux_dmabuf" \
     "$generated/wayland-xdg.zig"
 
@@ -41,11 +44,11 @@ wayland-scanner server-header "$presentation_time" \
     "$generated/presentation-time-server-protocol.h"
 wayland-scanner private-code "$presentation_time" \
     "$generated/presentation-time-protocol.c"
-wayland-scanner client-header "$linux_dmabuf" \
+wayland-scanner client-header "$linux_dmabuf_c" \
     "$generated/linux-dmabuf-client-protocol.h"
-wayland-scanner server-header "$linux_dmabuf" \
+wayland-scanner server-header "$linux_dmabuf_c" \
     "$generated/linux-dmabuf-server-protocol.h"
-wayland-scanner private-code "$linux_dmabuf" \
+wayland-scanner private-code "$linux_dmabuf_c" \
     "$generated/linux-dmabuf-protocol.c"
 
 cflags="-std=c11 -O3 -DNDEBUG -D_GNU_SOURCE -Wall -Wextra -Werror"

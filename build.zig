@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const wayland_source = b.dependency("wayland", .{});
+    const wayland_protocols_source = b.dependency("wayland_protocols", .{});
 
     const wayring = b.addModule("wayring", .{
         .root_source_file = b.path("src/root.zig"),
@@ -92,13 +94,17 @@ pub fn build(b: *std.Build) void {
 
     const protocol_compat_test = b.addSystemCommand(&.{ "/bin/sh", "test/protocol-compat.sh" });
     protocol_compat_test.addArtifactArg(scanner);
+    protocol_compat_test.addDirectoryArg(wayland_source.path(""));
+    protocol_compat_test.addDirectoryArg(wayland_protocols_source.path(""));
     const protocol_compat_step = b.step(
         "protocol-compat",
-        "Generate and test common production Wayland protocols",
+        "Generate and test pinned upstream Wayland protocols",
     );
     protocol_compat_step.dependOn(&protocol_compat_test.step);
 
     const build_benchmarks = b.addSystemCommand(&.{ "/bin/sh", "bench/build.sh" });
+    build_benchmarks.addDirectoryArg(wayland_source.path(""));
+    build_benchmarks.addDirectoryArg(wayland_protocols_source.path(""));
     const benchmark_step = b.step("benchmarks", "Build the benchmark executables");
     benchmark_step.dependOn(&build_benchmarks.step);
 }

@@ -985,6 +985,7 @@ const ProtocolServerHandler = struct {
                     handler.data_offer = offer;
                     handler.data_device_created = true;
                 },
+                .release => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_data_offer.info) {
@@ -1556,6 +1557,7 @@ const ProtocolServerHandler = struct {
                     handler.params_destroyed = handler.buffer_destroyed;
                     handler.params_destroyed_count += 1;
                 },
+                .set_sampling_device => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_shm.info) {
@@ -1580,6 +1582,7 @@ const ProtocolServerHandler = struct {
                     );
                     handler.pool_created = true;
                 },
+                .release => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_shm_pool.info) {
@@ -1714,6 +1717,7 @@ const ProtocolServerHandler = struct {
                     )).id;
                     handler.region_created = true;
                 },
+                .release => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.xdg_wm_base.info) {
@@ -1879,6 +1883,7 @@ const ProtocolServerHandler = struct {
                         handler.surface_committed = true;
                     }
                 },
+                .get_release => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_subcompositor.info) {
@@ -2698,6 +2703,7 @@ const PointerClientHandler = struct {
                 },
                 .frame => handler.frame = true,
                 .leave => return error.UnexpectedEvent,
+                .axis_relative_direction, .warp => return error.UnexpectedEvent,
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
