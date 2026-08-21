@@ -453,6 +453,13 @@ transform, scale, and content offset. Persistent properties remain
 pending/current values while attachment, damage, and offset are extracted and
 reset as one content update.
 
+Viewporter crop and destination state is fixed-size and double-buffered with
+the surface. Commit validation applies buffer transform and scale before
+checking the 24.8 fixed-point source rectangle, rejects fractional source sizes
+when no destination is present, and derives the renderer-facing surface size.
+A null attachment has zero surface size but still applies pending viewport
+state; destroying the viewport clears both properties on the next commit.
+
 Damage uses one conservative bounding rectangle per coordinate space. This may
 overdraw but cannot miss changed pixels, requires no region allocation, and
 keeps the common surface commit path fixed-size. Exact opaque/input regions,
