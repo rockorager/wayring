@@ -71,6 +71,24 @@ case "$mode" in
         strace -f -c "$root/zig-out/bench/wayring-ping" \
             "$messages" "$batch" "$warmup" "$connections"
         ;;
+    rx-pressure)
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample connections=$connections buffers=2" >&2
+            "$root/zig-out/bench/wayring-ping" \
+                "$messages" "$batch" "$warmup" "$connections" rx-pressure-immediate
+            "$root/zig-out/bench/wayring-ping" \
+                "$messages" "$batch" "$warmup" "$connections" rx-pressure-deferred
+            sample=$((sample + 1))
+        done
+        ;;
+    rx-pressure-syscalls)
+        echo "warning: strace perturbs timing; use this mode only for syscall counts" >&2
+        strace -f -c "$root/zig-out/bench/wayring-ping" \
+            "$messages" "$batch" "$warmup" "$connections" rx-pressure-immediate
+        strace -f -c "$root/zig-out/bench/wayring-ping" \
+            "$messages" "$batch" "$warmup" "$connections" rx-pressure-deferred
+        ;;
     resources)
         for resource_count in $resource_connections; do
             echo "# scope=idle connections=$resource_count idle_ms=$idle_ms" >&2

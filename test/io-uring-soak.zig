@@ -646,6 +646,7 @@ test "real io_uring receives recover from shared buffer exhaustion" {
     var held: [receive_pressure_buffers]HeldReceive = undefined;
     var held_count: usize = 0;
     var saw_exhaustion = false;
+    var exhaustion_completions: usize = 0;
     var completions: usize = 0;
     while (held_count < held.len or !saw_exhaustion) {
         completions += 1;
@@ -673,7 +674,11 @@ test "real io_uring receives recover from shared buffer exhaustion" {
                 };
                 held_count += 1;
             },
-            .buffers_exhausted => saw_exhaustion = true,
+            .buffers_exhausted => {
+                saw_exhaustion = true;
+                exhaustion_completions += 1;
+                _ = try reactor.deferReceive(state.peer);
+            },
             else => return error.UnexpectedCompletion,
         }
     }
@@ -683,43 +688,50 @@ test "real io_uring receives recover from shared buffer exhaustion" {
     for (&held) |*item| {
         const actor = try reactor.getActor(item.state.peer);
         try consumeReceivePressure(item.state, actor, item.received);
-        try (try reactor.getReceiver(item.state.peer)).release(item.received);
+        try reactor.releaseReceived(item.state.peer, item.received);
+        if (!actor.receive_active and item.state.received < receive_pressure_bytes)
+            _ = try reactor.deferReceive(item.state.peer);
     }
-    var prepared = false;
-    for (&states) |*state| {
-        const actor = try reactor.getActor(state.peer);
-        if (!actor.receive_active) {
-            try reactor.prepareReceive(state.peer);
-            prepared = true;
-        }
-    }
-    if (prepared) _ = try reactor.ring.submit();
+    const initial_rearms = try reactor.prepareDeferredReceives();
+    try std.testing.expect(initial_rearms > 0);
+    _ = try reactor.ring.submit();
 
     completions = 0;
+    var rearm_submissions: usize = 1;
     while (!receivePressureComplete(&states)) {
-        completions += 1;
-        if (completions > 10_000) return error.CompletionLimitExceeded;
-        const completion = try reactor.ring.copy_cqe();
-        const routed = (reactor.route(null, completion) orelse
-            return error.InvalidCompletion).connection;
-        if (routed.operation != .receive) return error.UnexpectedCompletion;
-        const state = findReceivePressureState(&states, reactor.routedPeer(routed)) orelse
-            return error.UnknownPeer;
-        const actor = try reactor.getActor(state.peer);
-        const event = try actor.completeRouted(.receive, completion);
-        switch (event) {
-            .received => {
-                const receiver = try reactor.getReceiver(state.peer);
-                const received = try receiver.decodeCompletion(completion);
-                try consumeReceivePressure(state, actor, received);
-                try receiver.release(received);
-            },
-            .buffers_exhausted => saw_exhaustion = true,
-            else => return error.UnexpectedCompletion,
+        while (true) {
+            completions += 1;
+            if (completions > 10_000) return error.CompletionLimitExceeded;
+            const completion = try reactor.ring.copy_cqe();
+            const routed = (reactor.route(null, completion) orelse
+                return error.InvalidCompletion).connection;
+            if (routed.operation != .receive) return error.UnexpectedCompletion;
+            const state = findReceivePressureState(&states, reactor.routedPeer(routed)) orelse
+                return error.UnknownPeer;
+            const actor = try reactor.getActor(state.peer);
+            const event = try actor.completeRouted(.receive, completion);
+            switch (event) {
+                .received => {
+                    const receiver = try reactor.getReceiver(state.peer);
+                    const received = try receiver.decodeCompletion(completion);
+                    try consumeReceivePressure(state, actor, received);
+                    try reactor.releaseReceived(state.peer, received);
+                    if (state.received < receive_pressure_bytes and !actor.receive_active)
+                        _ = try reactor.deferReceive(state.peer);
+                },
+                .buffers_exhausted => {
+                    saw_exhaustion = true;
+                    exhaustion_completions += 1;
+                    if (state.received < receive_pressure_bytes)
+                        _ = try reactor.deferReceive(state.peer);
+                },
+                else => return error.UnexpectedCompletion,
+            }
+            if (receivePressureComplete(&states) or reactor.ring.cq_ready() == 0) break;
         }
-        if (state.received < receive_pressure_bytes and !actor.receive_active) {
-            try reactor.prepareReceive(state.peer);
+        if (try reactor.prepareDeferredReceives() != 0) {
             _ = try reactor.ring.submit();
+            rearm_submissions += 1;
         }
     }
 
@@ -727,6 +739,7 @@ test "real io_uring receives recover from shared buffer exhaustion" {
         try std.testing.expectEqual(receive_pressure_bytes, state.received);
         try std.testing.expectEqual(@as(usize, 1), state.received_fds);
     }
+    try std.testing.expect(rearm_submissions < exhaustion_completions);
     for (states) |state| {
         if (!try reactor.prepareClose(state.peer)) try reactor.destroyPeer(state.peer);
     }

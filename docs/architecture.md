@@ -196,9 +196,20 @@ When every shared provided buffer is selected, the kernel terminates affected
 multishot receives with `ENOBUFS`. The actor reports buffer exhaustion without
 closing the connection. Callers return already delivered buffers before
 rearming inactive peers; repeated rearming while buffers remain held only
-produces more `ENOBUFS` completions. Real-kernel soak coverage retains the whole
-buffer group across concurrent clients, then verifies that every stream and
-transferred descriptor resumes intact after those buffers are returned.
+produces more `ENOBUFS` completions. The optional reactor-wide deferred-receive
+FIFO parks each exhausted peer once. Returning any non-incrementally-consumed
+buffer permits one FIFO sweep for a caller-controlled batch submission, and
+the permit remains pending if no peer has been parked yet;
+`ENOBUFS` alone never permits another sweep. A sweep rather than a buffer-credit
+count is required because an already-active multishot receive can race for a
+returned buffer, which userspace cannot reserve for a particular rearm SQE.
+Pending entries are removed in O(1) on peer destruction, preventing slot reuse
+from retaining stale queue links. If one sweep exceeds the available submission
+queue space, its pending state survives submission so the caller can continue
+the sweep in another batch.
+Real-kernel soak coverage retains the whole buffer group across concurrent
+clients, then verifies that every stream and transferred descriptor resumes
+intact after those buffers are returned.
 
 The reusable io_uring backend owns persistent per-connection recvmsg and
 sendmsg operation state while borrowing one reactor-wide provided-buffer group.

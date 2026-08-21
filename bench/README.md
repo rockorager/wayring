@@ -26,6 +26,8 @@ bench/run.sh perf
 bench/run.sh syscalls
 bench/run.sh multi
 bench/run.sh multi-syscalls
+bench/run.sh rx-pressure
+bench/run.sh rx-pressure-syscalls
 bench/run.sh resources
 bench/run.sh idle-perf
 bench/run.sh latency
@@ -67,6 +69,12 @@ connection; the reported message count and throughput are aggregate. Wayring
 client send SQEs for every connection are submitted together once per batch;
 libwayland queues the same requests before flushing each display. Connection
 counts are limited to 64.
+
+Receive-pressure mode deliberately gives all Wayring connections only two
+shared provided buffers. It compares immediate `ENOBUFS` rearming against the
+allocation-free deferred FIFO using identical traffic. The syscall variant is
+the decisive check for avoided retry submissions; timing remains useful for
+detecting scheduler overhead but is sensitive to host scheduling.
 
 Resource mode samples initialized client/server pairs while idle and again
 after `RESOURCE_WARMUP` messages per connection. It reports the resident memory

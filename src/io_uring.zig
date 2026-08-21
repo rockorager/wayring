@@ -44,6 +44,15 @@ pub const Peer = struct {
     generation: u32,
 };
 
+const deferred_end = std.math.maxInt(u32);
+const deferred_none = deferred_end - 1;
+
+const DeferredReceive = struct {
+    generation: u32 = 0,
+    previous: u32 = deferred_none,
+    next: u32 = deferred_none,
+};
+
 pub const SendState = struct {
     descriptor_scratch: []linux.fd_t,
     control_storage: []u8,
@@ -78,6 +87,10 @@ pub const Reactor = struct {
     slot_storage: []reactor.Slot,
     slots: reactor.Slots,
     actor_storage: []connection.Actor,
+    deferred_receive_storage: []DeferredReceive,
+    deferred_receive_head: u32,
+    deferred_receive_tail: u32,
+    receive_rearm_pending: bool,
     receiver_storage: []Receiver,
     fd_storage: []linux.fd_t,
     sender_storage: []SendState,
@@ -141,6 +154,15 @@ pub const Reactor = struct {
         owner.slots = reactor.Slots.init(owner.slot_storage);
         owner.actor_storage = try allocator.alloc(connection.Actor, config.max_connections);
         errdefer allocator.free(owner.actor_storage);
+        owner.deferred_receive_storage = try allocator.alloc(
+            DeferredReceive,
+            config.max_connections,
+        );
+        errdefer allocator.free(owner.deferred_receive_storage);
+        @memset(owner.deferred_receive_storage, .{});
+        owner.deferred_receive_head = deferred_end;
+        owner.deferred_receive_tail = deferred_end;
+        owner.receive_rearm_pending = false;
         owner.receiver_storage = try allocator.alloc(Receiver, config.max_connections);
         errdefer allocator.free(owner.receiver_storage);
         owner.fd_storage = try allocator.alloc(linux.fd_t, config.max_connections);
@@ -199,6 +221,8 @@ pub const Reactor = struct {
 
     pub fn deinit(owner: *Reactor, allocator: std.mem.Allocator) void {
         std.debug.assert(owner.slots.active_count == 0);
+        std.debug.assert(owner.deferred_receive_head == deferred_end);
+        std.debug.assert(owner.deferred_receive_tail == deferred_end);
         owner.descriptors.deinit(allocator);
         owner.transmit_blocks.deinit(allocator);
         owner.fragment_blocks.deinit(allocator);
@@ -207,6 +231,7 @@ pub const Reactor = struct {
         allocator.free(owner.sender_storage);
         allocator.free(owner.fd_storage);
         allocator.free(owner.receiver_storage);
+        allocator.free(owner.deferred_receive_storage);
         allocator.free(owner.actor_storage);
         allocator.free(owner.slot_storage);
         owner.receive_buffers.deinit(allocator);
@@ -291,6 +316,86 @@ pub const Reactor = struct {
         _ = try owner.ring.submit();
     }
 
+    /// Parks an inactive receive after `ENOBUFS`. Each peer occupies at most
+    /// one allocation-free FIFO entry until a returned buffer permits rearm.
+    pub fn deferReceive(owner: *Reactor, peer: Peer) !bool {
+        const actor = try owner.getActor(peer);
+        if (actor.lifecycle != .open) return error.Closing;
+        if (actor.receive_active) return error.ReceiveAlreadyActive;
+        const node = &owner.deferred_receive_storage[peer.slot];
+        if (node.next != deferred_none) {
+            if (node.generation != peer.generation) return error.StaleHandle;
+            return false;
+        }
+        node.* = .{
+            .generation = peer.generation,
+            .previous = owner.deferred_receive_tail,
+            .next = deferred_end,
+        };
+        if (owner.deferred_receive_tail == deferred_end) {
+            owner.deferred_receive_head = peer.slot;
+        } else {
+            owner.deferred_receive_storage[owner.deferred_receive_tail].next = peer.slot;
+        }
+        owner.deferred_receive_tail = peer.slot;
+        return true;
+    }
+
+    /// Returns a selected receive buffer and permits one deferred FIFO sweep
+    /// when the kernel did not retain it for incremental consumption.
+    pub fn releaseReceived(
+        owner: *Reactor,
+        peer: Peer,
+        received: Receiver.Received,
+    ) !void {
+        const receiver = try owner.getReceiver(peer);
+        try receiver.release(received);
+        if (received.completion.flags & linux.IORING_CQE_F_BUF_MORE == 0)
+            owner.receive_rearm_pending = true;
+    }
+
+    /// Queues one FIFO sweep of deferred receives without submitting. A buffer
+    /// return permits the sweep, rather than counting credits: active multishot
+    /// receives can race for returned buffers, so a userspace credit cannot
+    /// reserve one for a particular SQE. `ENOBUFS` by itself never permits a
+    /// retry, preventing an empty-buffer completion loop. If the SQ fills,
+    /// submit the prepared entries and call again while
+    /// `deferredReceivesPending()` is true.
+    pub fn prepareDeferredReceives(owner: *Reactor) !usize {
+        if (!owner.receive_rearm_pending or owner.deferred_receive_head == deferred_end)
+            return 0;
+        owner.receive_rearm_pending = false;
+        var prepared: usize = 0;
+        while (owner.deferred_receive_head != deferred_end) {
+            const slot = owner.deferred_receive_head;
+            const node = &owner.deferred_receive_storage[slot];
+            const peer: Peer = .{ .slot = @intCast(slot), .generation = node.generation };
+            const actor = owner.getActor(peer) catch {
+                owner.removeDeferredReceive(slot);
+                continue;
+            };
+            if (actor.lifecycle != .open or actor.receive_active) {
+                owner.removeDeferredReceive(slot);
+                continue;
+            }
+            owner.prepareReceive(peer) catch |err| {
+                if (err == error.SubmissionQueueFull) {
+                    owner.receive_rearm_pending = true;
+                    return prepared;
+                }
+                return err;
+            };
+            owner.removeDeferredReceive(slot);
+            prepared += 1;
+        }
+        return prepared;
+    }
+
+    pub fn deferredReceivesPending(owner: *const Reactor) bool {
+        return owner.receive_rearm_pending and
+            owner.deferred_receive_head != deferred_end;
+    }
+
     /// Moves a peer to closing and queues cancellation of every active socket
     /// operation without submitting, allowing many peers to share one ring
     /// enter. Returns false when no operation needs cancellation.
@@ -328,6 +433,9 @@ pub const Reactor = struct {
     pub fn destroyPeer(owner: *Reactor, peer: Peer) !void {
         const peer_actor = try owner.getActor(peer);
         if (!peer_actor.canDeinit()) return error.ActorBusy;
+        const deferred = &owner.deferred_receive_storage[peer.slot];
+        if (deferred.next != deferred_none and deferred.generation == peer.generation)
+            owner.removeDeferredReceive(peer.slot);
         try owner.slots.deactivate(peer.slot, peer.generation);
         peer_actor.deinit();
         _ = linux.close(owner.fd_storage[peer.slot]);
@@ -399,6 +507,22 @@ pub const Reactor = struct {
             else
                 null,
         };
+    }
+
+    fn removeDeferredReceive(owner: *Reactor, slot: u32) void {
+        const node = &owner.deferred_receive_storage[slot];
+        std.debug.assert(node.next != deferred_none);
+        if (node.previous == deferred_end) {
+            owner.deferred_receive_head = node.next;
+        } else {
+            owner.deferred_receive_storage[node.previous].next = node.next;
+        }
+        if (node.next == deferred_end) {
+            owner.deferred_receive_tail = node.previous;
+        } else {
+            owner.deferred_receive_storage[node.next].previous = node.previous;
+        }
+        node.* = .{};
     }
 
     fn validConfig(config: Config) bool {

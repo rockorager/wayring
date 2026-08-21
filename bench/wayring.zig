@@ -45,7 +45,15 @@ const send_tag = (completions.Token{
 }).encode();
 
 const Options = struct {
-    const Mode = enum { round_trip, latency, client_tx, client_rx, idle };
+    const Mode = enum {
+        round_trip,
+        latency,
+        client_tx,
+        client_rx,
+        idle,
+        rx_pressure_immediate,
+        rx_pressure_deferred,
+    };
 
     warmup: u64 = 100_000,
     messages: u64 = 1_000_000,
@@ -162,6 +170,7 @@ fn flushActorSend(
 fn flushMultiActorSend(
     ring: *linux.IoUring,
     owner: *IoReactor,
+    deferred_rearm: bool,
     target_slot: usize,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -191,7 +200,9 @@ fn flushMultiActorSend(
                     }
                 },
                 .receive => switch (event) {
-                    .buffers_exhausted => try receivers[routed_slot].arm(
+                    .buffers_exhausted => if (deferred_rearm) {
+                        _ = try owner.deferReceive(owner.routedPeer(routed));
+                    } else try receivers[routed_slot].arm(
                         ring,
                         fds[routed_slot],
                         routed_actor,
@@ -697,9 +708,19 @@ const MultiInput = struct {
     received: MultishotReceiver.Received,
 };
 
+fn submitDeferredReceives(ring: *linux.IoUring, owner: *IoReactor) !void {
+    while (owner.deferredReceivesPending()) {
+        const prepared = try owner.prepareDeferredReceives();
+        if (prepared == 0 and ring.sq_ready() == 0)
+            return error.InvalidReceiveSchedulerState;
+        _ = try ring.submit();
+    }
+}
+
 fn nextMultiInput(
     ring: *linux.IoUring,
     owner: *IoReactor,
+    deferred_rearm: bool,
     fds: []const c.fd_t,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -719,7 +740,10 @@ fn nextMultiInput(
                 .slot = slot,
                 .received = try receiver.decodeCompletion(cqe),
             },
-            .buffers_exhausted => try receiver.arm(ring, fds[slot], actor),
+            .buffers_exhausted => if (deferred_rearm) {
+                _ = try owner.deferReceive(owner.routedPeer(routed));
+                if (ring.cq_ready() == 0) try submitDeferredReceives(ring, owner);
+            } else try receiver.arm(ring, fds[slot], actor),
             else => return error.InvalidCompletion,
         }
     }
@@ -727,24 +751,37 @@ fn nextMultiInput(
 
 fn finishMultiInput(
     ring: *linux.IoUring,
+    owner: *IoReactor,
+    deferred_rearm: bool,
     fd: c.fd_t,
     actor: *connection.Actor,
     receiver: *MultishotReceiver,
     input: MultishotReceiver.Received,
 ) !void {
-    try receiver.release(input);
-    if (!actor.receive_active) try receiver.arm(ring, fd, actor);
+    if (deferred_rearm) {
+        const peer: wayring.io_uring.Peer = .{
+            .slot = actor.slot,
+            .generation = actor.generation,
+        };
+        try owner.releaseReceived(peer, input);
+        if (!actor.receive_active) _ = try owner.deferReceive(peer);
+        if (ring.cq_ready() == 0) try submitDeferredReceives(ring, owner);
+    } else {
+        try receiver.release(input);
+        if (!actor.receive_active) try receiver.arm(ring, fd, actor);
+    }
 }
 
 fn serverMultiHandshake(
     ring: *linux.IoUring,
     owner: *IoReactor,
+    deferred_rearm: bool,
     fds: []const c.fd_t,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
     namespaces: []objects.SharedNamespace,
 ) !void {
-    const input = try nextMultiInput(ring, owner, fds, actors, receivers);
+    const input = try nextMultiInput(ring, owner, deferred_rearm, fds, actors, receivers);
     const actor = &actors[input.slot];
     const receiver = &receivers[input.slot];
     if (input.slot != 0) return error.InvalidMessage;
@@ -764,16 +801,25 @@ fn serverMultiHandshake(
         descriptor_flags & linux.FD_CLOEXEC != 0;
     _ = linux.close(received_fd);
     if (!valid_fd) return error.InvalidMessage;
-    try finishMultiInput(ring, fds[0], actor, receiver, input.received);
+    try finishMultiInput(
+        ring,
+        owner,
+        deferred_rearm,
+        fds[0],
+        actor,
+        receiver,
+        input.received,
+    );
     try Benchmark.encodeEvent(&actor.transmit, object_id, .{
         .pong = .{ .sequence = 0 },
     });
-    try flushMultiActorSend(ring, owner, 0, actors, receivers, fds);
+    try flushMultiActorSend(ring, owner, deferred_rearm, 0, actors, receivers, fds);
 }
 
 fn serverMultiPhase(
     ring: *linux.IoUring,
     owner: *IoReactor,
+    deferred_rearm: bool,
     fds: []const c.fd_t,
     actors: []connection.Actor,
     receivers: []MultishotReceiver,
@@ -785,7 +831,7 @@ fn serverMultiPhase(
     @memset(counts, 0);
     var completed: usize = 0;
     while (completed < actors.len) {
-        const input = try nextMultiInput(ring, owner, fds, actors, receivers);
+        const input = try nextMultiInput(ring, owner, deferred_rearm, fds, actors, receivers);
         const actor = &actors[input.slot];
         const receiver = &receivers[input.slot];
         _ = try actor.ingestControl(input.received.control);
@@ -802,7 +848,15 @@ fn serverMultiPhase(
             &payload,
             &context,
         );
-        try finishMultiInput(ring, fds[input.slot], actor, receiver, input.received);
+        try finishMultiInput(
+            ring,
+            owner,
+            deferred_rearm,
+            fds[input.slot],
+            actor,
+            receiver,
+            input.received,
+        );
     }
 
     for (actors) |*actor| try Benchmark.encodeEvent(&actor.transmit, object_id, .{
@@ -811,6 +865,7 @@ fn serverMultiPhase(
     for (fds, 0..) |_, index| try flushMultiActorSend(
         ring,
         owner,
+        deferred_rearm,
         index,
         actors,
         receivers,
@@ -892,10 +947,16 @@ fn stopMulti(
 
 fn serverMulti(fds: []const c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
-    const receive_buffer_count = try std.math.ceilPowerOfTwo(
-        u16,
-        @intCast(@max(recv_buffer_count, options.connections)),
-    );
+    const receive_pressure = options.mode == .rx_pressure_immediate or
+        options.mode == .rx_pressure_deferred;
+    const deferred_rearm = options.mode == .rx_pressure_deferred;
+    const receive_buffer_count: u16 = if (receive_pressure)
+        2
+    else
+        try std.math.ceilPowerOfTwo(
+            u16,
+            @intCast(@max(recv_buffer_count, options.connections)),
+        );
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = multi_ring_entries }, .{
         .max_connections = options.connections,
@@ -947,11 +1008,20 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
     }
     _ = try ring.submit();
 
-    try serverMultiHandshake(ring, &owner, fds, actors, receivers, namespaces);
+    try serverMultiHandshake(
+        ring,
+        &owner,
+        deferred_rearm,
+        fds,
+        actors,
+        receivers,
+        namespaces,
+    );
     if (options.mode == .latency) {
         for (0..options.warmup) |round| try serverMultiPhase(
             ring,
             &owner,
+            deferred_rearm,
             fds,
             actors,
             receivers,
@@ -963,6 +1033,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         for (0..options.messages) |round| try serverMultiPhase(
             ring,
             &owner,
+            deferred_rearm,
             fds,
             actors,
             receivers,
@@ -972,8 +1043,30 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             @intCast(options.warmup + round + 1),
         );
     } else {
-        try serverMultiPhase(ring, &owner, fds, actors, receivers, namespaces, counts, options.warmup, 1);
-        try serverMultiPhase(ring, &owner, fds, actors, receivers, namespaces, counts, options.messages, 2);
+        try serverMultiPhase(
+            ring,
+            &owner,
+            deferred_rearm,
+            fds,
+            actors,
+            receivers,
+            namespaces,
+            counts,
+            options.warmup,
+            1,
+        );
+        try serverMultiPhase(
+            ring,
+            &owner,
+            deferred_rearm,
+            fds,
+            actors,
+            receivers,
+            namespaces,
+            counts,
+            options.messages,
+            2,
+        );
     }
 
     try stopMulti(ring, slots, actors, receivers);
@@ -1222,15 +1315,34 @@ fn multiMain(options: Options) !u8 {
         try sendMultiPhase(allocator, &ring, parent_fds, options.messages, options.batch, 2);
         const elapsed = try monotonicNs() - start;
         const total_messages = try std.math.mul(u64, options.messages, options.connections);
-        if (options.mode != .idle) _ = c.printf(
-            "backend=wayring-multishot connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
-            options.connections,
-            total_messages,
-            options.batch,
-            elapsed,
-            @as(f64, @floatFromInt(total_messages)) * @as(f64, std.time.ns_per_s) /
-                @as(f64, @floatFromInt(elapsed)),
-        );
+        if (options.mode != .idle) {
+            const throughput = @as(f64, @floatFromInt(total_messages)) *
+                @as(f64, std.time.ns_per_s) / @as(f64, @floatFromInt(elapsed));
+            if (options.mode == .rx_pressure_immediate or
+                options.mode == .rx_pressure_deferred)
+            {
+                const rearm_name: [*:0]const u8 = if (options.mode == .rx_pressure_deferred)
+                    "deferred"
+                else
+                    "immediate";
+                _ = c.printf(
+                    "backend=wayring-multishot receive_rearm=%s connections=%zu buffers=2 messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                    rearm_name,
+                    options.connections,
+                    total_messages,
+                    options.batch,
+                    elapsed,
+                    throughput,
+                );
+            } else _ = c.printf(
+                "backend=wayring-multishot connections=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                options.connections,
+                total_messages,
+                options.batch,
+                elapsed,
+                throughput,
+            );
+        }
     }
     for (parent_fds) |fd| _ = c.close(fd);
 
@@ -1258,6 +1370,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .client_rx
         else if (std.mem.eql(u8, value, "idle"))
             options.mode = .idle
+        else if (std.mem.eql(u8, value, "rx-pressure-immediate"))
+            options.mode = .rx_pressure_immediate
+        else if (std.mem.eql(u8, value, "rx-pressure-deferred"))
+            options.mode = .rx_pressure_deferred
         else if (!std.mem.eql(u8, value, "round-trip"))
             return error.InvalidMessage;
     }
