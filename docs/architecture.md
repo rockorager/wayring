@@ -474,7 +474,9 @@ caller-provided storage. Generic keys may include a client identity when the
 pool spans clients. Generation-checked tokens let the hot commit path bypass
 key lookup without making stale storage references valid. Relationship
 visibility and position are double-buffered on the parent, while role-object
-destruction is immediate.
+destruction is immediate. Exact top-to-bottom child stacking includes the
+parent plane, validates sibling references, and latches restacks on parent
+commit without allocating.
 The graph implements the established synchronized-subtree behavior; exact
 version-7 per-content-update dependency edges, constraints, and release
 callbacks remain the next scheduler layer. The SHM interoperability server
