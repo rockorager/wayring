@@ -529,8 +529,17 @@ every advertised core or custom format. Pool creation and growth, positive
 dimensions, minimum row stride, conservative `stride * height` extent, and
 final offset are checked before publication with overflow-safe arithmetic. This
 bounded metadata layer is the prerequisite for shared mapping lifetime and
-SIGBUS-safe pixel access; those remain explicit rather than exposing an unsafe
-raw mapped slice prematurely.
+SIGBUS-safe pixel access. One compositor-wide bounded store allocates pool,
+buffer, and importer-pin slots at initialization. Pool resources, every child
+buffer, and active pins independently retain the mapping, so either protocol
+resource may be destroyed first. Generation-checked tokens reject stale slot
+reuse. Growth uses `mremap` immediately when idle and is deferred while pinned,
+preventing address movement beneath an importer. Shrink-sealed files whose
+length covers the complete mapping expose a zero-copy read-only slice; unsealed
+files deliberately return `UnsafeAccess` until the fault-safe access path is
+active rather than exposing a potentially fatal raw mapping. The real SHM
+libwayland-server interop path owns its received descriptor and resource
+lifetime through this store.
 
 ## Initial transport candidate
 

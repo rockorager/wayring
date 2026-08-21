@@ -1,6 +1,9 @@
-//! Bounded protocol-independent wl_shm metadata validation.
+//! Bounded protocol-independent wl_shm metadata and shared mapping ownership.
 
 const std = @import("std");
+const linux = std.os.linux;
+
+const none = std.math.maxInt(u32);
 
 pub const Error = error{
     InvalidConfig,
@@ -11,6 +14,17 @@ pub const Error = error{
     InvalidStride,
     OutOfBounds,
     SizeOverflow,
+};
+
+pub const StoreError = Error || std.mem.Allocator.Error || std.posix.MMapError ||
+    std.posix.MRemapError || error{
+    Exhausted,
+    StalePool,
+    StaleBuffer,
+    StalePin,
+    ResourceDestroyed,
+    ResizePending,
+    UnsafeAccess,
 };
 
 /// Compositor-supplied metadata for an advertised wl_shm format. Keeping the
@@ -101,6 +115,475 @@ pub fn createBuffer(
         .format = format,
         .extent = extent,
     };
+}
+
+pub const PoolToken = struct {
+    index: u32,
+    generation: u32,
+};
+
+pub const BufferToken = struct {
+    index: u32,
+    generation: u32,
+};
+
+const PoolNode = struct {
+    generation: u32 = 1,
+    next_free: u32 = none,
+    active: bool = false,
+    resource_alive: bool = false,
+    fd: linux.fd_t = -1,
+    mapping: []align(std.heap.page_size_min) u8 = undefined,
+    declared_size: usize = 0,
+    pending_size: usize = 0,
+    buffer_count: usize = 0,
+    pin_count: usize = 0,
+    sealed_direct: bool = false,
+};
+
+const BufferNode = struct {
+    generation: u32 = 1,
+    next_free: u32 = none,
+    active: bool = false,
+    pool: PoolToken = undefined,
+    metadata: Buffer = undefined,
+};
+
+const PinNode = struct {
+    generation: u32 = 1,
+    next_free: u32 = none,
+    active: bool = false,
+    pool: PoolToken = undefined,
+    metadata: Buffer = undefined,
+};
+
+const PinToken = struct {
+    index: u32,
+    generation: u32,
+};
+
+pub const PoolInfo = struct {
+    mapped_size: usize,
+    declared_size: usize,
+    pending_size: ?usize,
+    buffer_count: usize,
+    pin_count: usize,
+    resource_alive: bool,
+    sealed_direct: bool,
+};
+
+/// A compositor-wide bounded store. Protocol pool resources, child buffers,
+/// and importer pins hold independent references to one mapping. All slot
+/// storage is allocated once; resource creation performs only mmap work.
+pub const Store = struct {
+    limits: Limits,
+    pools: []PoolNode,
+    buffers: []BufferNode,
+    pins: []PinNode,
+    pool_free: u32,
+    buffer_free: u32,
+    pin_free: u32,
+    active_pools: usize = 0,
+    active_buffers: usize = 0,
+    active_pins: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        limits: Limits,
+        pool_capacity: usize,
+        buffer_capacity: usize,
+    ) StoreError!Store {
+        try limits.validate();
+        if (pool_capacity == 0 or buffer_capacity == 0 or
+            pool_capacity >= none or buffer_capacity >= none)
+            return error.InvalidConfig;
+        const pools = try allocator.alloc(PoolNode, pool_capacity);
+        errdefer allocator.free(pools);
+        const buffers = try allocator.alloc(BufferNode, buffer_capacity);
+        errdefer allocator.free(buffers);
+        const pins = try allocator.alloc(PinNode, buffer_capacity);
+        for (pools, 0..) |*node, index| node.* = .{
+            .next_free = if (index + 1 < pools.len) @intCast(index + 1) else none,
+        };
+        for (buffers, 0..) |*node, index| node.* = .{
+            .next_free = if (index + 1 < buffers.len) @intCast(index + 1) else none,
+        };
+        for (pins, 0..) |*node, index| node.* = .{
+            .next_free = if (index + 1 < pins.len) @intCast(index + 1) else none,
+        };
+        return .{
+            .limits = limits,
+            .pools = pools,
+            .buffers = buffers,
+            .pins = pins,
+            .pool_free = 0,
+            .buffer_free = 0,
+            .pin_free = 0,
+        };
+    }
+
+    pub fn deinit(store: *Store, allocator: std.mem.Allocator) void {
+        std.debug.assert(store.active_pools == 0);
+        std.debug.assert(store.active_buffers == 0);
+        std.debug.assert(store.active_pins == 0);
+        allocator.free(store.pins);
+        allocator.free(store.buffers);
+        allocator.free(store.pools);
+        store.* = undefined;
+    }
+
+    /// Takes ownership of `fd` on success. The descriptor remains open for
+    /// growth validation and closes with the final mapping reference.
+    pub fn addPool(store: *Store, fd: linux.fd_t, requested_size: i32) StoreError!PoolToken {
+        if (store.pool_free == none) return error.Exhausted;
+        const size = try createPool(store.limits, requested_size);
+        const mapping = try std.posix.mmap(
+            null,
+            size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        const index = store.pool_free;
+        const generation = store.pools[index].generation;
+        store.pool_free = store.pools[index].next_free;
+        store.pools[index] = .{
+            .generation = generation,
+            .active = true,
+            .resource_alive = true,
+            .fd = fd,
+            .mapping = mapping,
+            .declared_size = size,
+            .sealed_direct = fileCannotShrinkBelow(fd, size),
+        };
+        store.active_pools += 1;
+        return .{ .index = index, .generation = generation };
+    }
+
+    pub fn destroyPoolResource(store: *Store, token: PoolToken) StoreError!void {
+        const node = try store.resolvePool(token);
+        if (!node.resource_alive) return error.ResourceDestroyed;
+        node.resource_alive = false;
+        store.releasePoolIfUnused(token.index);
+    }
+
+    pub fn resize(store: *Store, token: PoolToken, requested_size: i32) StoreError!void {
+        const node = try store.resolvePool(token);
+        if (!node.resource_alive) return error.ResourceDestroyed;
+        const size = try resizePool(store.limits, node.declared_size, requested_size);
+        if (size == node.declared_size) return;
+        if (node.pin_count != 0) {
+            node.declared_size = size;
+            node.pending_size = size;
+            return;
+        }
+        const mapping = try remap(node.mapping, size);
+        node.mapping = mapping;
+        node.declared_size = size;
+        node.sealed_direct = fileCannotShrinkBelow(node.fd, size);
+    }
+
+    pub fn addBuffer(
+        store: *Store,
+        pool_token: PoolToken,
+        format: Format,
+        offset: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+    ) StoreError!BufferToken {
+        const pool = try store.resolvePool(pool_token);
+        if (!pool.resource_alive) return error.ResourceDestroyed;
+        if (store.buffer_free == none) return error.Exhausted;
+        const metadata = try createBuffer(
+            pool.declared_size,
+            format,
+            offset,
+            width,
+            height,
+            stride,
+        );
+        const index = store.buffer_free;
+        const generation = store.buffers[index].generation;
+        store.buffer_free = store.buffers[index].next_free;
+        store.buffers[index] = .{
+            .generation = generation,
+            .active = true,
+            .pool = pool_token,
+            .metadata = metadata,
+        };
+        pool.buffer_count += 1;
+        store.active_buffers += 1;
+        return .{ .index = index, .generation = generation };
+    }
+
+    pub fn destroyBuffer(store: *Store, token: BufferToken) StoreError!void {
+        const node = try store.resolveBuffer(token);
+        const pool_index = node.pool.index;
+        const pool = try store.resolvePool(node.pool);
+        pool.buffer_count -= 1;
+        node.active = false;
+        node.generation = nextGeneration(node.generation);
+        node.next_free = store.buffer_free;
+        store.buffer_free = token.index;
+        store.active_buffers -= 1;
+        store.releasePoolIfUnused(pool_index);
+    }
+
+    pub fn poolInfo(store: *Store, token: PoolToken) StoreError!PoolInfo {
+        const node = try store.resolvePool(token);
+        return .{
+            .mapped_size = node.mapping.len,
+            .declared_size = node.declared_size,
+            .pending_size = if (node.pending_size == 0) null else node.pending_size,
+            .buffer_count = node.buffer_count,
+            .pin_count = node.pin_count,
+            .resource_alive = node.resource_alive,
+            .sealed_direct = node.sealed_direct,
+        };
+    }
+
+    pub fn bufferInfo(store: *Store, token: BufferToken) StoreError!Buffer {
+        return (try store.resolveBuffer(token)).metadata;
+    }
+
+    pub const Pin = struct {
+        token: PinToken,
+    };
+
+    pub fn pin(store: *Store, token: BufferToken) StoreError!Pin {
+        const buffer = try store.resolveBuffer(token);
+        const pool = try store.resolvePool(buffer.pool);
+        if (pool.pending_size != 0) return error.ResizePending;
+        if (store.pin_free == none) return error.Exhausted;
+        const pin_index = store.pin_free;
+        const pin_generation = store.pins[pin_index].generation;
+        store.pin_free = store.pins[pin_index].next_free;
+        store.pins[pin_index] = .{
+            .generation = pin_generation,
+            .active = true,
+            .pool = buffer.pool,
+            .metadata = buffer.metadata,
+        };
+        pool.pin_count += 1;
+        store.active_pins += 1;
+        return .{
+            .token = .{ .index = pin_index, .generation = pin_generation },
+        };
+    }
+
+    /// Returns a zero-copy read-only slice only while this pin remains active
+    /// and file seals make truncation faults impossible for the full mapping.
+    pub fn bytes(store: *Store, pin_value: Pin) StoreError![]const u8 {
+        const pin_node = try store.resolvePin(pin_value.token);
+        const pool = try store.resolvePool(pin_node.pool);
+        if (!pool.sealed_direct) return error.UnsafeAccess;
+        return pool.mapping[pin_node.metadata.offset..pin_node.metadata.end()];
+    }
+
+    pub fn unpin(store: *Store, pin_value: Pin) StoreError!void {
+        const pin_node = try store.resolvePin(pin_value.token);
+        const pool_token = pin_node.pool;
+        const pool_index = pool_token.index;
+        const pool = try store.resolvePool(pool_token);
+        pin_node.active = false;
+        pin_node.generation = nextGeneration(pin_node.generation);
+        pin_node.next_free = store.pin_free;
+        store.pin_free = pin_value.token.index;
+        store.active_pins -= 1;
+        pool.pin_count -= 1;
+        if (pool.pin_count == 0 and pool.pending_size != 0) {
+            const size = pool.pending_size;
+            const mapping = remap(pool.mapping, size) catch |err| {
+                store.releasePoolIfUnused(pool_index);
+                return err;
+            };
+            pool.mapping = mapping;
+            pool.pending_size = 0;
+            pool.sealed_direct = fileCannotShrinkBelow(pool.fd, size);
+        }
+        store.releasePoolIfUnused(pool_index);
+    }
+
+    fn resolvePool(store: *Store, token: PoolToken) StoreError!*PoolNode {
+        if (token.index >= store.pools.len) return error.StalePool;
+        const node = &store.pools[token.index];
+        if (!node.active or node.generation != token.generation) return error.StalePool;
+        return node;
+    }
+
+    fn resolveBuffer(store: *Store, token: BufferToken) StoreError!*BufferNode {
+        if (token.index >= store.buffers.len) return error.StaleBuffer;
+        const node = &store.buffers[token.index];
+        if (!node.active or node.generation != token.generation) return error.StaleBuffer;
+        return node;
+    }
+
+    fn resolvePin(store: *Store, token: PinToken) StoreError!*PinNode {
+        if (token.index >= store.pins.len) return error.StalePin;
+        const node = &store.pins[token.index];
+        if (!node.active or node.generation != token.generation) return error.StalePin;
+        return node;
+    }
+
+    fn releasePoolIfUnused(store: *Store, index: u32) void {
+        const node = &store.pools[index];
+        if (node.resource_alive or node.buffer_count != 0 or node.pin_count != 0) return;
+        std.posix.munmap(node.mapping);
+        _ = linux.close(node.fd);
+        node.active = false;
+        node.generation = nextGeneration(node.generation);
+        node.next_free = store.pool_free;
+        store.pool_free = index;
+        store.active_pools -= 1;
+    }
+};
+
+fn remap(
+    mapping: []align(std.heap.page_size_min) u8,
+    size: usize,
+) std.posix.MRemapError![]align(std.heap.page_size_min) u8 {
+    return std.posix.mremap(mapping.ptr, mapping.len, size, .{ .MAYMOVE = true }, null);
+}
+
+fn fileCannotShrinkBelow(fd: linux.fd_t, size: usize) bool {
+    const seals_result = linux.fcntl(fd, linux.F.GET_SEALS, 0);
+    if (linux.errno(seals_result) != .SUCCESS or
+        seals_result & linux.F.SEAL_SHRINK == 0)
+        return false;
+    var stat: linux.Statx = undefined;
+    const stat_result = linux.statx(
+        fd,
+        "",
+        linux.AT.EMPTY_PATH | linux.AT.STATX_DONT_SYNC,
+        .{ .SIZE = true },
+        &stat,
+    );
+    return linux.errno(stat_result) == .SUCCESS and stat.mask.SIZE and stat.size >= size;
+}
+
+fn nextGeneration(generation: u32) u32 {
+    const next = generation +% 1;
+    return if (next == 0) 1 else next;
+}
+
+test "shared mappings outlive resources and defer growth while pinned" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .max_pool_bytes = 8192 },
+        1,
+        2,
+    );
+    defer store.deinit(std.testing.allocator);
+    const fd = try testMemfd(8192, true);
+    const pool = try store.addPool(fd, 4096);
+    const first = try store.addBuffer(
+        pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        0,
+        2,
+        2,
+        8,
+    );
+    const pin_value = try store.pin(first);
+    try std.testing.expectEqual(@as(usize, 16), (try store.bytes(pin_value)).len);
+
+    try store.resize(pool, 8192);
+    const deferred = try store.poolInfo(pool);
+    try std.testing.expectEqual(@as(usize, 4096), deferred.mapped_size);
+    try std.testing.expectEqual(@as(usize, 8192), deferred.declared_size);
+    try std.testing.expectEqual(@as(?usize, 8192), deferred.pending_size);
+    try std.testing.expectError(error.ResizePending, store.pin(first));
+    try store.unpin(pin_value);
+    const grown = try store.poolInfo(pool);
+    try std.testing.expectEqual(@as(usize, 8192), grown.mapped_size);
+    try std.testing.expectEqual(@as(?usize, null), grown.pending_size);
+    try std.testing.expect(grown.sealed_direct);
+
+    const second = try store.addBuffer(
+        pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        4096,
+        2,
+        2,
+        8,
+    );
+    try store.destroyPoolResource(pool);
+    try std.testing.expect(!(try store.poolInfo(pool)).resource_alive);
+    try std.testing.expectError(error.ResourceDestroyed, store.addBuffer(
+        pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        0,
+        1,
+        1,
+        4,
+    ));
+    try store.destroyBuffer(first);
+    try store.destroyBuffer(second);
+    try std.testing.expectError(error.StalePool, store.poolInfo(pool));
+    try std.testing.expectError(error.StaleBuffer, store.bufferInfo(first));
+
+    const replacement_pool = try store.addPool(try testMemfd(4096, true), 4096);
+    try std.testing.expectEqual(pool.index, replacement_pool.index);
+    try std.testing.expect(pool.generation != replacement_pool.generation);
+    const replacement_buffer = try store.addBuffer(
+        replacement_pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        0,
+        1,
+        1,
+        4,
+    );
+    try std.testing.expectEqual(second.index, replacement_buffer.index);
+    try std.testing.expect(second.generation != replacement_buffer.generation);
+    try store.destroyBuffer(replacement_buffer);
+    try store.destroyPoolResource(replacement_pool);
+}
+
+test "pins retain destroyed unsealed pools without exposing raw bytes" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .max_pool_bytes = 4096 },
+        1,
+        1,
+    );
+    defer store.deinit(std.testing.allocator);
+    const pool = try store.addPool(try testMemfd(4096, false), 4096);
+    const buffer = try store.addBuffer(
+        pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        0,
+        1,
+        1,
+        4,
+    );
+    const pin_value = try store.pin(buffer);
+    try std.testing.expectError(error.UnsafeAccess, store.bytes(pin_value));
+    try store.destroyPoolResource(pool);
+    try store.destroyBuffer(buffer);
+    try std.testing.expectEqual(@as(usize, 1), store.active_pools);
+    try store.unpin(pin_value);
+    try std.testing.expectEqual(@as(usize, 0), store.active_pools);
+    try std.testing.expectError(error.StalePool, store.poolInfo(pool));
+    try std.testing.expectError(error.StalePin, store.unpin(pin_value));
+}
+
+fn testMemfd(size: usize, sealed: bool) !linux.fd_t {
+    const flags: u32 = linux.MFD.CLOEXEC |
+        if (sealed) @as(u32, linux.MFD.ALLOW_SEALING) else 0;
+    const result = linux.memfd_create("wayring-shm-test", flags);
+    if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+    const fd: linux.fd_t = @intCast(result);
+    errdefer _ = linux.close(fd);
+    if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS)
+        return error.SystemCallFailed;
+    if (sealed and linux.errno(linux.fcntl(
+        fd,
+        linux.F.ADD_SEALS,
+        linux.F.SEAL_SHRINK,
+    )) != .SUCCESS) return error.SystemCallFailed;
+    return fd;
 }
 
 test "pool creation and growth enforce configured bounds" {

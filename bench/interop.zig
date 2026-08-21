@@ -557,6 +557,13 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
     defer InteropCommitState.deinitQueue(&commit_queue);
     var subsurface_graph = try InteropSubsurfaceGraph.init(allocator, 4, 4);
     defer subsurface_graph.deinit(allocator);
+    var shm_store = try wayring.shm.Store.init(
+        allocator,
+        .{ .max_pool_bytes = 4096 },
+        1,
+        1,
+    );
+    defer shm_store.deinit(allocator);
     var handler: ProtocolServerHandler = .{
         .kind = kind,
         .runtime = &runtime,
@@ -570,6 +577,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .commit_scheduler = &commit_scheduler,
         .commit_queue = &commit_queue,
         .subsurface_graph = &subsurface_graph,
+        .shm_store = &shm_store,
     };
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
@@ -730,7 +738,8 @@ const ProtocolServerHandler = struct {
     ponged: bool = false,
     configured: bool = false,
     pool_created: bool = false,
-    shm_pool_size: usize = 0,
+    shm_pool: ?wayring.shm.PoolToken = null,
+    shm_buffer: ?wayring.shm.BufferToken = null,
     buffer_created: bool = false,
     buffer_destroyed: bool = false,
     pool_destroyed: bool = false,
@@ -758,6 +767,7 @@ const ProtocolServerHandler = struct {
     commit_scheduler: *InteropCommitState.Scheduler,
     commit_queue: *InteropCommitState.Scheduler.Queue,
     subsurface_graph: *InteropSubsurfaceGraph,
+    shm_store: *wayring.shm.Store,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1687,20 +1697,23 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .create_pool => |value| {
-                    defer _ = linux.close(value.fd);
                     const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
-                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0)
+                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0) {
+                        _ = linux.close(value.fd);
                         return error.InvalidShmPool;
-                    handler.shm_pool_size = try wayring.shm.createPool(
-                        .{ .max_pool_bytes = 4096 },
-                        value.size,
-                    );
+                    }
+                    const pool = handler.shm_store.addPool(value.fd, value.size) catch |err| {
+                        _ = linux.close(value.fd);
+                        return err;
+                    };
+                    errdefer handler.shm_store.destroyPoolResource(pool) catch {};
                     _ = try standard_protocol.wl_shm.admit_create_pool(
                         handler.objects,
                         decoded.handle,
                         value,
                         .{},
                     );
+                    handler.shm_pool = pool;
                     handler.pool_created = true;
                 },
                 .release => return error.UnexpectedRequest,
@@ -1715,14 +1728,16 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .create_buffer => |value| {
-                    const metadata = try wayring.shm.createBuffer(
-                        handler.shm_pool_size,
+                    const buffer_token = try handler.shm_store.addBuffer(
+                        handler.shm_pool orelse return error.InvalidShmPool,
                         .{ .value = value.format.value, .bytes_per_pixel = 4 },
                         value.offset,
                         value.width,
                         value.height,
                         value.stride,
                     );
+                    errdefer handler.shm_store.destroyBuffer(buffer_token) catch {};
+                    const metadata = try handler.shm_store.bufferInfo(buffer_token);
                     if (metadata.offset != 0 or metadata.width != 2 or
                         metadata.height != 2 or metadata.stride != 8 or
                         metadata.format.value != standard_protocol.wl_shm.format.argb8888.value)
@@ -1734,10 +1749,21 @@ const ProtocolServerHandler = struct {
                         .{},
                     )).id;
                     handler.buffer = buffer;
+                    handler.shm_buffer = buffer_token;
                     handler.buffer_created = true;
                 },
-                .destroy => handler.pool_destroyed = handler.buffer_destroyed,
-                .resize => return error.UnexpectedRequest,
+                .destroy => {
+                    try handler.shm_store.destroyPoolResource(
+                        handler.shm_pool orelse return error.InvalidShmPool,
+                    );
+                    handler.pool_destroyed = handler.buffer_destroyed;
+                },
+                .resize => |value| {
+                    try handler.shm_store.resize(
+                        handler.shm_pool orelse return error.InvalidShmPool,
+                        value.size,
+                    );
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_buffer.info) {
@@ -1749,6 +1775,9 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
+                    try handler.shm_store.destroyBuffer(
+                        handler.shm_buffer orelse return error.InvalidShmBuffer,
+                    );
                     handler.buffer_destroyed = true;
                     handler.buffer_destroyed_count += 1;
                 },
@@ -1952,12 +1981,15 @@ const ProtocolServerHandler = struct {
                     if (handler.kind != .shm or value.buffer == null or
                         value.buffer.? != handler.buffer.?.id or value.x != 0 or value.y != 0)
                         return error.InvalidSurface;
+                    const metadata = try handler.shm_store.bufferInfo(
+                        handler.shm_buffer orelse return error.InvalidShmBuffer,
+                    );
                     try handler.surface_state.attach(
                         target.object.version,
                         .{
                             .handle = handler.buffer.?,
-                            .width = 2,
-                            .height = 2,
+                            .width = metadata.width,
+                            .height = metadata.height,
                         },
                         value.x,
                         value.y,
