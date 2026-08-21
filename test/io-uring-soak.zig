@@ -338,3 +338,241 @@ fn expectSuccess(result: usize) !void {
     const errno = linux.errno(result);
     if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
 }
+
+const backpressure_connections = 4;
+const backpressure_block_size = 64 * 1024;
+const backpressure_bytes = 4 * backpressure_block_size;
+
+const BackpressureState = struct {
+    peer: wayring.io_uring.Peer,
+    remote: linux.fd_t,
+    pattern: u8,
+    in_flight: usize = 0,
+    sent: usize = 0,
+    received: usize = 0,
+    received_fds: usize = 0,
+};
+
+test "real io_uring sends resume after forced kernel backpressure" {
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(std.testing.allocator, .{ .entries = 32 }, .{
+        .max_connections = backpressure_connections + 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = backpressure_block_size,
+        .transmit_block_count = backpressure_connections * 4,
+        .descriptor_count = backpressure_connections,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(std.testing.allocator);
+    const actor_config: wayring.io_uring.ActorConfig = .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = backpressure_bytes,
+        .transmit_fd_budget = 1,
+    };
+    var states: [backpressure_connections]BackpressureState = undefined;
+    var payload: [backpressure_block_size]u8 = undefined;
+
+    for (&states, 0..) |*state, index| {
+        var sockets: [2]linux.fd_t = undefined;
+        try expectSuccess(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            0,
+            &sockets,
+        ));
+        try setSendBuffer(sockets[0], 4096);
+        state.* = .{
+            .peer = try reactor.attach(sockets[0], actor_config),
+            .remote = sockets[1],
+            .pattern = @intCast(index + 1),
+        };
+        @memset(&payload, state.pattern);
+        const actor = try reactor.getActor(state.peer);
+        const descriptor = try createDescriptor();
+        try actor.enqueue(&payload, &.{descriptor});
+        for (1..4) |_| try actor.enqueue(&payload, &.{});
+    }
+    try std.testing.expectEqual(@as(usize, 0), reactor.transmit_blocks.available());
+
+    var pressure_sockets: [2]linux.fd_t = undefined;
+    try expectSuccess(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &pressure_sockets,
+    ));
+    const pressure_peer = try reactor.attach(pressure_sockets[0], actor_config);
+    const pressure_actor = try reactor.getActor(pressure_peer);
+    try std.testing.expectError(error.Exhausted, pressure_actor.enqueue("x", &.{}));
+
+    for (&states) |*state| try prepareBackpressureSend(&reactor, state);
+    _ = try reactor.ring.submit();
+    var received_pool = try wayring.pool.SharedFds.init(
+        std.testing.allocator,
+        backpressure_connections,
+    );
+    defer received_pool.deinit(std.testing.allocator);
+    var saw_partial = false;
+
+    while (true) {
+        var pending: usize = 0;
+        for (states) |state| if (state.in_flight != 0) {
+            pending += 1;
+        };
+        if (pending == 0) break;
+        while (pending != 0) {
+            const completion = try reactor.ring.copy_cqe();
+            const routed = (reactor.route(null, completion) orelse
+                return error.InvalidCompletion).connection;
+            if (routed.operation != .send) return error.UnexpectedCompletion;
+            const peer = reactor.routedPeer(routed);
+            const state = findBackpressureState(&states, peer) orelse
+                return error.UnknownPeer;
+            const submitted = state.in_flight;
+            const event = try (try reactor.getActor(peer)).completeRouted(.send, completion);
+            if (event.sent.length < submitted) saw_partial = true;
+            state.sent += event.sent.length;
+            state.in_flight = 0;
+            pending -= 1;
+        }
+        for (&states) |*state| try drainBackpressure(state, &received_pool);
+        var prepared = false;
+        for (&states) |*state| {
+            if (state.sent < backpressure_bytes) {
+                try prepareBackpressureSend(&reactor, state);
+                prepared = true;
+            }
+        }
+        if (prepared) _ = try reactor.ring.submit();
+    }
+
+    try std.testing.expect(saw_partial);
+    for (&states) |*state| {
+        try drainBackpressure(state, &received_pool);
+        try std.testing.expectEqual(backpressure_bytes, state.sent);
+        try std.testing.expectEqual(backpressure_bytes, state.received);
+        try std.testing.expectEqual(@as(usize, 1), state.received_fds);
+    }
+    try std.testing.expectEqual(
+        @as(usize, backpressure_connections * 4),
+        reactor.transmit_blocks.available(),
+    );
+    try pressure_actor.enqueue("recovered", &.{});
+    var pressure_state: BackpressureState = .{
+        .peer = pressure_peer,
+        .remote = pressure_sockets[1],
+        .pattern = 0,
+    };
+    try prepareBackpressureSend(&reactor, &pressure_state);
+    _ = try reactor.ring.submit_and_wait(1);
+    const pressure_completion = try reactor.ring.copy_cqe();
+    const pressure_routed = (reactor.route(null, pressure_completion) orelse
+        return error.InvalidCompletion).connection;
+    if (pressure_routed.operation != .send) return error.UnexpectedCompletion;
+    const completed_pressure_peer = reactor.routedPeer(pressure_routed);
+    try std.testing.expectEqual(pressure_peer.slot, completed_pressure_peer.slot);
+    try std.testing.expectEqual(pressure_peer.generation, completed_pressure_peer.generation);
+    const pressure_event = try pressure_actor.completeRouted(
+        pressure_routed.operation,
+        pressure_completion,
+    );
+    try std.testing.expectEqual(@as(usize, "recovered".len), pressure_event.sent.length);
+    var recovered: ["recovered".len]u8 = undefined;
+    try std.testing.expectEqual(
+        recovered.len,
+        try syscallLength(linux.read(pressure_sockets[1], &recovered, recovered.len)),
+    );
+    try std.testing.expectEqualSlices(u8, "recovered", &recovered);
+
+    for (states) |state| {
+        try reactor.destroyPeer(state.peer);
+        _ = linux.close(state.remote);
+    }
+    try reactor.destroyPeer(pressure_peer);
+    _ = linux.close(pressure_sockets[1]);
+    try std.testing.expectEqual(@as(usize, 0), reactor.slots.active_count);
+    try std.testing.expectEqual(
+        @as(usize, backpressure_connections * 4),
+        reactor.transmit_blocks.available(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, backpressure_connections),
+        reactor.descriptors.available(),
+    );
+}
+
+fn prepareBackpressureSend(
+    reactor: *wayring.io_uring.Reactor,
+    state: *BackpressureState,
+) !void {
+    const actor = try reactor.getActor(state.peer);
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try actor.transmit.snapshot(&descriptor_scratch, &control);
+    state.in_flight = snapshot.byteCount();
+    try reactor.prepareSend(state.peer);
+}
+
+fn findBackpressureState(
+    states: []BackpressureState,
+    peer: wayring.io_uring.Peer,
+) ?*BackpressureState {
+    for (states) |*state| {
+        if (state.peer.slot == peer.slot and state.peer.generation == peer.generation)
+            return state;
+    }
+    return null;
+}
+
+fn drainBackpressure(
+    state: *BackpressureState,
+    received_pool: *wayring.pool.SharedFds,
+) !void {
+    var queue = wayring.ancillary.FdQueue.init(received_pool, 1);
+    defer queue.deinit();
+    var bytes: [16 * 1024]u8 = undefined;
+    while (state.received < state.sent) {
+        const wanted = @min(bytes.len, state.sent - state.received);
+        var iov: std.posix.iovec = .{ .base = &bytes, .len = wanted };
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        var message: linux.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = &control,
+            .controllen = control.len,
+            .flags = 0,
+        };
+        const count = try syscallLength(linux.recvmsg(
+            state.remote,
+            &message,
+            linux.MSG.CMSG_CLOEXEC,
+        ));
+        if (count == 0) return error.UnexpectedEof;
+        if (message.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC) != 0)
+            return error.TruncatedMessage;
+        for (bytes[0..count]) |byte| try std.testing.expectEqual(state.pattern, byte);
+        _ = try wayring.ancillary.enqueueRights(control[0..message.controllen], &queue);
+        while (queue.pop()) |fd| {
+            try expectCloseOnExec(fd);
+            _ = linux.close(fd);
+            state.received_fds += 1;
+        } else |err| if (err != error.Empty) return err;
+        state.received += count;
+    }
+}
+
+fn setSendBuffer(fd: linux.fd_t, size: i32) !void {
+    try expectSuccess(linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.SNDBUF,
+        std.mem.asBytes(&size).ptr,
+        @sizeOf(i32),
+    ));
+}
