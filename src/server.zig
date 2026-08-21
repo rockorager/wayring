@@ -393,6 +393,32 @@ pub fn Core(comptime protocol: type) type {
             return result;
         }
 
+        /// Reactor-aware selected-buffer dispatch. In addition to returning the
+        /// buffer exactly once, this records receive-buffer progress for the
+        /// deferred rearm scheduler.
+        pub inline fn receivedRequestsReactor(
+            actor: *connection.Actor,
+            namespace: anytype,
+            reactor: *io_uring.Reactor,
+            peer: io_uring.Peer,
+            completion: std.os.linux.io_uring_cqe,
+            context: anytype,
+        ) !RequestResult {
+            const receiver = try reactor.getReceiver(peer);
+            const received = receiver.decodeCompletion(completion) catch |cause| {
+                reactor.noteReceiveBufferReturned(completion);
+                return terminalRequest(actor, 0, null, cause);
+            };
+            _ = actor.ingestControl(received.control) catch |cause| {
+                reactor.releaseReceived(peer, received) catch {};
+                return terminalRequest(actor, 0, null, cause);
+            };
+            var payload = received.payload;
+            const result = dispatchRequests(actor, namespace, &payload, context);
+            try reactor.releaseReceived(peer, received);
+            return result;
+        }
+
         fn terminalRequest(
             actor: *connection.Actor,
             dispatched: usize,
@@ -1450,6 +1476,260 @@ pub fn Runtime(comptime protocol: type) type {
             runtime.clients.deinit(allocator);
             runtime.endpoint.deinit() catch unreachable;
             runtime.* = undefined;
+        }
+    };
+}
+
+/// Allocation-free completion driver for a server `Runtime`. Initialization
+/// allocates one intrusive pending-work node per reactor connection slot; CQE
+/// processing and request dispatch allocate nothing. Ring submission remains
+/// explicit so owned- and borrowed-ring users share the same batching policy.
+pub fn Driver(comptime protocol: type) type {
+    return struct {
+        const Self = @This();
+        const ServerRuntime = Runtime(protocol);
+        const ProtocolCore = Core(protocol);
+        const queue_end = std.math.maxInt(u32);
+        const queue_none = queue_end - 1;
+
+        const Pending = struct {
+            generation: u32 = 0,
+            next: u32 = queue_none,
+        };
+
+        runtime: *ServerRuntime,
+        pending_storage: []Pending,
+        pending_head: u32 = queue_end,
+        pending_tail: u32 = queue_end,
+        display_context: ?*anyopaque,
+
+        pub const Progress = struct {
+            completions: usize = 0,
+            accepted: usize = 0,
+            requests: usize = 0,
+            protocol_errors: usize = 0,
+            destroyed: usize = 0,
+            prepared: usize = 0,
+            pending: bool = false,
+
+            fn merge(progress: *Progress, other: Progress) void {
+                progress.completions += other.completions;
+                progress.accepted += other.accepted;
+                progress.requests += other.requests;
+                progress.protocol_errors += other.protocol_errors;
+                progress.destroyed += other.destroyed;
+                progress.prepared += other.prepared;
+                progress.pending = other.pending;
+            }
+        };
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            runtime: *ServerRuntime,
+            display_context: ?*anyopaque,
+        ) !Self {
+            const storage = try allocator.alloc(Pending, runtime.clients.reactor.actor_storage.len);
+            @memset(storage, .{});
+            return .{
+                .runtime = runtime,
+                .pending_storage = storage,
+                .display_context = display_context,
+            };
+        }
+
+        pub fn deinit(driver: *Self, allocator: std.mem.Allocator) void {
+            std.debug.assert(driver.pending_head == queue_end);
+            std.debug.assert(driver.pending_tail == queue_end);
+            allocator.free(driver.pending_storage);
+            driver.* = undefined;
+        }
+
+        /// Marks a peer whose queued output or closing state should be prepared
+        /// during the next batch. Repeated scheduling occupies one FIFO node.
+        pub fn schedule(driver: *Self, peer: io_uring.Peer) !bool {
+            _ = try driver.runtime.clients.get(peer);
+            const node = &driver.pending_storage[peer.slot];
+            if (node.next != queue_none) {
+                if (node.generation != peer.generation) return error.StaleHandle;
+                return false;
+            }
+            node.* = .{ .generation = peer.generation, .next = queue_end };
+            if (driver.pending_tail == queue_end) {
+                driver.pending_head = peer.slot;
+            } else {
+                driver.pending_storage[driver.pending_tail].next = peer.slot;
+            }
+            driver.pending_tail = peer.slot;
+            return true;
+        }
+
+        /// Processes Wayring CQEs and prepares all resulting socket work without
+        /// submitting the ring. On a borrowed ring, filter unrelated CQEs before
+        /// passing the batch. Call `prepare` again after submission while
+        /// `Progress.pending` is true.
+        pub fn dispatch(
+            driver: *Self,
+            completions: []const std.os.linux.io_uring_cqe,
+            handler: anytype,
+        ) !Progress {
+            var progress: Progress = .{};
+            for (completions) |completion| {
+                try driver.complete(completion, handler, &progress);
+                progress.completions += 1;
+            }
+            progress.merge(try driver.prepare(handler));
+            return progress;
+        }
+
+        /// Prepares queued sends, close cancellation, destruction, and deferred
+        /// receives until the SQ fills or no work remains. This never submits.
+        pub fn prepare(driver: *Self, handler: anytype) !Progress {
+            var progress: Progress = .{};
+            const reactor = driver.runtime.clients.reactor;
+            while (driver.pending_head != queue_end) {
+                const slot = driver.pending_head;
+                const node = &driver.pending_storage[slot];
+                const peer: io_uring.Peer = .{
+                    .slot = @intCast(slot),
+                    .generation = node.generation,
+                };
+                const actor = reactor.getActor(peer) catch {
+                    driver.popPending();
+                    continue;
+                };
+
+                if (actor.lifecycle == .closing and actor.canDeinit()) {
+                    driver.popPending();
+                    if (@hasDecl(@TypeOf(handler.*), "disconnected"))
+                        handler.disconnected(peer);
+                    try driver.runtime.destroyClient(peer);
+                    progress.destroyed += 1;
+                    continue;
+                }
+
+                if (actor.lifecycle == .closing) {
+                    if (!actor.cancel_requested) {
+                        const queued = reactor.prepareClose(peer) catch |err| {
+                            if (err == error.SubmissionQueueFull) break;
+                            return err;
+                        };
+                        if (queued) progress.prepared += 1;
+                    }
+                    driver.popPending();
+                    continue;
+                }
+
+                if (actor.transmit.queuedBytes() != 0 and
+                    !actor.transmit.sendActive())
+                {
+                    reactor.prepareSend(peer) catch |err| {
+                        if (err == error.SubmissionQueueFull) break;
+                        return err;
+                    };
+                    progress.prepared += 1;
+                }
+                driver.popPending();
+            }
+
+            progress.prepared += try reactor.prepareDeferredReceives();
+            progress.pending = driver.pending_head != queue_end or
+                reactor.deferredReceivesPending();
+            return progress;
+        }
+
+        fn complete(
+            driver: *Self,
+            completion: std.os.linux.io_uring_cqe,
+            handler: anytype,
+            progress: *Progress,
+        ) !void {
+            const reactor = driver.runtime.clients.reactor;
+            switch (reactor.route(&driver.runtime.endpoint.listener, completion) orelse
+                return error.InvalidCompletion) {
+                .listener => {
+                    if (try driver.runtime.completeListener(
+                        completion,
+                        driver.display_context,
+                    )) |peer| {
+                        progress.accepted += 1;
+                        progress.prepared += 1;
+                        if (@hasDecl(@TypeOf(handler.*), "connected"))
+                            handler.connected(peer);
+                        _ = try driver.schedule(peer);
+                    }
+                },
+                .connection => |routed| {
+                    const peer = reactor.routedPeer(routed);
+                    const actor = try reactor.getActor(peer);
+                    const event = actor.completeRouted(routed.operation, completion) catch |err| {
+                        if (err == error.IoFailure and actor.lifecycle == .closing) {
+                            _ = try driver.schedule(peer);
+                            return;
+                        }
+                        return err;
+                    };
+                    switch (event) {
+                        .received => {
+                            var context = RequestContext(@TypeOf(handler)){
+                                .handler = handler,
+                                .peer = peer,
+                            };
+                            const result = try ProtocolCore.receivedRequestsReactor(
+                                actor,
+                                &(try driver.runtime.clients.get(peer)).namespace,
+                                reactor,
+                                peer,
+                                completion,
+                                &context,
+                            );
+                            switch (result) {
+                                .dispatched => |count| progress.requests += count,
+                                .terminal => |failure| {
+                                    progress.requests += failure.dispatched;
+                                    if (failure.cause != error.Disconnected) {
+                                        progress.protocol_errors += 1;
+                                        if (@hasDecl(@TypeOf(handler.*), "protocolError"))
+                                            handler.protocolError(peer, failure);
+                                    }
+                                },
+                            }
+                            if (actor.lifecycle == .open and !actor.receive_active)
+                                _ = try reactor.deferReceive(peer);
+                            _ = try driver.schedule(peer);
+                        },
+                        .sent, .disconnected, .receive_stopped, .send_stopped, .cancel_complete => _ = try driver.schedule(peer),
+                        .buffers_exhausted => {
+                            if (actor.lifecycle == .open)
+                                _ = try reactor.deferReceive(peer);
+                            _ = try driver.schedule(peer);
+                        },
+                    }
+                },
+            }
+        }
+
+        fn popPending(driver: *Self) void {
+            const slot = driver.pending_head;
+            const node = &driver.pending_storage[slot];
+            driver.pending_head = node.next;
+            if (driver.pending_head == queue_end) driver.pending_tail = queue_end;
+            node.* = .{};
+        }
+
+        fn RequestContext(comptime Handler: type) type {
+            return struct {
+                handler: Handler,
+                peer: io_uring.Peer,
+
+                pub fn request(
+                    context: *@This(),
+                    target: objects.Dispatch,
+                    message: wire.Message,
+                    fds: *ancillary.FdQueue,
+                ) !@import("dispatch.zig").Control {
+                    return context.handler.request(context.peer, target, message, fds);
+                }
+            };
         }
     };
 }

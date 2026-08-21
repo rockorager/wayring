@@ -377,7 +377,15 @@ pub const Reactor = struct {
     ) !void {
         const receiver = try owner.getReceiver(peer);
         try receiver.release(received);
-        if (received.completion.flags & linux.IORING_CQE_F_BUF_MORE == 0)
+        owner.noteReceiveBufferReturned(received.completion);
+    }
+
+    /// Records a selected buffer already returned through a lower-level
+    /// receiver path. Incrementally consumed buffers remain kernel-owned.
+    pub fn noteReceiveBufferReturned(owner: *Reactor, completion: linux.io_uring_cqe) void {
+        if (completion.res > 0 and
+            completion.flags & linux.IORING_CQE_F_BUFFER != 0 and
+            completion.flags & linux.IORING_CQE_F_BUF_MORE == 0)
             owner.receive_rearm_pending = true;
     }
 

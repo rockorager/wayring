@@ -346,6 +346,26 @@ block backpressure, and reports the affected peer for explicit send preparation.
 Registries created while an update is pending use the current initial global
 listing and are sequence-filtered from that update, preventing duplicate
 announcements.
+The optional server driver owns only allocation-free scheduling policy over a
+borrowed runtime. It allocates one intrusive work node per reactor connection
+slot at initialization, deduplicates peers needing send or close preparation,
+dispatches batches of already-filtered Wayring CQEs, and prepares resulting
+sends, cancellation, destruction, and deferred receives without submitting.
+Application handlers receive the peer, resolved target, message, and descriptor
+queue directly; optional connection, disconnection, and protocol-error hooks
+remain statically dispatched. External event producers queue output through the
+runtime and explicitly schedule the affected peer. Borrowed-ring users must
+filter unrelated CQEs before dispatch and retain control of `submit`; if a
+batch reports pending work because the SQ filled, they submit and call
+`prepare` again. Thus the driver removes repetitive compositor event-loop code
+without hiding ring ownership, batching, or another subsystem's completion
+traffic.
+
+Against the same libwayland client and generated protocol handler, the batched
+driver's five-sample median was 7.80 million messages/second versus 7.11 million
+for the handwritten one-CQE loop in this orb. Median round-trip p50 was 48.1
+microseconds versus 46.1 microseconds and p99 was 97.5 versus 93.0 microseconds,
+within the run's scheduling noise but worth retaining as a latency guardrail.
 Generated codecs expose validated request and event sizes without allocating or
 mutating TX state. Generic server event sending uses that preflight to reserve a
 destructor event and its required `wl_display.delete_id` as one batch. It removes

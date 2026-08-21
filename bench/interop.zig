@@ -32,6 +32,7 @@ const Options = struct {
     warmup: u64 = 100_000,
     mode: enum {
         libwayland_client,
+        libwayland_client_driver,
         libwayland_server,
         xdg_libwayland_client,
         xdg_libwayland_server,
@@ -60,7 +61,7 @@ const Options = struct {
 pub fn main(init: std.process.Init.Minimal) !u8 {
     const options = try parseOptions(init.args);
     return switch (options.mode) {
-        .libwayland_client => wayringServer(options),
+        .libwayland_client, .libwayland_client_driver => wayringServer(options),
         .libwayland_server => wayringClient(options),
         .xdg_libwayland_client => wayringProtocolServer(.xdg),
         .xdg_libwayland_server => wayringXdgClient(),
@@ -104,9 +105,14 @@ fn wayringServer(options: Options) !u8 {
         var result: ffi.struct_benchmark_result = undefined;
         const status = ffi.benchmark_client_fd(connected_fd, &c_options, &result);
         if (status == 0 and result.messages == options.messages) {
+            const driver_name: [*:0]const u8 = if (options.mode == .libwayland_client_driver)
+                "batched"
+            else
+                "manual";
             if (options.latency) {
                 _ = c.printf(
-                    "server=wayring client=libwayland latency_scope=round_trip rounds=%llu mean_ns=%llu p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+                    "server=wayring server_driver=%s client=libwayland latency_scope=round_trip rounds=%llu mean_ns=%llu p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+                    driver_name,
                     options.messages,
                     result.mean_ns,
                     result.p50_ns,
@@ -116,7 +122,8 @@ fn wayringServer(options: Options) !u8 {
                 );
             } else {
                 _ = c.printf(
-                    "server=wayring client=libwayland messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                    "server=wayring server_driver=%s client=libwayland messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                    driver_name,
                     options.messages,
                     options.batch,
                     result.elapsed_ns,
@@ -180,6 +187,22 @@ fn wayringServer(options: Options) !u8 {
         .latency = options.latency,
     };
     _ = try reactor.ring.submit();
+    if (options.mode == .libwayland_client_driver)
+        try runDriverServer(allocator, &reactor, &runtime, peer, actor, &handler)
+    else
+        try runManualServer(&reactor, &runtime, peer, actor, &handler);
+    try runtime.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+fn runManualServer(
+    reactor: *wayring.io_uring.Reactor,
+    runtime: *ServerRuntime,
+    peer: wayring.io_uring.Peer,
+    actor: *wayring.connection.Actor,
+    handler: *ServerHandler,
+) !void {
     while (handler.received < handler.target or
         actor.transmit.queuedBytes() != 0 or actor.transmit.sendActive())
     {
@@ -202,7 +225,7 @@ fn wayringServer(options: Options) !u8 {
                     &handler.objects.namespace,
                     try reactor.getReceiver(peer),
                     completion,
-                    &handler,
+                    handler,
                 )) {
                     .dispatched => {},
                     .terminal => |failure| return failure.cause,
@@ -248,10 +271,58 @@ fn wayringServer(options: Options) !u8 {
         }
     }
     try runtime.destroyClient(peer);
-    try runtime.deinit(allocator);
-    reactor.deinit(allocator);
-    return waitChild(child);
 }
+
+fn runDriverServer(
+    allocator: std.mem.Allocator,
+    reactor: *wayring.io_uring.Reactor,
+    runtime: *ServerRuntime,
+    peer: wayring.io_uring.Peer,
+    actor: *wayring.connection.Actor,
+    handler: *ServerHandler,
+) !void {
+    var driver = try wayring.server.Driver(core_protocol).init(allocator, runtime, null);
+    defer driver.deinit(allocator);
+    var adapter: DriverServerHandler = .{ .handler = handler };
+    var completions: [16]linux.io_uring_cqe = undefined;
+    while (handler.received < handler.target or
+        actor.transmit.queuedBytes() != 0 or actor.transmit.sendActive())
+    {
+        const count = try reactor.ring.copy_cqes(&completions, 1);
+        const progress = try driver.dispatch(completions[0..count], &adapter);
+        if (progress.protocol_errors != 0) return error.ProtocolError;
+        if (progress.prepared != 0 or progress.pending)
+            _ = try reactor.ring.submit();
+    }
+
+    _ = try runtime.prepareEndpointClose();
+    _ = try runtime.clients.prepareClose(peer);
+    _ = try driver.schedule(peer);
+    _ = try reactor.ring.submit();
+    while (!runtime.endpoint.listener.canDeinit() or reactor.slots.active_count != 0) {
+        const count = try reactor.ring.copy_cqes(&completions, 1);
+        const progress = try driver.dispatch(completions[0..count], &adapter);
+        if (progress.prepared != 0 or progress.pending)
+            _ = try reactor.ring.submit();
+    }
+}
+
+const DriverServerHandler = struct {
+    handler: *ServerHandler,
+
+    pub fn request(
+        adapter: *DriverServerHandler,
+        peer: wayring.io_uring.Peer,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (peer.slot != adapter.handler.peer.slot or
+            peer.generation != adapter.handler.peer.generation)
+            return error.UnexpectedClient;
+        return adapter.handler.request(target, message, fds);
+    }
+};
 
 const ServerHandler = struct {
     runtime: *ServerRuntime,
@@ -5411,6 +5482,8 @@ fn parseOptions(args: std.process.Args) !Options {
     if (iterator.next()) |value| {
         if (std.mem.eql(u8, value, "libwayland-client"))
             options.mode = .libwayland_client
+        else if (std.mem.eql(u8, value, "libwayland-client-driver"))
+            options.mode = .libwayland_client_driver
         else if (std.mem.eql(u8, value, "libwayland-server"))
             options.mode = .libwayland_server
         else if (std.mem.eql(u8, value, "libwayland-client-latency")) {
@@ -5418,6 +5491,9 @@ fn parseOptions(args: std.process.Args) !Options {
             options.latency = true;
         } else if (std.mem.eql(u8, value, "libwayland-server-latency")) {
             options.mode = .libwayland_server;
+            options.latency = true;
+        } else if (std.mem.eql(u8, value, "libwayland-client-driver-latency")) {
+            options.mode = .libwayland_client_driver;
             options.latency = true;
         } else if (std.mem.eql(u8, value, "xdg-libwayland-client")) {
             options.mode = .xdg_libwayland_client;

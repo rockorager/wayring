@@ -45,6 +45,8 @@ bench/run.sh interop
 bench/run.sh interop-perf
 bench/run.sh interop-syscalls
 bench/run.sh interop-latency
+bench/run.sh server-driver
+bench/run.sh server-driver-latency
 bench/run.sh xdg-interop
 bench/run.sh data-device-interop
 bench/run.sh output-interop
@@ -157,6 +159,11 @@ both directions through generated `fd` arguments and verifies close-on-exec.
 The measurements are useful for validating real wire
 compatibility and finding asymmetric runtime costs; they are not a direct
 replacement for the symmetric implementation comparisons above.
+
+Server-driver modes isolate the allocation-free batched `server.Driver` from
+the prior handwritten one-client CQE loop while keeping the same libwayland
+client, generated protocol handler, traffic, and ring configuration. Samples
+alternate order, and registration/setup remain outside timed traffic.
 
 Xdg interoperability mode drives both a real libwayland client against a
 Wayring server and a Wayring client against a real libwayland server. Each

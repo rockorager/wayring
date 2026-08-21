@@ -1251,6 +1251,152 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     );
 }
 
+test "server driver batches accept dispatch send and disconnect" {
+    const allocator = std.testing.allocator;
+    var path_storage: [100]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_storage,
+        "/tmp/wayring-driver-test-{d}",
+        .{linux.getpid()},
+    );
+    wayring.unix_socket.unlink(path) catch |err| if (err != error.NotFound) return err;
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 1,
+        .descriptor_count = 1,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(allocator);
+    const listener_fd = try wayring.unix_socket.listen(path, 1);
+    var runtime = try wayring.server.Runtime(protocol).init(
+        allocator,
+        &reactor,
+        listener_fd,
+        .{
+            .actor = .{
+                .received_fd_budget = 1,
+                .transmit_byte_budget = 64,
+                .transmit_fd_budget = 1,
+            },
+            .object_capacity = 2,
+            .object_quota = 2,
+            .buckets_per_client = 4,
+            .max_globals = 1,
+            .registry_capacity = 1,
+        },
+    );
+    defer runtime.deinit(allocator) catch unreachable;
+    var driver = try wayring.server.Driver(protocol).init(allocator, &runtime, null);
+    defer driver.deinit(allocator);
+    var handler: DriverHandler = .{ .runtime = &runtime };
+
+    try runtime.prepareAccept();
+    const client_fd = try wayring.unix_socket.connect(path);
+    _ = try reactor.ring.submit();
+    var completion = try reactor.ring.copy_cqe();
+    var progress = try driver.dispatch(&.{completion}, &handler);
+    try std.testing.expectEqual(@as(usize, 1), progress.accepted);
+    try std.testing.expectEqual(@as(usize, 1), handler.connected_count);
+    _ = try reactor.ring.submit();
+
+    var request: [12]u8 = undefined;
+    try (wayring.wire.Header{
+        .object_id = wayring.objects.display_id,
+        .opcode = 0,
+        .size = request.len,
+    }).encode(request[0..wayring.wire.header_len]);
+    std.mem.writeInt(
+        u32,
+        request[wayring.wire.header_len..],
+        2,
+        @import("builtin").cpu.arch.endian(),
+    );
+    try std.testing.expectEqual(
+        request.len,
+        linux.write(client_fd, &request, request.len),
+    );
+    completion = try reactor.ring.copy_cqe();
+    progress = try driver.dispatch(&.{completion}, &handler);
+    try std.testing.expectEqual(@as(usize, 1), progress.requests);
+    try std.testing.expectEqual(@as(usize, 1), progress.prepared);
+    _ = try reactor.ring.submit();
+
+    completion = try reactor.ring.copy_cqe();
+    progress = try driver.dispatch(&.{completion}, &handler);
+    try std.testing.expectEqual(@as(usize, 0), progress.requests);
+    var response: [24]u8 = undefined;
+    try std.testing.expectEqual(
+        response.len,
+        linux.read(client_fd, &response, response.len),
+    );
+    const done = (try wayring.wire.Message.decode(&response)).?;
+    try std.testing.expectEqual(@as(u32, 2), done.header.object_id);
+    const deleted = (try wayring.wire.Message.decode(response[done.header.size..])).?;
+    try std.testing.expectEqual(wayring.objects.display_id, deleted.header.object_id);
+
+    _ = linux.close(client_fd);
+    while (handler.disconnected_count == 0) {
+        completion = try reactor.ring.copy_cqe();
+        progress = try driver.dispatch(&.{completion}, &handler);
+        if (progress.prepared != 0) _ = try reactor.ring.submit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.disconnected_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.clients.reactor.slots.active_count);
+
+    _ = try runtime.prepareEndpointClose();
+    _ = try reactor.ring.submit();
+    while (!runtime.endpoint.listener.canDeinit()) {
+        completion = try reactor.ring.copy_cqe();
+        _ = try driver.dispatch(&.{completion}, &handler);
+    }
+}
+
+const DriverHandler = struct {
+    runtime: *wayring.server.Runtime(protocol),
+    connected_count: usize = 0,
+    disconnected_count: usize = 0,
+
+    pub fn connected(handler: *DriverHandler, _: wayring.io_uring.Peer) void {
+        handler.connected_count += 1;
+    }
+
+    pub fn disconnected(handler: *DriverHandler, _: wayring.io_uring.Peer) void {
+        handler.disconnected_count += 1;
+    }
+
+    pub fn request(
+        handler: *DriverHandler,
+        peer: wayring.io_uring.Peer,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface != &Core.Display.info) return error.WrongInterface;
+        const action = try handler.runtime.decodeDisplayRequest(peer, message, fds, null);
+        const callback = switch (action) {
+            .sync => |value| value,
+            .get_registry => return error.UnexpectedRequest,
+        };
+        const objects = try handler.runtime.clients.get(peer);
+        try Core.completeSync(
+            objects,
+            &(try handler.runtime.clients.reactor.getActor(peer)).transmit,
+            callback,
+            77,
+        );
+        return .continue_dispatch;
+    }
+};
+
 const VisibilityState = struct {
     allowed_slot: u24 = 0,
     restricted_context: u8 = 0,
