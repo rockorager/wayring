@@ -56,6 +56,9 @@ bench/run.sh pointer-interop
 bench/run.sh keyboard-interop
 bench/run.sh touch-interop
 bench/run.sh subsurface-interop
+bench/run.sh shm
+bench/run.sh shm-perf
+bench/run.sh shm-syscalls
 ```
 
 Configure a run through environment variables:
@@ -67,7 +70,16 @@ OBJECTS=64 MESSAGES=5000000 bench/run.sh objects
 CONNECTIONS=8 LATENCY_MESSAGES=10000 LATENCY_WARMUP=1000 bench/run.sh latency
 RESOURCE_CONNECTIONS="1 8 32 64" IDLE_MS=1000 bench/run.sh resources
 CONNECTIONS=64 IDLE_MS=5000 bench/run.sh idle-perf
+SHM_SIZES="4096 65536 8294400" SHM_BATCHES="1 16" bench/run.sh shm
 ```
+
+SHM mode compares the shrink-sealed zero-copy pin path with the SIGBUS-safe
+io_uring copy path. The sealed result measures mapping acquisition and endpoint
+sampling rather than memory-copy bandwidth; its reported byte rate is effective
+buffer availability. Copy mode moves every reported byte into caller-owned
+memory. `SHM_TARGET_BYTES` controls work per matrix cell and
+`SHM_MAX_WORKING_BYTES` caps `size * batch` destination storage. Perf and syscall
+modes use `SHM_SIZE`, `SHM_BATCH`, `SHM_OPERATIONS`, and `SHM_WARMUP`.
 
 The multi-connection modes compare Wayring and libwayland across identical
 socket counts and messages per connection. Wayring uses one io_uring instance

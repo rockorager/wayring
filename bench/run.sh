@@ -16,6 +16,10 @@ resource_warmup=${RESOURCE_WARMUP:-10000}
 rx_connections=${RX_CONNECTIONS:-"8 16 32"}
 rx_buffers=${RX_BUFFERS:-"2 4 8 16"}
 fixed_connections=${FIXED_CONNECTIONS:-"8 32 64"}
+shm_sizes=${SHM_SIZES:-"4096 65536 8294400 33177600"}
+shm_batches=${SHM_BATCHES:-"1 16"}
+shm_target_bytes=${SHM_TARGET_BYTES:-1073741824}
+shm_max_working_bytes=${SHM_MAX_WORKING_BYTES:-268435456}
 mode=${1:-throughput}
 
 (cd "$root" && zig build benchmarks)
@@ -367,6 +371,50 @@ case "$mode" in
         "$root/zig-out/bench/wayring-interop" 1 1 1 shm-libwayland-client
         "$root/zig-out/bench/wayring-interop" 1 1 1 shm-libwayland-server
         ;;
+    shm)
+        for shm_size in $shm_sizes; do
+            shm_operations=$((shm_target_bytes / shm_size))
+            if [ "$shm_operations" -lt 32 ]; then shm_operations=32; fi
+            shm_warmup=$((shm_operations / 10))
+            if [ "$shm_warmup" -lt 1 ]; then shm_warmup=1; fi
+            for shm_batch in $shm_batches; do
+                if [ $((shm_size * shm_batch)) -gt "$shm_max_working_bytes" ]; then
+                    continue
+                fi
+                sample=1
+                while [ "$sample" -le "$repeats" ]; do
+                    echo "# sample=$sample scope=shm size=$shm_size batch=$shm_batch operations=$shm_operations" >&2
+                    "$root/zig-out/bench/wayring-shm" \
+                        sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+                    "$root/zig-out/bench/wayring-shm" \
+                        copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+                    sample=$((sample + 1))
+                done
+            done
+        done
+        ;;
+    shm-perf)
+        events=task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions,branches,branch-misses
+        shm_size=${SHM_SIZE:-65536}
+        shm_batch=${SHM_BATCH:-16}
+        shm_operations=${SHM_OPERATIONS:-$((shm_target_bytes / shm_size))}
+        shm_warmup=${SHM_WARMUP:-$((shm_operations / 10))}
+        perf stat -e "$events" "$root/zig-out/bench/wayring-shm" \
+            sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        perf stat -e "$events" "$root/zig-out/bench/wayring-shm" \
+            copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        ;;
+    shm-syscalls)
+        echo "warning: strace perturbs timing; use this mode only for syscall counts" >&2
+        shm_size=${SHM_SIZE:-65536}
+        shm_batch=${SHM_BATCH:-16}
+        shm_operations=${SHM_OPERATIONS:-$((shm_target_bytes / shm_size))}
+        shm_warmup=${SHM_WARMUP:-$((shm_operations / 10))}
+        strace -f -c "$root/zig-out/bench/wayring-shm" \
+            sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        strace -f -c "$root/zig-out/bench/wayring-shm" \
+            copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        ;;
     dmabuf-interop)
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-client
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-server
@@ -396,7 +444,7 @@ case "$mode" in
         "$root/zig-out/bench/wayring-interop" 1 1 1 subsurface-libwayland-server
         ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|shm|shm-perf|shm-syscalls|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
         exit 2
         ;;
 esac

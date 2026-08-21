@@ -73,6 +73,11 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep benchmark_protocol \
     -Mwayring="$root/src/root.zig" \
     -femit-bin="$out/wayring-ping"
 
+zig build-exe -OReleaseFast --dep wayring \
+    -Mroot="$root/bench/shm.zig" \
+    -Mwayring="$root/src/root.zig" \
+    -femit-bin="$out/wayring-shm"
+
 # Keep libwayland out of the normal Wayring executable so mixed-interoperability
 # coverage cannot perturb its code layout or benchmark results.
 # shellcheck disable=SC2086
