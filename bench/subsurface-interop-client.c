@@ -67,7 +67,10 @@ subsurface_client_fd(int fd)
 	wl_subsurface_set_position(subsurface, -7, 11);
 	wl_subsurface_place_above(subsurface, parent);
 	wl_subsurface_place_below(subsurface, parent);
+	wl_surface_commit(child);
+	wl_surface_commit(parent);
 	wl_subsurface_set_sync(subsurface);
+	wl_surface_commit(child);
 	wl_subsurface_set_desync(subsurface);
 	if (wl_display_roundtrip(display) < 0)
 		goto cleanup;

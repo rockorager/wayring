@@ -11,6 +11,7 @@ struct subsurface_server_state {
 	struct wl_resource *child;
 	int surfaces_created;
 	int surfaces_destroyed;
+	int surface_commits;
 	int subsurface_created;
 	int positioned;
 	int above;
@@ -146,8 +147,17 @@ surface_destroy(struct wl_client *client, struct wl_resource *resource)
 	wl_resource_destroy(resource);
 }
 
+static void
+surface_commit(struct wl_client *client, struct wl_resource *resource)
+{
+	struct subsurface_server_state *state = wl_resource_get_user_data(resource);
+	(void) client;
+	state->surface_commits++;
+}
+
 static const struct wl_surface_interface surface_implementation = {
 	.destroy = surface_destroy,
+	.commit = surface_commit,
 };
 
 static void
@@ -229,6 +239,7 @@ subsurface_server_fd(int fd)
 	wl_display_run(state.display);
 	wl_display_destroy(state.display);
 	return state.surfaces_created == 2 && state.surfaces_destroyed == 2 &&
+	       state.surface_commits == 3 &&
 	       state.subsurface_created && state.positioned && state.above && state.below &&
 	       state.sync && state.desync && state.subsurface_destroyed &&
 	       state.subcompositor_destroyed ? EXIT_SUCCESS : EXIT_FAILURE;

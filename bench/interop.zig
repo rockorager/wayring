@@ -21,6 +21,8 @@ const XdgServerCore = wayring.server.Core(standard_protocol);
 const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
+const InteropSubsurfaceGraph = wayring.compositor.SubsurfaceGraph(wayring.objects.Handle, u32);
+const subsurface_role_id = 1;
 
 const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
 const drm_format_argb8888: u32 = 0x34325241;
@@ -544,6 +546,8 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
     defer frame_pool.deinit(allocator);
     var frame_queue = wayring.compositor.FrameQueue.init(&frame_pool);
     defer frame_queue.deinit();
+    var subsurface_graph = try InteropSubsurfaceGraph.init(allocator, 4, 4);
+    defer subsurface_graph.deinit(allocator);
     var handler: ProtocolServerHandler = .{
         .kind = kind,
         .runtime = &runtime,
@@ -553,6 +557,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .region_state = &region_state,
         .surface_regions = &surface_regions,
         .frame_queue = &frame_queue,
+        .subsurface_graph = &subsurface_graph,
     };
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
@@ -665,7 +670,8 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             handler.subsurface_surfaces_destroyed != 2 or !handler.subsurface_created or
             !handler.subsurface_positioned or !handler.subsurface_above or
             !handler.subsurface_below or !handler.subsurface_sync or
-            !handler.subsurface_desync or !handler.subsurface_destroyed or
+            !handler.subsurface_desync or !handler.subsurface_parent_latched or
+            !handler.subsurface_desync_applied or !handler.subsurface_destroyed or
             !handler.subcompositor_destroyed)
             return error.IncompleteInterop,
         .shell => if (!handler.surface_created or !handler.shell_surface_created or
@@ -735,6 +741,7 @@ const ProtocolServerHandler = struct {
     region_state: *wayring.compositor.Region,
     surface_regions: *wayring.compositor.SurfaceRegions,
     frame_queue: *wayring.compositor.FrameQueue,
+    subsurface_graph: *InteropSubsurfaceGraph,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -796,7 +803,10 @@ const ProtocolServerHandler = struct {
     subsurface_below: bool = false,
     subsurface_sync: bool = false,
     subsurface_desync: bool = false,
+    subsurface_parent_latched: bool = false,
+    subsurface_desync_applied: bool = false,
     subsurface_destroyed: bool = false,
+    subsurface_child_state: wayring.compositor.Surface = .{},
     subcompositor_destroyed: bool = false,
     shell_surface_created: bool = false,
     shell_events_sent: bool = false,
@@ -1896,8 +1906,11 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .destroy => {
                     if (handler.kind == .shm) try handler.surface_state.validateDestroy();
-                    if (handler.kind == .subsurface)
+                    if (handler.kind == .subsurface) {
+                        if (std.meta.eql(decoded.handle, handler.subsurface_child.?))
+                            try handler.subsurface_child_state.validateDestroy();
                         handler.subsurface_surfaces_destroyed += 1;
+                    }
                     if (handler.kind == .shm) handler.surface_destroyed = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch or handler.kind == .shell)
@@ -2007,6 +2020,39 @@ const ProtocolServerHandler = struct {
                         );
                         handler.frame_completed = true;
                         handler.surface_committed = true;
+                    } else if (handler.kind == .subsurface) {
+                        var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
+                        if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
+                            const payload: u32 = if (handler.subsurface_parent_latched) 22 else 21;
+                            if ((try handler.subsurface_graph.commitToken(
+                                handler.subsurface_graph.token(decoded.handle) orelse
+                                    return error.InvalidSubsurface,
+                                payload,
+                                &applied,
+                            )).len != 0) return error.InvalidSubsurface;
+                        } else if (std.meta.eql(decoded.handle, handler.subsurface_parent.?)) {
+                            const updates = try handler.subsurface_graph.commitToken(
+                                handler.subsurface_graph.token(decoded.handle) orelse
+                                    return error.InvalidSubsurface,
+                                10,
+                                &applied,
+                            );
+                            if (updates.len != 2 or updates[0].payload != 10 or
+                                updates[1].payload != 21)
+                                return error.InvalidSubsurface;
+                            const position = try handler.subsurface_graph.position(
+                                handler.subsurface_child.?,
+                            );
+                            var stack_entries: [1]InteropSubsurfaceGraph.StackEntry = undefined;
+                            const stack = try handler.subsurface_graph.stack(
+                                handler.subsurface_parent.?,
+                                &stack_entries,
+                            );
+                            if (position.x != -7 or position.y != 11 or stack.len != 1 or
+                                stack[0].above_parent)
+                                return error.InvalidSubsurface;
+                            handler.subsurface_parent_latched = true;
+                        } else return error.InvalidSubsurface;
                     }
                 },
                 .get_release => return error.UnexpectedRequest,
@@ -2030,6 +2076,11 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     );
+                    try handler.subsurface_child_state.role.assign(subsurface_role_id, true);
+                    try handler.subsurface_graph.add(
+                        handler.subsurface_child.?,
+                        handler.subsurface_parent.?,
+                    );
                     handler.subsurface_created = true;
                 },
                 .destroy => handler.subcompositor_destroyed = true,
@@ -2045,21 +2096,55 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .set_position => |value| {
                     if (value.x != -7 or value.y != 11) return error.InvalidSubsurface;
+                    try handler.subsurface_graph.setPosition(
+                        handler.subsurface_child.?,
+                        value.x,
+                        value.y,
+                    );
                     handler.subsurface_positioned = true;
                 },
                 .place_above => |value| {
                     if (value.sibling != handler.subsurface_parent.?.id)
                         return error.InvalidSubsurface;
+                    try handler.subsurface_graph.placeAbove(
+                        handler.subsurface_child.?,
+                        handler.subsurface_parent.?,
+                    );
                     handler.subsurface_above = true;
                 },
                 .place_below => |value| {
                     if (value.sibling != handler.subsurface_parent.?.id)
                         return error.InvalidSubsurface;
+                    try handler.subsurface_graph.placeBelow(
+                        handler.subsurface_child.?,
+                        handler.subsurface_parent.?,
+                    );
                     handler.subsurface_below = true;
                 },
-                .set_sync => handler.subsurface_sync = true,
-                .set_desync => handler.subsurface_desync = true,
-                .destroy => handler.subsurface_destroyed = true,
+                .set_sync => {
+                    try handler.subsurface_graph.setSync(handler.subsurface_child.?);
+                    handler.subsurface_sync = true;
+                },
+                .set_desync => {
+                    var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
+                    const updates = try handler.subsurface_graph.setDesync(
+                        handler.subsurface_child.?,
+                        &applied,
+                    );
+                    if (updates.len != 1 or updates[0].payload != 22)
+                        return error.InvalidSubsurface;
+                    handler.subsurface_desync = true;
+                    handler.subsurface_desync_applied = true;
+                },
+                .destroy => {
+                    var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
+                    if ((try handler.subsurface_graph.remove(
+                        handler.subsurface_child.?,
+                        &applied,
+                    )).len != 0) return error.InvalidSubsurface;
+                    try handler.subsurface_child_state.role.deactivateObject(subsurface_role_id);
+                    handler.subsurface_destroyed = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_region.info) {
@@ -3468,11 +3553,32 @@ fn wayringSubsurfaceClient() !u8 {
         .{ .place_below = .{ .sibling = parent.id } },
     );
     try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        child_surface,
+        .{ .commit = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        parent,
+        .{ .commit = .{} },
+    );
+    try wayring.client.sendRequest(
         standard_protocol.wl_subsurface,
         objects,
         &actor.transmit,
         subsurface,
         .{ .set_sync = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        child_surface,
+        .{ .commit = .{} },
     );
     try wayring.client.sendRequest(
         standard_protocol.wl_subsurface,

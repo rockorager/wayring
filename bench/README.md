@@ -228,8 +228,9 @@ up, and cancellation semantics before ordered touch, surface, and seat teardown.
 
 Subsurface interoperability mode runs both library pairings. Each constructs a
 parent and child surface, assigns the child subsurface role, and validates
-position, sibling stacking, synchronized and desynchronized modes, and ordered
-subsurface, surface, and subcompositor teardown.
+parent-latched position and stacking, cached synchronized child commits,
+desynchronization release, permanent role lifetime, and ordered subsurface,
+surface, and subcompositor teardown.
 
 Legacy-shell interoperability mode runs both library pairings against the core
 `wl_shell` protocol. It assigns a shell-surface role, exchanges ping/pong,
