@@ -37,6 +37,7 @@ bench/run.sh interop-perf
 bench/run.sh interop-syscalls
 bench/run.sh interop-latency
 bench/run.sh xdg-interop
+bench/run.sh data-device-interop
 ```
 
 Configure a run through environment variables:
@@ -150,3 +151,9 @@ plane FD transfer, immediate and asynchronous `wl_buffer` creation, nonfatal
 import failure, synchronization, and ordered destruction. The harness validates
 wire and object semantics without attempting to import the synthetic descriptor
 as a real GPU dma-buf.
+
+Data-device interoperability mode drives a real libwayland clipboard source
+against a Wayring server. It binds a seat and data-device manager, creates a
+source and device, advertises a MIME type, sets the selection, transfers the
+payload through a close-on-exec pipe supplied by the server, and validates
+ordered source, device, and seat teardown.

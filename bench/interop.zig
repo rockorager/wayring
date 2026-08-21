@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -39,6 +39,7 @@ const Options = struct {
         shm_libwayland_server,
         dmabuf_libwayland_client,
         dmabuf_libwayland_server,
+        data_device_libwayland_client,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -54,6 +55,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .shm_libwayland_server => wayringShmClient(),
         .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf),
         .dmabuf_libwayland_server => wayringDmabufClient(),
+        .data_device_libwayland_client => wayringProtocolServer(.data_device),
     };
 }
 
@@ -342,6 +344,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .xdg => ffi.xdg_client_fd(connected_fd),
             .shm => ffi.shm_client_fd(connected_fd),
             .dmabuf => ffi.dmabuf_client_fd(connected_fd),
+            .data_device => ffi.data_device_client_fd(connected_fd),
         });
     }
 
@@ -383,6 +386,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             3,
             null,
         ),
+        .data_device => {
+            _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 7, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_data_device_manager.info, 3, null);
+        },
     }
     try runtime.prepareAccept();
     _ = try reactor.ring.submit();
@@ -401,6 +408,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .objects = try runtime.clients.get(peer),
         .queue = &actor.transmit,
     };
+    defer {
+        if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
+    }
     _ = try reactor.ring.submit();
 
     var disconnected = false;
@@ -474,6 +484,11 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             handler.plane_added_count != 3 or handler.buffer_destroyed_count != 2 or
             handler.params_destroyed_count != 3)
             return error.IncompleteInterop,
+        .data_device => if (!handler.data_source_created or !handler.data_device_created or
+            !handler.mime_offered or !handler.selection_set or !handler.selection_sent or
+            !handler.data_source_destroyed or !handler.data_device_released or
+            !handler.seat_released)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -529,6 +544,15 @@ const ProtocolServerHandler = struct {
     feedback_presented: bool = false,
     feedback_discarded: bool = false,
     feedback_count: usize = 0,
+    data_source_created: bool = false,
+    data_device_created: bool = false,
+    mime_offered: bool = false,
+    selection_set: bool = false,
+    selection_sent: bool = false,
+    data_source_destroyed: bool = false,
+    data_device_released: bool = false,
+    seat_released: bool = false,
+    selection_read_fd: linux.fd_t = -1,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -651,6 +675,108 @@ const ProtocolServerHandler = struct {
                     } else return error.UnexpectedRequest;
                 },
                 .destroy => {},
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_data_device_manager.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_data_device_manager,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .create_data_source => |value| {
+                    _ = try standard_protocol.wl_data_device_manager.admit_create_data_source(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    );
+                    handler.data_source_created = true;
+                },
+                .get_data_device => |value| {
+                    _ = try standard_protocol.wl_data_device_manager.admit_get_data_device(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    );
+                    handler.data_device_created = true;
+                },
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_data_source.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_data_source,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .offer => |value| {
+                    if (!std.mem.eql(u8, value.mime_type, "text/plain"))
+                        return error.InvalidMimeType;
+                    handler.mime_offered = true;
+                },
+                .destroy => {
+                    if (handler.selection_read_fd < 0) return error.MissingSelection;
+                    var received: ["libwayland-selection\x00".len]u8 = undefined;
+                    try readExactInterop(handler.selection_read_fd, &received);
+                    _ = linux.close(handler.selection_read_fd);
+                    handler.selection_read_fd = -1;
+                    if (!std.mem.eql(u8, &received, "libwayland-selection\x00"))
+                        return error.InvalidSelection;
+                    handler.data_source_destroyed = true;
+                },
+                .set_actions => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_data_device.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_data_device,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .set_selection => |value| {
+                    if (!handler.mime_offered or value.serial != 77 or value.source == null)
+                        return error.InvalidSelection;
+                    const source = handler.objects.namespace.lookupHandle(value.source.?) orelse
+                        return error.UnknownObject;
+                    var pipe: [2]linux.fd_t = undefined;
+                    const pipe_result = linux.pipe2(&pipe, .{ .CLOEXEC = true });
+                    if (linux.errno(pipe_result) != .SUCCESS) return error.SystemCallFailed;
+                    wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_source,
+                        handler.objects,
+                        handler.queue,
+                        source,
+                        .{ .send = .{ .mime_type = "text/plain", .fd = pipe[1] } },
+                    ) catch |err| {
+                        _ = linux.close(pipe[0]);
+                        _ = linux.close(pipe[1]);
+                        return err;
+                    };
+                    handler.selection_read_fd = pipe[0];
+                    handler.selection_set = true;
+                    handler.selection_sent = true;
+                },
+                .release => handler.data_device_released = true,
+                .start_drag => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_seat.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_seat,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .release => handler.seat_released = true,
+                else => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
@@ -2197,6 +2323,20 @@ fn cOptions(options: Options) ffi.struct_benchmark_options {
     };
 }
 
+fn readExactInterop(fd: linux.fd_t, bytes: []u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const result = linux.read(fd, bytes[offset..].ptr, bytes.len - offset);
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.SystemCallFailed,
+        }
+        if (result == 0) return error.Disconnected;
+        offset += result;
+    }
+}
+
 fn waitChild(child: c.pid_t) !u8 {
     var status: c_int = 0;
     if (c.waitpid(child, &status, 0) != child or
@@ -2241,6 +2381,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .dmabuf_libwayland_client;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-server")) {
             options.mode = .dmabuf_libwayland_server;
+        } else if (std.mem.eql(u8, value, "data-device-libwayland-client")) {
+            options.mode = .data_device_libwayland_client;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

@@ -184,8 +184,11 @@ case "$mode" in
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-client
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-server
         ;;
+    data-device-interop)
+        "$root/zig-out/bench/wayring-interop" 1 1 1 data-device-libwayland-client
+        ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|xdg-interop|shm-interop|dmabuf-interop]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|xdg-interop|shm-interop|dmabuf-interop|data-device-interop]" >&2
         exit 2
         ;;
 esac
