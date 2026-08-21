@@ -28,6 +28,10 @@ bench/run.sh multi
 bench/run.sh multi-syscalls
 bench/run.sh rx-pressure
 bench/run.sh rx-pressure-syscalls
+bench/run.sh rx-pool
+bench/run.sh rx-pool-syscalls
+bench/run.sh rx-pool-latency
+bench/run.sh rx-pool-resources
 bench/run.sh resources
 bench/run.sh idle-perf
 bench/run.sh latency
@@ -75,6 +79,11 @@ shared provided buffers. It compares immediate `ENOBUFS` rearming against the
 allocation-free deferred FIFO using identical traffic. The syscall variant is
 the decisive check for avoided retry submissions; timing remains useful for
 detecting scheduler overhead but is sensitive to host scheduling.
+The `rx-pool` modes vary both connection and shared-buffer counts to locate the
+memory, throughput, syscall, and all-client tail-latency knee. Configure their
+matrix with `RX_CONNECTIONS="8 16 32"` and `RX_BUFFERS="2 4 8 16"`. Output
+includes exact reserved receive-pool capacity because process RSS is generally
+too coarse and noisy to distinguish these 64 KiB buffer-count increments.
 
 Resource mode samples initialized client/server pairs while idle and again
 after `RESOURCE_WARMUP` messages per connection. It reports the resident memory

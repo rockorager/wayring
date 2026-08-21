@@ -210,6 +210,14 @@ the sweep in another batch.
 Real-kernel soak coverage retains the whole buffer group across concurrent
 clients, then verifies that every stream and transferred descriptor resumes
 intact after those buffers are returned.
+Pool sizing remains explicit because it is a workload decision, not a function
+of admitted connection count. With 32 simultaneously busy benchmark clients,
+8 shared 64 KiB buffers retained the throughput plateau, reduced ring-enter
+count from 1,182 at 2 buffers to 717, and reduced all-client p99 round latency
+from 240 to 186 microseconds. Increasing to 16 buffers saved another 62 enters
+but did not improve p99 in that run. Eight buffers per reactor is therefore the
+current balanced starting point for up to 32 bursty clients; latency-critical
+callers can provision toward their expected simultaneous receive fan-out.
 
 The reusable io_uring backend owns persistent per-connection recvmsg and
 sendmsg operation state while borrowing one reactor-wide provided-buffer group.

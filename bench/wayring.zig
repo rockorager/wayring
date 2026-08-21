@@ -53,6 +53,8 @@ const Options = struct {
         idle,
         rx_pressure_immediate,
         rx_pressure_deferred,
+        rx_pool_latency,
+        rx_pool_idle,
     };
 
     warmup: u64 = 100_000,
@@ -62,7 +64,23 @@ const Options = struct {
     objects: usize = 1,
     mode: Mode = .round_trip,
     idle_ms: u64 = 1000,
+    receive_buffers: u16 = 2,
 };
+
+fn isReceivePoolMode(mode: Options.Mode) bool {
+    return mode == .rx_pressure_immediate or
+        mode == .rx_pressure_deferred or
+        mode == .rx_pool_latency or
+        mode == .rx_pool_idle;
+}
+
+fn isLatencyMode(mode: Options.Mode) bool {
+    return mode == .latency or mode == .rx_pool_latency;
+}
+
+fn isIdleMode(mode: Options.Mode) bool {
+    return mode == .idle or mode == .rx_pool_idle;
+}
 
 const Ring = struct {
     io: linux.IoUring,
@@ -947,11 +965,10 @@ fn stopMulti(
 
 fn serverMulti(fds: []const c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
-    const receive_pressure = options.mode == .rx_pressure_immediate or
-        options.mode == .rx_pressure_deferred;
-    const deferred_rearm = options.mode == .rx_pressure_deferred;
+    const receive_pressure = isReceivePoolMode(options.mode);
+    const deferred_rearm = receive_pressure and options.mode != .rx_pressure_immediate;
     const receive_buffer_count: u16 = if (receive_pressure)
-        2
+        options.receive_buffers
     else
         try std.math.ceilPowerOfTwo(
             u16,
@@ -1017,7 +1034,7 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         receivers,
         namespaces,
     );
-    if (options.mode == .latency) {
+    if (isLatencyMode(options.mode)) {
         for (0..options.warmup) |round| try serverMultiPhase(
             ring,
             &owner,
@@ -1248,17 +1265,35 @@ fn runMultiLatency(
     }
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
     const operations = try std.math.mul(u64, options.messages, options.connections);
-    _ = c.printf(
-        "backend=wayring-multishot connections=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
-        options.connections,
-        options.messages,
-        operations,
-        @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(options.messages)),
-        percentile(samples, 50),
-        percentile(samples, 95),
-        percentile(samples, 99),
-        samples[samples.len - 1],
-    );
+    const mean = @as(f64, @floatFromInt(sum)) /
+        @as(f64, @floatFromInt(options.messages));
+    if (options.mode == .rx_pool_latency) {
+        _ = c.printf(
+            "backend=wayring-multishot connections=%zu buffers=%u pool_bytes=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+            options.connections,
+            options.receive_buffers,
+            @as(usize, options.receive_buffers) * recv_buffer_size,
+            options.messages,
+            operations,
+            mean,
+            percentile(samples, 50),
+            percentile(samples, 95),
+            percentile(samples, 99),
+            samples[samples.len - 1],
+        );
+    } else {
+        _ = c.printf(
+            "backend=wayring-multishot connections=%zu latency_scope=round_trip_all rounds=%llu operations=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+            options.connections,
+            options.messages,
+            operations,
+            mean,
+            percentile(samples, 50),
+            percentile(samples, 95),
+            percentile(samples, 99),
+            samples[samples.len - 1],
+        );
+    }
 }
 
 fn multiMain(options: Options) !u8 {
@@ -1293,18 +1328,18 @@ fn multiMain(options: Options) !u8 {
     var ring = try Ring.init(multi_ring_entries);
     defer ring.deinit();
     try validateFdLane(&ring, parent_fds[0]);
-    if (options.mode == .idle and benchmark_resource_sample(
+    if (isIdleMode(options.mode) and benchmark_resource_sample(
         "wayring-multishot",
         "idle",
         options.connections,
         child,
         options.idle_ms,
     ) != 0) return error.SystemCallFailed;
-    if (options.mode == .latency) {
+    if (isLatencyMode(options.mode)) {
         try runMultiLatency(allocator, &ring, parent_fds, options);
     } else {
         try sendMultiPhase(allocator, &ring, parent_fds, options.warmup, options.batch, 1);
-        if (options.mode == .idle and benchmark_resource_sample(
+        if (isIdleMode(options.mode) and benchmark_resource_sample(
             "wayring-multishot",
             "active",
             options.connections,
@@ -1315,7 +1350,7 @@ fn multiMain(options: Options) !u8 {
         try sendMultiPhase(allocator, &ring, parent_fds, options.messages, options.batch, 2);
         const elapsed = try monotonicNs() - start;
         const total_messages = try std.math.mul(u64, options.messages, options.connections);
-        if (options.mode != .idle) {
+        if (!isIdleMode(options.mode)) {
             const throughput = @as(f64, @floatFromInt(total_messages)) *
                 @as(f64, std.time.ns_per_s) / @as(f64, @floatFromInt(elapsed));
             if (options.mode == .rx_pressure_immediate or
@@ -1326,9 +1361,11 @@ fn multiMain(options: Options) !u8 {
                 else
                     "immediate";
                 _ = c.printf(
-                    "backend=wayring-multishot receive_rearm=%s connections=%zu buffers=2 messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                    "backend=wayring-multishot receive_rearm=%s connections=%zu buffers=%u pool_bytes=%zu messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
                     rearm_name,
                     options.connections,
+                    options.receive_buffers,
+                    @as(usize, options.receive_buffers) * recv_buffer_size,
                     total_messages,
                     options.batch,
                     elapsed,
@@ -1374,17 +1411,26 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .rx_pressure_immediate
         else if (std.mem.eql(u8, value, "rx-pressure-deferred"))
             options.mode = .rx_pressure_deferred
+        else if (std.mem.eql(u8, value, "rx-pool-latency"))
+            options.mode = .rx_pool_latency
+        else if (std.mem.eql(u8, value, "rx-pool-idle"))
+            options.mode = .rx_pool_idle
         else if (!std.mem.eql(u8, value, "round-trip"))
             return error.InvalidMessage;
     }
     if (iterator.next()) |value| options.objects = try std.fmt.parseUnsigned(usize, value, 10);
     if (iterator.next()) |value| options.idle_ms = try std.fmt.parseUnsigned(u64, value, 10);
+    if (iterator.next()) |value|
+        options.receive_buffers = try std.fmt.parseUnsigned(u16, value, 10);
     if (options.messages == 0 or options.batch == 0 or options.warmup == 0 or
         options.connections == 0 or options.connections > max_connections or
         options.objects == 0 or options.objects > max_objects or
-        (options.mode == .idle and options.idle_ms == 0) or
+        (isIdleMode(options.mode) and options.idle_ms == 0) or
+        (isReceivePoolMode(options.mode) and
+            (!std.math.isPowerOfTwo(options.receive_buffers) or
+                options.receive_buffers > 1 << 15)) or
         (options.objects > 1 and (options.connections != 1 or options.mode != .round_trip)) or
-        (options.mode == .latency and
+        (isLatencyMode(options.mode) and
             options.messages > std.math.maxInt(u32) - options.warmup) or
         ((options.mode == .client_tx or options.mode == .client_rx) and
             options.connections != 1))
@@ -1396,7 +1442,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const options = try parseOptions(init.args);
     if (options.mode == .client_tx) return clientTransmitMain(options);
     if (options.mode == .client_rx) return clientReceiveMain(options);
-    if (options.connections > 1 or options.mode == .latency or options.mode == .idle)
+    if (options.connections > 1 or isLatencyMode(options.mode) or isIdleMode(options.mode) or
+        isReceivePoolMode(options.mode))
         return multiMain(options);
     var sockets: [2]c.fd_t = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)

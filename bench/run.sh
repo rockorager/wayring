@@ -13,6 +13,8 @@ latency_warmup=${LATENCY_WARMUP:-1000}
 idle_ms=${IDLE_MS:-1000}
 resource_connections=${RESOURCE_CONNECTIONS:-"1 8 32 64"}
 resource_warmup=${RESOURCE_WARMUP:-10000}
+rx_connections=${RX_CONNECTIONS:-"8 16 32"}
+rx_buffers=${RX_BUFFERS:-"2 4 8 16"}
 mode=${1:-throughput}
 
 (cd "$root" && zig build benchmarks)
@@ -88,6 +90,51 @@ case "$mode" in
             "$messages" "$batch" "$warmup" "$connections" rx-pressure-immediate
         strace -f -c "$root/zig-out/bench/wayring-ping" \
             "$messages" "$batch" "$warmup" "$connections" rx-pressure-deferred
+        ;;
+    rx-pool)
+        for rx_connection_count in $rx_connections; do
+            for rx_buffer_count in $rx_buffers; do
+                sample=1
+                while [ "$sample" -le "$repeats" ]; do
+                    echo "# sample=$sample connections=$rx_connection_count buffers=$rx_buffer_count" >&2
+                    "$root/zig-out/bench/wayring-ping" \
+                        "$messages" "$batch" "$warmup" "$rx_connection_count" \
+                        rx-pressure-deferred 1 1000 "$rx_buffer_count"
+                    sample=$((sample + 1))
+                done
+            done
+        done
+        ;;
+    rx-pool-syscalls)
+        echo "warning: strace perturbs timing; use this mode only for syscall counts" >&2
+        for rx_connection_count in $rx_connections; do
+            for rx_buffer_count in $rx_buffers; do
+                echo "# connections=$rx_connection_count buffers=$rx_buffer_count" >&2
+                strace -f -c "$root/zig-out/bench/wayring-ping" \
+                    "$messages" "$batch" "$warmup" "$rx_connection_count" \
+                    rx-pressure-deferred 1 1000 "$rx_buffer_count"
+            done
+        done
+        ;;
+    rx-pool-latency)
+        for rx_connection_count in $rx_connections; do
+            for rx_buffer_count in $rx_buffers; do
+                echo "# connections=$rx_connection_count buffers=$rx_buffer_count latency_rounds=$latency_messages" >&2
+                "$root/zig-out/bench/wayring-ping" \
+                    "$latency_messages" 1 "$latency_warmup" "$rx_connection_count" \
+                    rx-pool-latency 1 1000 "$rx_buffer_count"
+            done
+        done
+        ;;
+    rx-pool-resources)
+        for rx_connection_count in $rx_connections; do
+            for rx_buffer_count in $rx_buffers; do
+                echo "# connections=$rx_connection_count buffers=$rx_buffer_count pool_bytes=$((rx_buffer_count * 65536)) idle_ms=$idle_ms" >&2
+                "$root/zig-out/bench/wayring-ping" \
+                    1 1 "$resource_warmup" "$rx_connection_count" \
+                    rx-pool-idle 1 "$idle_ms" "$rx_buffer_count"
+            done
+        done
         ;;
     resources)
         for resource_count in $resource_connections; do
