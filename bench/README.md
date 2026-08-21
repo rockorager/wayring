@@ -42,6 +42,7 @@ bench/run.sh output-interop
 bench/run.sh pointer-interop
 bench/run.sh keyboard-interop
 bench/run.sh touch-interop
+bench/run.sh subsurface-interop
 ```
 
 Configure a run through environment variables:
@@ -184,3 +185,8 @@ repeat metadata, and leave before ordered keyboard, surface, and seat teardown.
 Touch interoperability mode runs both library pairings. Each creates a surface
 and touch object, then validates contact down, motion, shape, orientation, frame,
 up, and cancellation semantics before ordered touch, surface, and seat teardown.
+
+Subsurface interoperability mode runs both library pairings. Each constructs a
+parent and child surface, assigns the child subsurface role, and validates
+position, sibling stacking, synchronized and desynchronized modes, and ordered
+subsurface, surface, and subcompositor teardown.

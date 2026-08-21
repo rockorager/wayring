@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -49,6 +49,8 @@ const Options = struct {
         keyboard_libwayland_server,
         touch_libwayland_client,
         touch_libwayland_server,
+        subsurface_libwayland_client,
+        subsurface_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -74,6 +76,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .keyboard_libwayland_server => wayringKeyboardClient(),
         .touch_libwayland_client => wayringProtocolServer(.touch),
         .touch_libwayland_server => wayringTouchClient(),
+        .subsurface_libwayland_client => wayringProtocolServer(.subsurface),
+        .subsurface_libwayland_server => wayringSubsurfaceClient(),
     };
 }
 
@@ -367,6 +371,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .pointer => ffi.pointer_client_fd(connected_fd),
             .keyboard => ffi.keyboard_client_fd(connected_fd),
             .touch => ffi.touch_client_fd(connected_fd),
+            .subsurface => ffi.subsurface_client_fd(connected_fd),
         });
     }
 
@@ -427,6 +432,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .touch => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
+        },
+        .subsurface => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_subcompositor.info, 1, null);
         },
     }
     try runtime.prepareAccept();
@@ -548,6 +557,13 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.touch_sent or !handler.touch_released or !handler.surface_destroyed or
             !handler.seat_released)
             return error.IncompleteInterop,
+        .subsurface => if (handler.subsurface_surfaces_created != 2 or
+            handler.subsurface_surfaces_destroyed != 2 or !handler.subsurface_created or
+            !handler.subsurface_positioned or !handler.subsurface_above or
+            !handler.subsurface_below or !handler.subsurface_sync or
+            !handler.subsurface_desync or !handler.subsurface_destroyed or
+            !handler.subcompositor_destroyed)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -640,6 +656,18 @@ const ProtocolServerHandler = struct {
     touch_released: bool = false,
     surface: ?wayring.objects.Handle = null,
     surface_destroyed: bool = false,
+    subsurface_parent: ?wayring.objects.Handle = null,
+    subsurface_child: ?wayring.objects.Handle = null,
+    subsurface_surfaces_created: usize = 0,
+    subsurface_surfaces_destroyed: usize = 0,
+    subsurface_created: bool = false,
+    subsurface_positioned: bool = false,
+    subsurface_above: bool = false,
+    subsurface_below: bool = false,
+    subsurface_sync: bool = false,
+    subsurface_desync: bool = false,
+    subsurface_destroyed: bool = false,
+    subcompositor_destroyed: bool = false,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -1455,6 +1483,15 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).id;
+                    if (handler.kind == .subsurface) {
+                        if (handler.subsurface_surfaces_created == 0)
+                            handler.subsurface_parent = surface
+                        else if (handler.subsurface_surfaces_created == 1)
+                            handler.subsurface_child = surface
+                        else
+                            return error.UnexpectedRequest;
+                        handler.subsurface_surfaces_created += 1;
+                    }
                     if (handler.kind == .shm) handler.surface_created = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch)
@@ -1555,6 +1592,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
+                    if (handler.kind == .subsurface)
+                        handler.subsurface_surfaces_destroyed += 1;
                     if (handler.kind == .shm) handler.surface_destroyed = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch)
@@ -1618,6 +1657,56 @@ const ProtocolServerHandler = struct {
                     }
                 },
                 else => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_subcompositor.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_subcompositor,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .get_subsurface => |value| {
+                    if (value.surface != handler.subsurface_child.?.id or
+                        value.parent != handler.subsurface_parent.?.id)
+                        return error.InvalidSubsurface;
+                    _ = try standard_protocol.wl_subcompositor.admit_get_subsurface(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    );
+                    handler.subsurface_created = true;
+                },
+                .destroy => handler.subcompositor_destroyed = true,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_subsurface.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_subsurface,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .set_position => |value| {
+                    if (value.x != -7 or value.y != 11) return error.InvalidSubsurface;
+                    handler.subsurface_positioned = true;
+                },
+                .place_above => |value| {
+                    if (value.sibling != handler.subsurface_parent.?.id)
+                        return error.InvalidSubsurface;
+                    handler.subsurface_above = true;
+                },
+                .place_below => |value| {
+                    if (value.sibling != handler.subsurface_parent.?.id)
+                        return error.InvalidSubsurface;
+                    handler.subsurface_below = true;
+                },
+                .set_sync => handler.subsurface_sync = true,
+                .set_desync => handler.subsurface_desync = true,
+                .destroy => handler.subsurface_destroyed = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_region.info) {
@@ -2836,6 +2925,229 @@ const TouchClientHandler = struct {
                     handler.cancel = true;
                 },
             }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
+fn wayringSubsurfaceClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.subsurface_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(objects, &actor.transmit, null);
+    var handler: SubsurfaceClientHandler = .{
+        .objects = objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.compositor == null or handler.subcompositor == null or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, objects, &handler);
+
+    const parent = (try standard_protocol.wl_compositor.construct_create_surface(
+        objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const child_surface = (try standard_protocol.wl_compositor.construct_create_surface(
+        objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const subsurface = (try standard_protocol.wl_subcompositor.construct_get_subsurface(
+        objects,
+        &actor.transmit,
+        handler.subcompositor.?,
+        .{ .surface = child_surface.id, .parent = parent.id },
+    )).id;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .set_position = .{ .x = -7, .y = 11 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .place_above = .{ .sibling = parent.id } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .place_below = .{ .sibling = parent.id } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .set_sync = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .set_desync = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subsurface,
+        objects,
+        &actor.transmit,
+        subsurface,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        child_surface,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        parent,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_subcompositor,
+        objects,
+        &actor.transmit,
+        handler.subcompositor.?,
+        .{ .destroy = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const SubsurfaceClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    subcompositor: ?wayring.objects.Handle = null,
+    synced: bool = false,
+    deleted: bool = false,
+
+    pub fn event(
+        handler: *SubsurfaceClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |value| if (value.id == handler.callback.id) {
+                    handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, standard_protocol.wl_compositor.info.name)) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wl_subcompositor.info.name,
+                    )) {
+                        handler.subcompositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_subcompositor.info,
+                            1,
+                            null,
+                        );
+                    }
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
     }
@@ -4453,6 +4765,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .touch_libwayland_client;
         } else if (std.mem.eql(u8, value, "touch-libwayland-server")) {
             options.mode = .touch_libwayland_server;
+        } else if (std.mem.eql(u8, value, "subsurface-libwayland-client")) {
+            options.mode = .subsurface_libwayland_client;
+        } else if (std.mem.eql(u8, value, "subsurface-libwayland-server")) {
+            options.mode = .subsurface_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or
