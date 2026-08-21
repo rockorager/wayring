@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -47,6 +47,8 @@ const Options = struct {
         pointer_libwayland_server,
         keyboard_libwayland_client,
         keyboard_libwayland_server,
+        touch_libwayland_client,
+        touch_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -70,6 +72,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .pointer_libwayland_server => wayringPointerClient(),
         .keyboard_libwayland_client => wayringProtocolServer(.keyboard),
         .keyboard_libwayland_server => wayringKeyboardClient(),
+        .touch_libwayland_client => wayringProtocolServer(.touch),
+        .touch_libwayland_server => wayringTouchClient(),
     };
 }
 
@@ -362,6 +366,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .output => ffi.output_client_fd(connected_fd),
             .pointer => ffi.pointer_client_fd(connected_fd),
             .keyboard => ffi.keyboard_client_fd(connected_fd),
+            .touch => ffi.touch_client_fd(connected_fd),
         });
     }
 
@@ -413,6 +418,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
         },
         .keyboard => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
+        },
+        .touch => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
         },
@@ -526,6 +535,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.keyboard_sent or !handler.keyboard_released or !handler.surface_destroyed or
             !handler.seat_released)
             return error.IncompleteInterop,
+        .touch => if (!handler.seat_advertised or !handler.touch_created or
+            !handler.touch_sent or !handler.touch_released or !handler.surface_destroyed or
+            !handler.seat_released)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -600,6 +613,9 @@ const ProtocolServerHandler = struct {
     keyboard_created: bool = false,
     keyboard_sent: bool = false,
     keyboard_released: bool = false,
+    touch_created: bool = false,
+    touch_sent: bool = false,
+    touch_released: bool = false,
     surface: ?wayring.objects.Handle = null,
     surface_destroyed: bool = false,
 
@@ -741,12 +757,14 @@ const ProtocolServerHandler = struct {
                 );
                 handler.output_sent = true;
             } else if (resource_interface == &standard_protocol.wl_seat.info and
-                (handler.kind == .pointer or handler.kind == .keyboard))
+                (handler.kind == .pointer or handler.kind == .keyboard or handler.kind == .touch))
             {
-                const capability = if (handler.kind == .pointer)
-                    standard_protocol.wl_seat.capability.pointer
-                else
-                    standard_protocol.wl_seat.capability.keyboard;
+                const capability = switch (handler.kind) {
+                    .pointer => standard_protocol.wl_seat.capability.pointer,
+                    .keyboard => standard_protocol.wl_seat.capability.keyboard,
+                    .touch => standard_protocol.wl_seat.capability.touch,
+                    else => unreachable,
+                };
                 try wayring.server.sendEvent(
                     standard_protocol,
                     standard_protocol.wl_seat,
@@ -1108,7 +1126,103 @@ const ProtocolServerHandler = struct {
                     handler.keyboard_sent = true;
                 },
                 .release => handler.seat_released = true,
-                .get_touch => return error.UnexpectedRequest,
+                .get_touch => |value| {
+                    const surface = handler.surface orelse return error.MissingSurface;
+                    const touch = (try standard_protocol.wl_seat.admit_get_touch(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    handler.touch_created = true;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .down = .{
+                            .serial = 51,
+                            .time = 200,
+                            .surface = surface.id,
+                            .id = 7,
+                            .x = 384,
+                            .y = -512,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .motion = .{ .time = 201, .id = 7, .x = 768, .y = 1024 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .shape = .{ .id = 7, .major = 1280, .minor = 512 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .orientation = .{ .id = 7, .orientation = -11520 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .frame = .{} },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .up = .{ .serial = 52, .time = 202, .id = 7 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .frame = .{} },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .down = .{
+                            .serial = 53,
+                            .time = 203,
+                            .surface = surface.id,
+                            .id = 8,
+                            .x = 0,
+                            .y = 0,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_touch,
+                        handler.objects,
+                        handler.queue,
+                        touch,
+                        .{ .cancel = .{} },
+                    );
+                    handler.touch_sent = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_pointer.info) {
@@ -1132,6 +1246,17 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .release => handler.keyboard_released = true,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_touch.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_touch,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .release => handler.touch_released = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_output.info) {
@@ -1307,7 +1432,8 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).id;
-                    if (handler.kind == .pointer or handler.kind == .keyboard)
+                    if (handler.kind == .pointer or handler.kind == .keyboard or
+                        handler.kind == .touch)
                         handler.surface = surface;
                 },
                 .create_region => return error.UnexpectedRequest,
@@ -1396,7 +1522,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
-                    if (handler.kind == .pointer or handler.kind == .keyboard)
+                    if (handler.kind == .pointer or handler.kind == .keyboard or
+                        handler.kind == .touch)
                         handler.surface_destroyed = true;
                 },
                 .commit => {},
@@ -2337,6 +2464,265 @@ const KeyboardClientHandler = struct {
                     if (!handler.key or value.serial != 44 or value.surface != handler.surface.?.id)
                         return error.InvalidKeyboard;
                     handler.leave = true;
+                },
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
+fn wayringTouchClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.touch_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: TouchClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.compositor == null or handler.seat == null or
+        !handler.capabilities or !handler.name or !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const surface = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const touch = (try standard_protocol.wl_seat.construct_get_touch(
+        client_objects,
+        &actor.transmit,
+        handler.seat.?,
+        .{},
+    )).id;
+    handler.surface = surface;
+    handler.touch = touch;
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.down != 2 or !handler.motion or !handler.shape or !handler.orientation or
+        !handler.up or handler.frames != 2 or !handler.cancel or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_touch,
+        client_objects,
+        &actor.transmit,
+        touch,
+        .{ .release = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_seat,
+        client_objects,
+        &actor.transmit,
+        handler.seat.?,
+        .{ .release = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const TouchClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    touch: ?wayring.objects.Handle = null,
+    synced: bool = false,
+    deleted: bool = false,
+    capabilities: bool = false,
+    name: bool = false,
+    down: usize = 0,
+    motion: bool = false,
+    shape: bool = false,
+    orientation: bool = false,
+    up: bool = false,
+    frames: usize = 0,
+    cancel: bool = false,
+
+    pub fn event(
+        handler: *TouchClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, standard_protocol.wl_compositor.info.name)) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
+                    } else if (std.mem.eql(u8, global.interface, standard_protocol.wl_seat.info.name)) {
+                        handler.seat = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_seat.info,
+                            @min(global.version, 8),
+                            null,
+                        );
+                    }
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.wl_seat.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_seat,
+                handler.objects,
+                handler.seat orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .capabilities => |value| {
+                    if (value.capabilities.value != standard_protocol.wl_seat.capability.touch.value)
+                        return error.InvalidCapabilities;
+                    handler.capabilities = true;
+                },
+                .name => |value| {
+                    if (!std.mem.eql(u8, value.name, "wayring-seat")) return error.InvalidSeat;
+                    handler.name = true;
+                },
+            }
+        } else if (interface == &standard_protocol.wl_touch.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_touch,
+                handler.objects,
+                handler.touch orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .down => |value| {
+                    const valid = if (handler.down == 0)
+                        value.serial == 51 and value.time == 200 and value.id == 7 and
+                            value.x == 384 and value.y == -512
+                    else
+                        handler.down == 1 and value.serial == 53 and value.time == 203 and
+                            value.id == 8 and value.x == 0 and value.y == 0;
+                    if (!valid or value.surface != handler.surface.?.id)
+                        return error.InvalidTouch;
+                    handler.down += 1;
+                },
+                .motion => |value| {
+                    if (value.time != 201 or value.id != 7 or value.x != 768 or value.y != 1024)
+                        return error.InvalidTouch;
+                    handler.motion = true;
+                },
+                .shape => |value| {
+                    if (value.id != 7 or value.major != 1280 or value.minor != 512)
+                        return error.InvalidTouch;
+                    handler.shape = true;
+                },
+                .orientation => |value| {
+                    if (value.id != 7 or value.orientation != -11520)
+                        return error.InvalidTouch;
+                    handler.orientation = true;
+                },
+                .up => |value| {
+                    if (value.serial != 52 or value.time != 202 or value.id != 7)
+                        return error.InvalidTouch;
+                    handler.up = true;
+                },
+                .frame => handler.frames += 1,
+                .cancel => {
+                    if (handler.down != 2) return error.InvalidTouch;
+                    handler.cancel = true;
                 },
             }
         } else return error.UnexpectedEvent;
@@ -3810,6 +4196,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .keyboard_libwayland_client;
         } else if (std.mem.eql(u8, value, "keyboard-libwayland-server")) {
             options.mode = .keyboard_libwayland_server;
+        } else if (std.mem.eql(u8, value, "touch-libwayland-client")) {
+            options.mode = .touch_libwayland_client;
+        } else if (std.mem.eql(u8, value, "touch-libwayland-server")) {
+            options.mode = .touch_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or
