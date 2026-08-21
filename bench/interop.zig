@@ -13,6 +13,7 @@ const c = std.c;
 const linux = std.os.linux;
 const ClientCore = wayring.client.Core(core_protocol);
 const ClientConnection = wayring.client.Connection(core_protocol);
+const ClientDriver = wayring.client.Driver(core_protocol);
 const ServerCore = wayring.server.Core(core_protocol);
 const ServerRuntime = wayring.server.Runtime(core_protocol);
 const Benchmark = benchmark_protocol.wp_wayring_benchmark_v1;
@@ -34,6 +35,7 @@ const Options = struct {
         libwayland_client,
         libwayland_client_driver,
         libwayland_server,
+        libwayland_server_driver,
         xdg_libwayland_client,
         xdg_libwayland_server,
         shm_libwayland_client,
@@ -62,7 +64,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const options = try parseOptions(init.args);
     return switch (options.mode) {
         .libwayland_client, .libwayland_client_driver => wayringServer(options),
-        .libwayland_server => wayringClient(options),
+        .libwayland_server, .libwayland_server_driver => wayringClient(options),
         .xdg_libwayland_client => wayringProtocolServer(.xdg),
         .xdg_libwayland_server => wayringXdgClient(),
         .shm_libwayland_client => wayringProtocolServer(.shm),
@@ -5165,12 +5167,16 @@ fn wayringClient(options: Options) !u8 {
         .registry = registry,
         .callback = callback,
     };
-    try reactor.prepareSend(peer);
-    _ = try reactor.ring.submit();
+    var driver_storage = ClientDriver.init(&connection);
+    const driver: ?*ClientDriver = if (options.mode == .libwayland_server_driver)
+        &driver_storage
+    else
+        null;
+    try prepareClientOutput(&reactor, peer, &handler, driver);
     while (handler.benchmark == null or !handler.synced or !handler.deleted)
-        try pumpClient(&reactor, peer, client_objects, &handler);
+        try pumpSelectedClient(&reactor, peer, client_objects, &handler, driver);
     while (actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
-        try pumpClient(&reactor, peer, client_objects, &handler);
+        try pumpSelectedClient(&reactor, peer, client_objects, &handler, driver);
 
     const descriptor_result = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(descriptor_result) != .SUCCESS) return error.SystemCallFailed;
@@ -5185,20 +5191,21 @@ fn wayringClient(options: Options) !u8 {
         _ = linux.close(descriptor);
         return err;
     };
-    try reactor.prepareSend(peer);
-    _ = try reactor.ring.submit();
+    try prepareClientOutput(&reactor, peer, &handler, driver);
     while (!handler.fd_valid or actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
-        try pumpClient(&reactor, peer, client_objects, &handler);
+        try pumpSelectedClient(&reactor, peer, client_objects, &handler, driver);
 
     if (options.latency) {
-        try clientLatency(allocator, &reactor, peer, client_objects, &handler, options);
+        try clientLatency(allocator, &reactor, peer, client_objects, &handler, driver, options);
     } else {
-        try clientPhase(&reactor, peer, client_objects, &handler, options.warmup, options.batch, 1);
+        try clientPhase(&reactor, peer, client_objects, &handler, driver, options.warmup, options.batch, 1);
         const start = try monotonicNs();
-        try clientPhase(&reactor, peer, client_objects, &handler, options.messages, options.batch, 2);
+        try clientPhase(&reactor, peer, client_objects, &handler, driver, options.messages, options.batch, 2);
         const elapsed = try monotonicNs() - start;
+        const driver_name: [*:0]const u8 = if (driver != null) "batched" else "manual";
         _ = c.printf(
-            "server=libwayland client=wayring messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+            "server=libwayland client=wayring client_driver=%s messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+            driver_name,
             options.messages,
             options.batch,
             elapsed,
@@ -5296,6 +5303,7 @@ fn clientPhase(
     peer: wayring.io_uring.Peer,
     client_objects: *wayring.objects.ClientObjects,
     handler: *ClientHandler,
+    driver: ?*ClientDriver,
     count: u64,
     batch: u32,
     sequence: u32,
@@ -5312,15 +5320,13 @@ fn clientPhase(
         );
         remaining -= chunk;
         const actor = try reactor.getActor(peer);
-        if (!actor.transmit.sendActive()) {
-            try reactor.prepareSend(peer);
-            _ = try reactor.ring.submit();
-        }
+        if (!actor.transmit.sendActive())
+            try prepareClientOutput(reactor, peer, handler, driver);
         while (actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
-            try pumpClient(reactor, peer, client_objects, handler);
+            try pumpSelectedClient(reactor, peer, client_objects, handler, driver);
     }
     while (handler.pong != sequence)
-        try pumpClient(reactor, peer, client_objects, handler);
+        try pumpSelectedClient(reactor, peer, client_objects, handler, driver);
 }
 
 fn clientLatency(
@@ -5329,6 +5335,7 @@ fn clientLatency(
     peer: wayring.io_uring.Peer,
     client_objects: *wayring.objects.ClientObjects,
     handler: *ClientHandler,
+    driver: ?*ClientDriver,
     options: Options,
 ) !void {
     const samples = try allocator.alloc(u64, @intCast(options.messages));
@@ -5338,6 +5345,7 @@ fn clientLatency(
         peer,
         client_objects,
         handler,
+        driver,
         1,
         1,
         @intCast(round + 1),
@@ -5350,6 +5358,7 @@ fn clientLatency(
             peer,
             client_objects,
             handler,
+            driver,
             1,
             1,
             @intCast(options.warmup + round + 1),
@@ -5358,8 +5367,10 @@ fn clientLatency(
         sum += sample.*;
     }
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const driver_name: [*:0]const u8 = if (driver != null) "batched" else "manual";
     _ = c.printf(
-        "server=libwayland client=wayring latency_scope=round_trip rounds=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+        "server=libwayland client=wayring client_driver=%s latency_scope=round_trip rounds=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+        driver_name,
         options.messages,
         @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(options.messages)),
         percentile(samples, 50),
@@ -5367,6 +5378,41 @@ fn clientLatency(
         percentile(samples, 99),
         samples[samples.len - 1],
     );
+}
+
+fn prepareClientOutput(
+    reactor: *wayring.io_uring.Reactor,
+    peer: wayring.io_uring.Peer,
+    handler: *ClientHandler,
+    driver: ?*ClientDriver,
+) !void {
+    if (driver) |active| {
+        _ = try active.schedule();
+        const progress = try active.prepare(handler);
+        if (progress.prepared != 0 or progress.pending)
+            _ = try reactor.ring.submit();
+    } else {
+        try reactor.prepareSend(peer);
+        _ = try reactor.ring.submit();
+    }
+}
+
+fn pumpSelectedClient(
+    reactor: *wayring.io_uring.Reactor,
+    peer: wayring.io_uring.Peer,
+    client_objects: *wayring.objects.ClientObjects,
+    handler: *ClientHandler,
+    driver: ?*ClientDriver,
+) !void {
+    if (driver) |active| {
+        const completion = try reactor.ring.copy_cqe();
+        const progress = try active.dispatch(&.{completion}, handler);
+        if (progress.event_errors != 0) return error.ProtocolError;
+        if (progress.prepared != 0 or progress.pending)
+            _ = try reactor.ring.submit();
+    } else {
+        try pumpClient(reactor, peer, client_objects, handler);
+    }
 }
 
 fn percentile(samples: []const u64, percent: u64) u64 {
@@ -5486,11 +5532,16 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .libwayland_client_driver
         else if (std.mem.eql(u8, value, "libwayland-server"))
             options.mode = .libwayland_server
+        else if (std.mem.eql(u8, value, "libwayland-server-driver"))
+            options.mode = .libwayland_server_driver
         else if (std.mem.eql(u8, value, "libwayland-client-latency")) {
             options.mode = .libwayland_client;
             options.latency = true;
         } else if (std.mem.eql(u8, value, "libwayland-server-latency")) {
             options.mode = .libwayland_server;
+            options.latency = true;
+        } else if (std.mem.eql(u8, value, "libwayland-server-driver-latency")) {
+            options.mode = .libwayland_server_driver;
             options.latency = true;
         } else if (std.mem.eql(u8, value, "libwayland-client-driver-latency")) {
             options.mode = .libwayland_client_driver;

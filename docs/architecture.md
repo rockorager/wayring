@@ -309,6 +309,11 @@ submission and calls `Connection.deinit` with its allocator. External request
 producers explicitly schedule the driver after queueing output. Typed optional
 hooks report terminal event failures and final disconnection without dynamic
 callback registration.
+Against the same libwayland server, the client driver's five-sample throughput
+median was 5.39 million messages/second versus 5.31 million for the handwritten
+loop. A longer alternating latency run measured median p50 of 54.5 microseconds
+for both paths and p99 of 85.0 versus 82.8 microseconds, preserving the manual
+path's latency profile within orb scheduling noise.
 Wayring operation tokens reserve low `user_data` bytes 1 through 5; borrowed-ring
 consumers must use a disjoint tag namespace and pass only Wayring candidates to
 reactor routing.

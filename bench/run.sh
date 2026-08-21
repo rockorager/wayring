@@ -323,6 +323,42 @@ case "$mode" in
             sample=$((sample + 1))
         done
         ;;
+    client-driver)
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample scope=client-driver" >&2
+            if [ $((sample % 2)) -eq 1 ]; then
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" libwayland-server
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" libwayland-server-driver
+            else
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" libwayland-server-driver
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" libwayland-server
+            fi
+            sample=$((sample + 1))
+        done
+        ;;
+    client-driver-latency)
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample scope=client-driver latency_rounds=$latency_messages" >&2
+            if [ $((sample % 2)) -eq 1 ]; then
+                "$root/zig-out/bench/wayring-interop" \
+                    "$latency_messages" 1 "$latency_warmup" libwayland-server-latency
+                "$root/zig-out/bench/wayring-interop" \
+                    "$latency_messages" 1 "$latency_warmup" libwayland-server-driver-latency
+            else
+                "$root/zig-out/bench/wayring-interop" \
+                    "$latency_messages" 1 "$latency_warmup" libwayland-server-driver-latency
+                "$root/zig-out/bench/wayring-interop" \
+                    "$latency_messages" 1 "$latency_warmup" libwayland-server-latency
+            fi
+            sample=$((sample + 1))
+        done
+        ;;
     xdg-interop)
         "$root/zig-out/bench/wayring-interop" 1 1 1 xdg-libwayland-client
         "$root/zig-out/bench/wayring-interop" 1 1 1 xdg-libwayland-server
