@@ -391,6 +391,13 @@ batch reports pending work because the SQ filled, they submit and call
 `prepare` again. Thus the driver removes repetitive compositor event-loop code
 without hiding ring ownership, batching, or another subsystem's completion
 traffic.
+An explicit shutdown request stops dispatch on every current peer, suppresses
+further global publication, and batches listener plus socket cancellation
+through the same pending-work machinery. Accept completions that race with
+shutdown are admitted only long enough to acquire normal ownership and are then
+closed without invoking the connected hook. Progress reports completion only
+after the listener and all client slots are quiescent and destroyed; descriptor
+and object cleanup therefore follows the ordinary generation-safe path.
 
 Against the same libwayland client and generated protocol handler, the batched
 driver's five-sample median was 7.80 million messages/second versus 7.11 million

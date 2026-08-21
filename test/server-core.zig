@@ -1402,20 +1402,17 @@ test "server driver recovers SQ pressure and drains protocol errors" {
     try std.testing.expectEqual(@as(u16, 0), display_error.header.opcode);
     _ = linux.close(client_fds[0]);
 
-    _ = linux.close(client_fds[1]);
-    while (handler.disconnected_count != 2) {
+    try driver.requestShutdown();
+    progress = try driver.prepare(&handler);
+    if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
+    while (!progress.shutdown_complete) {
         completion = try reactor.ring.copy_cqe();
         progress = try driver.dispatch(&.{completion}, &handler);
         if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
     }
+    try std.testing.expectEqual(@as(usize, 2), handler.disconnected_count);
     try std.testing.expectEqual(@as(usize, 0), runtime.clients.reactor.slots.active_count);
-
-    _ = try runtime.prepareEndpointClose();
-    _ = try reactor.ring.submit();
-    while (!runtime.endpoint.listener.canDeinit()) {
-        completion = try reactor.ring.copy_cqe();
-        _ = try driver.dispatch(&.{completion}, &handler);
-    }
+    _ = linux.close(client_fds[1]);
 }
 
 const DriverHandler = struct {

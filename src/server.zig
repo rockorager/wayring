@@ -1506,6 +1506,7 @@ pub fn Driver(comptime protocol: type) type {
         pending_head: u32 = queue_end,
         pending_tail: u32 = queue_end,
         display_context: ?*anyopaque,
+        shutdown_requested: bool = false,
 
         pub const Progress = struct {
             completions: usize = 0,
@@ -1516,6 +1517,7 @@ pub fn Driver(comptime protocol: type) type {
             published: usize = 0,
             prepared: usize = 0,
             pending: bool = false,
+            shutdown_complete: bool = false,
 
             fn merge(progress: *Progress, other: Progress) void {
                 progress.completions += other.completions;
@@ -1526,6 +1528,7 @@ pub fn Driver(comptime protocol: type) type {
                 progress.published += other.published;
                 progress.prepared += other.prepared;
                 progress.pending = other.pending;
+                progress.shutdown_complete = other.shutdown_complete;
             }
         };
 
@@ -1569,6 +1572,19 @@ pub fn Driver(comptime protocol: type) type {
             return true;
         }
 
+        /// Starts abrupt endpoint shutdown without submitting. Existing peers
+        /// stop dispatch immediately; their active socket operations and the
+        /// multishot accept are cancelled by `prepare` in shared SQ batches.
+        pub fn requestShutdown(driver: *Self) !void {
+            if (driver.shutdown_requested) return;
+            driver.shutdown_requested = true;
+            var peers = driver.runtime.clients.iterator();
+            while (peers.next()) |peer| {
+                (try driver.runtime.clients.reactor.getActor(peer)).beginClose();
+                _ = try driver.schedule(peer);
+            }
+        }
+
         /// Processes Wayring CQEs and prepares all resulting socket work without
         /// submitting the ring. On a borrowed ring, filter unrelated CQEs before
         /// passing the batch. Call `prepare` again after submission while
@@ -1592,17 +1608,30 @@ pub fn Driver(comptime protocol: type) type {
         pub fn prepare(driver: *Self, handler: anytype) !Progress {
             var progress: Progress = .{};
             const reactor = driver.runtime.clients.reactor;
-            while (true) switch (try driver.runtime.publishNext()) {
-                .sent => |peer| {
-                    _ = try driver.schedule(peer);
-                    progress.published += 1;
-                },
-                .blocked => |peer| {
-                    _ = try driver.schedule(peer);
-                    break;
-                },
-                .complete => break,
-            };
+            if (driver.shutdown_requested and
+                !driver.runtime.endpoint.listener.closing)
+            {
+                const queued = driver.runtime.prepareEndpointClose() catch |err| {
+                    if (err == error.SubmissionQueueFull) {
+                        progress.pending = true;
+                        return progress;
+                    }
+                    return err;
+                };
+                if (queued) progress.prepared += 1;
+            }
+            if (!driver.shutdown_requested)
+                while (true) switch (try driver.runtime.publishNext()) {
+                    .sent => |peer| {
+                        _ = try driver.schedule(peer);
+                        progress.published += 1;
+                    },
+                    .blocked => |peer| {
+                        _ = try driver.schedule(peer);
+                        break;
+                    },
+                    .complete => break,
+                };
             while (driver.pending_head != queue_end) {
                 const slot = driver.pending_head;
                 const node = &driver.pending_storage[slot];
@@ -1651,6 +1680,9 @@ pub fn Driver(comptime protocol: type) type {
             progress.prepared += try reactor.prepareDeferredReceives();
             progress.pending = driver.pending_head != queue_end or
                 reactor.deferredReceivesPending();
+            progress.shutdown_complete = driver.shutdown_requested and
+                driver.runtime.endpoint.listener.canDeinit() and
+                reactor.slots.active_count == 0;
             return progress;
         }
 
@@ -1670,8 +1702,11 @@ pub fn Driver(comptime protocol: type) type {
                     )) |peer| {
                         progress.accepted += 1;
                         progress.prepared += 1;
-                        if (@hasDecl(@TypeOf(handler.*), "connected"))
+                        if (driver.shutdown_requested) {
+                            (try reactor.getActor(peer)).beginClose();
+                        } else if (@hasDecl(@TypeOf(handler.*), "connected")) {
                             handler.connected(peer);
+                        }
                         _ = try driver.schedule(peer);
                     }
                 },

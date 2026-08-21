@@ -191,7 +191,7 @@ fn wayringServer(options: Options) !u8 {
     };
     _ = try reactor.ring.submit();
     if (options.mode == .libwayland_client_driver)
-        try runDriverServer(allocator, &reactor, &runtime, peer, actor, &handler)
+        try runDriverServer(allocator, &reactor, &runtime, actor, &handler)
     else
         try runManualServer(&reactor, &runtime, peer, actor, &handler);
     try runtime.deinit(allocator);
@@ -280,7 +280,6 @@ fn runDriverServer(
     allocator: std.mem.Allocator,
     reactor: *wayring.io_uring.Reactor,
     runtime: *ServerRuntime,
-    peer: wayring.io_uring.Peer,
     actor: *wayring.connection.Actor,
     handler: *ServerHandler,
 ) !void {
@@ -298,14 +297,14 @@ fn runDriverServer(
             _ = try reactor.ring.submit();
     }
 
-    _ = try runtime.prepareEndpointClose();
-    _ = try runtime.clients.prepareClose(peer);
-    _ = try driver.schedule(peer);
-    _ = try reactor.ring.submit();
-    while (!runtime.endpoint.listener.canDeinit() or reactor.slots.active_count != 0) {
+    try driver.requestShutdown();
+    var shutdown = try driver.prepare(&adapter);
+    if (shutdown.prepared != 0 or shutdown.pending)
+        _ = try reactor.ring.submit();
+    while (!shutdown.shutdown_complete) {
         const count = try reactor.ring.copy_cqes(&completions, 1);
-        const progress = try driver.dispatch(completions[0..count], &adapter);
-        if (progress.prepared != 0 or progress.pending)
+        shutdown = try driver.dispatch(completions[0..count], &adapter);
+        if (shutdown.prepared != 0 or shutdown.pending)
             _ = try reactor.ring.submit();
     }
 }
