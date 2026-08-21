@@ -440,6 +440,26 @@ shared server namespace directly. Its
 million for the prior per-client table and about 3–5 million for libwayland in
 the same orb.
 
+## Compositor state
+
+Reusable compositor policy is layered above generated protocol dispatch rather
+than embedded in transport actors. The first protocol-independent primitive is
+a fixed-size `wl_surface` state machine. It enforces permanent role identity and
+live role-object destruction ordering, validates scale, transform, and
+version-dependent attach offsets, and atomically commits buffer attachment,
+surface and buffer damage, transform, scale, and content offset. Persistent
+properties remain pending/current values while attachment, damage, and offset
+are extracted and reset as one content update.
+
+Damage uses one conservative bounding rectangle per coordinate space. This may
+overdraw but cannot miss changed pixels, requires no region allocation, and
+keeps the common surface commit path fixed-size. Exact opaque/input regions,
+frame callback chains, synchronized subsurface content-update graphs, and
+version-7 per-commit release callbacks remain separate composable state because
+their storage and scheduling policy differ by compositor. The SHM
+interoperability server exercises this state machine with real libwayland
+attach, dual damage, transform, scale, offset, and commit requests.
+
 ## Initial transport candidate
 
 - One ring per reactor thread, with connections permanently assigned to a ring.

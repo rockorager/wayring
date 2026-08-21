@@ -718,6 +718,7 @@ const ProtocolServerHandler = struct {
     buffer_transformed: bool = false,
     buffer_scaled: bool = false,
     surface_offset: bool = false,
+    surface_state: wayring.compositor.Surface = .{},
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1878,6 +1879,7 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
+                    if (handler.kind == .shm) try handler.surface_state.validateDestroy();
                     if (handler.kind == .subsurface)
                         handler.subsurface_surfaces_destroyed += 1;
                     if (handler.kind == .shm) handler.surface_destroyed = true;
@@ -1889,11 +1891,18 @@ const ProtocolServerHandler = struct {
                     if (handler.kind != .shm or value.buffer == null or
                         value.buffer.? != handler.buffer.?.id or value.x != 0 or value.y != 0)
                         return error.InvalidSurface;
+                    try handler.surface_state.attach(
+                        target.object.version,
+                        handler.buffer,
+                        value.x,
+                        value.y,
+                    );
                 },
                 .damage => |value| {
                     if (handler.kind != .shm or value.x != 1 or value.y != 2 or
                         value.width != 3 or value.height != 4)
                         return error.InvalidSurface;
+                    handler.surface_state.damage(value.x, value.y, value.width, value.height);
                 },
                 .frame => |value| {
                     if (handler.kind != .shm) return error.UnexpectedRequest;
@@ -1908,6 +1917,7 @@ const ProtocolServerHandler = struct {
                     if (handler.kind != .shm or value.x != 5 or value.y != 6 or
                         value.width != 7 or value.height != 8)
                         return error.InvalidSurface;
+                    handler.surface_state.damageBuffer(value.x, value.y, value.width, value.height);
                 },
                 .set_opaque_region => |value| {
                     if (handler.kind != .shm or value.region == null or
@@ -1925,20 +1935,31 @@ const ProtocolServerHandler = struct {
                     if (handler.kind != .shm or value.transform.value !=
                         standard_protocol.wl_output.transform.@"90".value)
                         return error.InvalidSurface;
+                    try handler.surface_state.setTransform(value.transform.value);
                     handler.buffer_transformed = true;
                 },
                 .set_buffer_scale => |value| {
                     if (handler.kind != .shm or value.scale != 2)
                         return error.InvalidSurface;
+                    try handler.surface_state.setScale(value.scale);
                     handler.buffer_scaled = true;
                 },
                 .offset => |value| {
                     if (handler.kind != .shm or value.x != 2 or value.y != -3)
                         return error.InvalidSurface;
+                    handler.surface_state.setOffset(value.x, value.y);
                     handler.surface_offset = true;
                 },
                 .commit => {
                     if (handler.kind == .shm) {
+                        const update = handler.surface_state.commit();
+                        if (update.attachment == null or
+                            update.attachment.?.buffer == null or
+                            !std.meta.eql(update.attachment.?.buffer.?, handler.buffer.?) or
+                            update.surface_damage.empty or update.buffer_damage.empty or
+                            update.transform != .@"90" or update.scale != 2 or
+                            update.offset.x != 2 or update.offset.y != -3)
+                            return error.InvalidSurfaceState;
                         try wayring.server.sendEvent(
                             standard_protocol,
                             standard_protocol.wl_buffer,
