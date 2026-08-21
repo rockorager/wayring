@@ -54,7 +54,7 @@ pool_create_buffer(struct wl_client *client, struct wl_resource *resource,
 	struct shm_server_state *state = wl_resource_get_user_data(resource);
 	struct wl_resource *buffer;
 
-	if (offset != 0 || width != 1 || height != 1 || stride != 4 ||
+	if (offset != 0 || width != 2 || height != 2 || stride != 8 ||
 	    format != WL_SHM_FORMAT_ARGB8888) {
 		wl_client_post_implementation_error(client, "invalid shm buffer");
 		return;

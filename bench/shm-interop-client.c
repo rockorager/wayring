@@ -118,7 +118,7 @@ shm_client_fd(int fd)
 	if (pool == NULL)
 		goto cleanup;
 	buffer = wl_shm_pool_create_buffer(
-		pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
+		pool, 0, 2, 2, 8, WL_SHM_FORMAT_ARGB8888);
 	surface = wl_compositor_create_surface(state.compositor);
 	if (buffer == NULL || surface == NULL)
 		goto cleanup;

@@ -1711,8 +1711,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .create_buffer => |value| {
-                    if (value.offset != 0 or value.width != 1 or value.height != 1 or
-                        value.stride != 4 or value.format.value !=
+                    if (value.offset != 0 or value.width != 2 or value.height != 2 or
+                        value.stride != 8 or value.format.value !=
                         standard_protocol.wl_shm.format.argb8888.value)
                         return error.InvalidShmBuffer;
                     const buffer = (try standard_protocol.wl_shm_pool.admit_create_buffer(
@@ -1942,7 +1942,11 @@ const ProtocolServerHandler = struct {
                         return error.InvalidSurface;
                     try handler.surface_state.attach(
                         target.object.version,
-                        handler.buffer,
+                        .{
+                            .handle = handler.buffer.?,
+                            .width = 2,
+                            .height = 2,
+                        },
                         value.x,
                         value.y,
                     );
@@ -2032,7 +2036,7 @@ const ProtocolServerHandler = struct {
                         const update = content.surface;
                         if (update.attachment == null or
                             update.attachment.?.buffer == null or
-                            !std.meta.eql(update.attachment.?.buffer.?, handler.buffer.?) or
+                            !std.meta.eql(update.attachment.?.buffer.?.handle, handler.buffer.?) or
                             update.surface_damage.empty or update.buffer_damage.empty or
                             update.transform != .@"90" or update.scale != 2 or
                             update.offset.x != 2 or update.offset.y != -3)
@@ -4668,9 +4672,9 @@ fn wayringShmClient() !u8 {
         pool.id,
         .{
             .offset = 0,
-            .width = 1,
-            .height = 1,
-            .stride = 4,
+            .width = 2,
+            .height = 2,
+            .stride = 8,
             .format = .argb8888,
         },
     )).id;
