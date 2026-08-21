@@ -730,6 +730,7 @@ const ProtocolServerHandler = struct {
     ponged: bool = false,
     configured: bool = false,
     pool_created: bool = false,
+    shm_pool_size: usize = 0,
     buffer_created: bool = false,
     buffer_destroyed: bool = false,
     pool_destroyed: bool = false,
@@ -1688,9 +1689,12 @@ const ProtocolServerHandler = struct {
                 .create_pool => |value| {
                     defer _ = linux.close(value.fd);
                     const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
-                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0 or
-                        value.size != 4096)
+                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0)
                         return error.InvalidShmPool;
+                    handler.shm_pool_size = try wayring.shm.createPool(
+                        .{ .max_pool_bytes = 4096 },
+                        value.size,
+                    );
                     _ = try standard_protocol.wl_shm.admit_create_pool(
                         handler.objects,
                         decoded.handle,
@@ -1711,9 +1715,17 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .create_buffer => |value| {
-                    if (value.offset != 0 or value.width != 2 or value.height != 2 or
-                        value.stride != 8 or value.format.value !=
-                        standard_protocol.wl_shm.format.argb8888.value)
+                    const metadata = try wayring.shm.createBuffer(
+                        handler.shm_pool_size,
+                        .{ .value = value.format.value, .bytes_per_pixel = 4 },
+                        value.offset,
+                        value.width,
+                        value.height,
+                        value.stride,
+                    );
+                    if (metadata.offset != 0 or metadata.width != 2 or
+                        metadata.height != 2 or metadata.stride != 8 or
+                        metadata.format.value != standard_protocol.wl_shm.format.argb8888.value)
                         return error.InvalidShmBuffer;
                     const buffer = (try standard_protocol.wl_shm_pool.admit_create_buffer(
                         handler.objects,

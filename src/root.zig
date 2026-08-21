@@ -31,6 +31,7 @@ pub const frame = @import("frame.zig");
 pub const subsurface = @import("subsurface.zig");
 pub const release = @import("release.zig");
 pub const content_update = @import("content_update.zig");
+pub const shm = @import("shm.zig");
 
 test {
     _ = wire;
@@ -56,4 +57,5 @@ test {
     _ = subsurface;
     _ = release;
     _ = content_update;
+    _ = shm;
 }

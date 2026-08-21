@@ -523,6 +523,15 @@ exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and
 commit requests, including destroying the source region after it is copied.
 
+SHM import begins with protocol-independent, format-aware metadata validation.
+Applications configure a hard maximum pool size and supply bytes per pixel for
+every advertised core or custom format. Pool creation and growth, positive
+dimensions, minimum row stride, conservative `stride * height` extent, and
+final offset are checked before publication with overflow-safe arithmetic. This
+bounded metadata layer is the prerequisite for shared mapping lifetime and
+SIGBUS-safe pixel access; those remain explicit rather than exposing an unsafe
+raw mapped slice prematurely.
+
 ## Initial transport candidate
 
 - One ring per reactor thread, with connections permanently assigned to a ring.
