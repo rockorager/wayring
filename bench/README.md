@@ -167,8 +167,7 @@ publishes geometry, mode flags, scale, stable name, description, and `done` in
 one event burst. Both clients validate every field before releasing the output,
 covering version-gated core events and output-resource teardown.
 
-Pointer interoperability mode drives a real libwayland client against a
-Wayring server. It advertises seat capabilities and name, creates a surface and
-pointer, and validates focus, fixed-point motion, button, wheel source, axis,
-discrete and value120 scroll data, stop, and frame events before ordered pointer,
-surface, and seat teardown.
+Pointer interoperability mode runs both library pairings. Each advertises seat
+capabilities and name, creates a surface and pointer, and validates focus,
+fixed-point motion, button, wheel source, axis, discrete and value120 scroll
+data, stop, and frame events before ordered pointer, surface, and seat teardown.
