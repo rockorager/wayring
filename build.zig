@@ -84,6 +84,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_end_to_end_tests = b.addRunArtifact(end_to_end_tests);
+    const fuzz_optimize: std.builtin.OptimizeMode = if (optimize == .Debug)
+        .ReleaseSafe
+    else
+        optimize;
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fuzz.zig"),
+            .target = target,
+            // Zig 0.16's self-hosted Debug fuzz runner has incompatible
+            // stack-trace types. ReleaseSafe uses the supported LLVM path.
+            .optimize = fuzz_optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "generated_protocol", .module = generated_test_module },
+            },
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
 
     const test_step = b.step("test", "Run the tests");
     test_step.dependOn(&run_tests.step);
@@ -91,6 +109,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_client_core_tests.step);
     test_step.dependOn(&run_server_core_tests.step);
     test_step.dependOn(&run_end_to_end_tests.step);
+    test_step.dependOn(&run_fuzz_tests.step);
+
+    const fuzz_step = b.step("fuzz", "Fuzz wire and connection state machines");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
 
     const protocol_compat_test = b.addSystemCommand(&.{ "/bin/sh", "test/protocol-compat.sh" });
     protocol_compat_test.addArtifactArg(scanner);
