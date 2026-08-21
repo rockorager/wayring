@@ -152,8 +152,10 @@ import failure, synchronization, and ordered destruction. The harness validates
 wire and object semantics without attempting to import the synthetic descriptor
 as a real GPU dma-buf.
 
-Data-device interoperability mode drives a real libwayland clipboard source
-against a Wayring server. It binds a seat and data-device manager, creates a
-source and device, advertises a MIME type, sets the selection, transfers the
-payload through a close-on-exec pipe supplied by the server, and validates
-ordered source, device, and seat teardown.
+Data-device interoperability mode runs both library pairings. It binds a seat
+and data-device manager, creates a source and device, advertises a MIME type,
+sets the selection, and transfers the source payload through a close-on-exec
+pipe supplied by the server. The reverse pairing also admits a server-created
+data offer and transfers its payload through a client-supplied pipe. Both paths
+validate descriptor ownership and ordered offer, source, device, and seat
+teardown.

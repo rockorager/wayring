@@ -8,5 +8,6 @@ int shm_server_fd(int fd);
 int dmabuf_client_fd(int fd);
 int dmabuf_server_fd(int fd);
 int data_device_client_fd(int fd);
+int data_device_server_fd(int fd);
 
 #endif

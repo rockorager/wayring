@@ -87,6 +87,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/dmabuf-interop-client.c" \
     "$root/bench/dmabuf-interop-server.c" \
     "$root/bench/data-device-interop-client.c" \
+    "$root/bench/data-device-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     "$generated/presentation-time-protocol.c" \
