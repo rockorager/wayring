@@ -9,6 +9,7 @@
 #include <wayland-client.h>
 
 static const char selection_data[] = "libwayland-selection";
+static const char offer_data[] = "wayring-drag-offer";
 
 struct data_device_client_state {
 	struct wl_seat *seat;
@@ -19,6 +20,49 @@ struct data_device_client_state {
 	int drop_performed;
 	int finished;
 	int action;
+	struct wl_data_offer *offer;
+	int offer_read_fd;
+	int offer_mime;
+	int offer_source_actions;
+	int offer_action;
+	int enter;
+	int motion;
+	int drop;
+	int leave;
+};
+
+static void
+offer_mime(void *data, struct wl_data_offer *offer, const char *mime_type)
+{
+	struct data_device_client_state *state = data;
+	(void) offer;
+	if (strcmp(mime_type, "text/plain") == 0)
+		state->offer_mime = 1;
+}
+
+static void
+offer_source_actions(void *data, struct wl_data_offer *offer, uint32_t actions)
+{
+	struct data_device_client_state *state = data;
+	(void) offer;
+	if (actions == (WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+	                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE))
+		state->offer_source_actions = 1;
+}
+
+static void
+offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
+{
+	struct data_device_client_state *state = data;
+	(void) offer;
+	if (action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+		state->offer_action = 1;
+}
+
+static const struct wl_data_offer_listener offer_listener = {
+	.offer = offer_mime,
+	.source_actions = offer_source_actions,
+	.action = offer_action,
 };
 
 static void
@@ -94,9 +138,10 @@ static void
 device_data_offer(void *data, struct wl_data_device *device,
                   struct wl_data_offer *offer)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) device;
-	(void) offer;
+	state->offer = offer;
+	wl_data_offer_add_listener(offer, &offer_listener, state);
 }
 
 static void
@@ -104,38 +149,50 @@ device_enter(void *data, struct wl_data_device *device, uint32_t serial,
              struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
              struct wl_data_offer *offer)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) device;
-	(void) serial;
-	(void) surface;
-	(void) x;
-	(void) y;
-	(void) offer;
+	if (serial == 99 && surface != NULL && x == wl_fixed_from_double(1.5) &&
+	    y == wl_fixed_from_int(-2) && offer == state->offer) {
+		wl_data_offer_accept(offer, serial, "text/plain");
+		wl_data_offer_set_actions(
+			offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+			       WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
+			WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+		state->enter = 1;
+	}
 }
 
 static void
 device_leave(void *data, struct wl_data_device *device)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) device;
+	state->leave = 1;
 }
 
 static void
 device_motion(void *data, struct wl_data_device *device, uint32_t time,
               wl_fixed_t x, wl_fixed_t y)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
 	(void) device;
-	(void) time;
-	(void) x;
-	(void) y;
+	if (time == 300 && x == wl_fixed_from_int(2) && y == wl_fixed_from_int(3))
+		state->motion = 1;
 }
 
 static void
 device_drop(void *data, struct wl_data_device *device)
 {
-	(void) data;
+	struct data_device_client_state *state = data;
+	int pipe_fds[2];
 	(void) device;
+	if (pipe2(pipe_fds, O_CLOEXEC) != 0)
+		return;
+	state->offer_read_fd = pipe_fds[0];
+	wl_data_offer_receive(state->offer, "text/plain", pipe_fds[1]);
+	close(pipe_fds[1]);
+	wl_data_offer_finish(state->offer);
+	state->drop = 1;
 }
 
 static void
@@ -192,7 +249,7 @@ static const struct wl_registry_listener registry_listener = {
 int
 data_device_client_fd(int fd)
 {
-	struct data_device_client_state state = {0};
+	struct data_device_client_state state = {.offer_read_fd = -1};
 	struct wl_display *display = wl_display_connect_to_fd(fd);
 	struct wl_registry *registry;
 	struct wl_data_source *source = NULL;
@@ -226,11 +283,30 @@ data_device_client_fd(int fd)
 	wl_data_device_set_selection(device, source, 77);
 	wl_data_device_start_drag(device, source, origin, icon, 88);
 	if (wl_display_roundtrip(display) < 0 || !state.sent || !state.target ||
-	    !state.drop_performed || !state.finished || !state.action)
+	    !state.drop_performed || !state.finished || !state.action ||
+	    !state.offer_mime || !state.offer_source_actions || !state.offer_action ||
+	    !state.enter || !state.motion || !state.drop || !state.leave)
 		goto cleanup;
+	if (wl_display_roundtrip(display) < 0)
+		goto cleanup;
+	if (state.offer_read_fd >= 0) {
+		char received[sizeof(offer_data)];
+		ssize_t count = read(state.offer_read_fd, received, sizeof(received));
+		close(state.offer_read_fd);
+		state.offer_read_fd = -1;
+		if (count != (ssize_t) sizeof(received) ||
+		    memcmp(received, offer_data, sizeof(received)) != 0)
+			goto cleanup;
+	} else {
+		goto cleanup;
+	}
 	status = EXIT_SUCCESS;
 
 cleanup:
+	if (state.offer_read_fd >= 0)
+		close(state.offer_read_fd);
+	if (state.offer != NULL)
+		wl_data_offer_destroy(state.offer);
 	if (source != NULL)
 		wl_data_source_destroy(source);
 	if (device != NULL)

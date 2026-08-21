@@ -16,6 +16,8 @@ struct data_device_server_state {
 	struct wl_resource *source;
 	struct wl_resource *origin;
 	struct wl_resource *icon;
+	struct wl_resource *device;
+	struct wl_resource *offer;
 	int source_read_fd;
 	int source_created;
 	int device_created;
@@ -31,16 +33,21 @@ struct data_device_server_state {
 	int drag_started;
 	int drag_events;
 	int surfaces_destroyed;
+	int offer_accepted;
+	int offer_actions;
+	int offer_finished;
+	int destination_events;
 };
 
 static void
 offer_accept(struct wl_client *client, struct wl_resource *resource,
              uint32_t serial, const char *mime_type)
 {
-	(void) client;
-	(void) resource;
-	(void) serial;
-	(void) mime_type;
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	if (serial != 99 || mime_type == NULL || strcmp(mime_type, "text/plain") != 0)
+		wl_client_post_implementation_error(client, "invalid offer acceptance");
+	else
+		state->offer_accepted = 1;
 }
 
 static void
@@ -75,18 +82,22 @@ offer_destroy(struct wl_client *client, struct wl_resource *resource)
 static void
 offer_finish(struct wl_client *client, struct wl_resource *resource)
 {
-	(void) resource;
-	wl_client_post_implementation_error(client, "unexpected data offer finish");
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	(void) client;
+	state->offer_finished = 1;
 }
 
 static void
 offer_set_actions(struct wl_client *client, struct wl_resource *resource,
                   uint32_t actions, uint32_t preferred_action)
 {
-	(void) resource;
-	(void) actions;
-	(void) preferred_action;
-	wl_client_post_implementation_error(client, "unexpected data offer actions");
+	struct data_device_server_state *state = wl_resource_get_user_data(resource);
+	if (actions != (WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+	                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE) ||
+	    preferred_action != WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+		wl_client_post_implementation_error(client, "invalid offer actions");
+	else
+		state->offer_actions = 1;
 }
 
 static const struct wl_data_offer_interface offer_implementation = {
@@ -240,7 +251,12 @@ manager_get_device(struct wl_client *client, struct wl_resource *resource,
 	wl_resource_set_implementation(offer, &offer_implementation, state, NULL);
 	wl_data_device_send_data_offer(device, offer);
 	wl_data_offer_send_offer(offer, "text/plain");
-	wl_data_device_send_selection(device, offer);
+	wl_data_offer_send_source_actions(
+		offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+		       WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+	wl_data_offer_send_action(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+	state->device = device;
+	state->offer = offer;
 	state->device_created = 1;
 }
 
@@ -344,8 +360,17 @@ compositor_create_surface(struct wl_client *client, struct wl_resource *resource
 	wl_resource_set_implementation(surface, &surface_implementation, state, NULL);
 	if (state->origin == NULL)
 		state->origin = surface;
-	else
+	else {
 		state->icon = surface;
+		wl_data_device_send_enter(state->device, 99, state->origin,
+		                          wl_fixed_from_double(1.5), wl_fixed_from_int(-2),
+		                          state->offer);
+		wl_data_device_send_motion(
+			state->device, 300, wl_fixed_from_int(2), wl_fixed_from_int(3));
+		wl_data_device_send_drop(state->device);
+		wl_data_device_send_leave(state->device);
+		state->destination_events = 1;
+	}
 }
 
 static void
@@ -417,6 +442,8 @@ data_device_server_fd(int fd)
 	       state.selection_set && state.source_sent && state.offer_received &&
 	       state.offer_destroyed && state.source_destroyed &&
 	       state.device_released && state.seat_released && state.source_actions &&
-	       state.drag_started && state.drag_events && state.surfaces_destroyed == 2 ?
+	       state.drag_started && state.drag_events && state.surfaces_destroyed == 2 &&
+	       state.offer_accepted && state.offer_actions && state.offer_finished &&
+	       state.destination_events ?
 	       EXIT_SUCCESS : EXIT_FAILURE;
 }

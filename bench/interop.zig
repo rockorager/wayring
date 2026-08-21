@@ -544,6 +544,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .data_device => if (!handler.data_source_created or !handler.data_device_created or
             !handler.mime_offered or !handler.selection_set or !handler.selection_sent or
             !handler.source_actions_set or !handler.drag_started or !handler.drag_events_sent or
+            !handler.offer_events_sent or !handler.offer_accepted or
+            !handler.offer_actions_set or !handler.offer_received or
+            !handler.offer_finished or !handler.offer_destroyed or
             !handler.data_source_destroyed or !handler.data_device_released or
             !handler.seat_released)
             return error.IncompleteInterop,
@@ -651,6 +654,14 @@ const ProtocolServerHandler = struct {
     drag_origin: ?wayring.objects.Handle = null,
     drag_icon: ?wayring.objects.Handle = null,
     drag_surface_count: usize = 0,
+    data_device: ?wayring.objects.Handle = null,
+    data_offer: ?wayring.objects.Handle = null,
+    offer_events_sent: bool = false,
+    offer_accepted: bool = false,
+    offer_actions_set: bool = false,
+    offer_received: bool = false,
+    offer_finished: bool = false,
+    offer_destroyed: bool = false,
     data_source_destroyed: bool = false,
     data_device_released: bool = false,
     seat_released: bool = false,
@@ -913,14 +924,80 @@ const ProtocolServerHandler = struct {
                     handler.data_source_created = true;
                 },
                 .get_data_device => |value| {
-                    _ = try standard_protocol.wl_data_device_manager.admit_get_data_device(
+                    const device = (try standard_protocol.wl_data_device_manager.admit_get_data_device(
                         handler.objects,
                         decoded.handle,
                         value,
                         .{},
+                    )).id;
+                    const offer = (try standard_protocol.wl_data_device.construct_event_data_offer(
+                        standard_protocol,
+                        handler.objects,
+                        handler.queue,
+                        device,
+                        .{},
+                    )).id;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_offer,
+                        handler.objects,
+                        handler.queue,
+                        offer,
+                        .{ .offer = .{ .mime_type = "text/plain" } },
                     );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_offer,
+                        handler.objects,
+                        handler.queue,
+                        offer,
+                        .{ .source_actions = .{ .source_actions = .fromInt(3) } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_data_offer,
+                        handler.objects,
+                        handler.queue,
+                        offer,
+                        .{ .action = .{ .dnd_action = .move } },
+                    );
+                    handler.data_device = device;
+                    handler.data_offer = offer;
                     handler.data_device_created = true;
                 },
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_data_offer.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_data_offer,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .accept => |value| {
+                    if (value.serial != 99 or value.mime_type == null or
+                        !std.mem.eql(u8, value.mime_type.?, "text/plain"))
+                        return error.InvalidDrag;
+                    handler.offer_accepted = true;
+                },
+                .receive => |value| {
+                    defer _ = linux.close(value.fd);
+                    const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
+                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0 or
+                        !std.mem.eql(u8, value.mime_type, "text/plain"))
+                        return error.InvalidDrag;
+                    try writeExactInterop(value.fd, "wayring-drag-offer\x00");
+                    handler.offer_received = true;
+                },
+                .set_actions => |value| {
+                    if (value.dnd_actions.value != 3 or value.preferred_action.value !=
+                        standard_protocol.wl_data_device_manager.dnd_action.move.value)
+                        return error.InvalidDrag;
+                    handler.offer_actions_set = true;
+                },
+                .finish => handler.offer_finished = true,
+                .destroy => handler.offer_destroyed = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_data_source.info) {
@@ -1548,6 +1625,49 @@ const ProtocolServerHandler = struct {
                         else
                             return error.UnexpectedRequest;
                         handler.drag_surface_count += 1;
+                        if (handler.drag_surface_count == 2) {
+                            const device = handler.data_device orelse return error.MissingDataDevice;
+                            const offer = handler.data_offer orelse return error.MissingDataOffer;
+                            try wayring.server.sendEvent(
+                                standard_protocol,
+                                standard_protocol.wl_data_device,
+                                handler.objects,
+                                handler.queue,
+                                device,
+                                .{ .enter = .{
+                                    .serial = 99,
+                                    .surface = handler.drag_origin.?.id,
+                                    .x = 384,
+                                    .y = -512,
+                                    .id = offer.id,
+                                } },
+                            );
+                            try wayring.server.sendEvent(
+                                standard_protocol,
+                                standard_protocol.wl_data_device,
+                                handler.objects,
+                                handler.queue,
+                                device,
+                                .{ .motion = .{ .time = 300, .x = 512, .y = 768 } },
+                            );
+                            try wayring.server.sendEvent(
+                                standard_protocol,
+                                standard_protocol.wl_data_device,
+                                handler.objects,
+                                handler.queue,
+                                device,
+                                .{ .drop = .{} },
+                            );
+                            try wayring.server.sendEvent(
+                                standard_protocol,
+                                standard_protocol.wl_data_device,
+                                handler.objects,
+                                handler.queue,
+                                device,
+                                .{ .leave = .{} },
+                            );
+                            handler.offer_events_sent = true;
+                        }
                     }
                     if (handler.kind == .subsurface) {
                         if (handler.subsurface_surfaces_created == 0)
@@ -3497,6 +3617,7 @@ fn wayringDataDeviceClient() !u8 {
     )).id;
     handler.source = source;
     handler.device = device;
+    handler.destination = origin;
     try wayring.client.sendRequest(
         standard_protocol.wl_data_source,
         client_objects,
@@ -3537,10 +3658,28 @@ fn wayringDataDeviceClient() !u8 {
     _ = try reactor.ring.submit();
     while (!handler.source_sent or !handler.source_target or !handler.source_action or
         !handler.source_drop_performed or !handler.source_finished or
-        handler.offer == null or !handler.offer_mime or
-        !handler.selection_received or !handler.synced or !handler.deleted)
+        handler.offer == null or !handler.offer_mime or !handler.offer_source_actions or
+        !handler.offer_action or !handler.drag_enter or !handler.drag_motion or
+        !handler.drag_drop or !handler.drag_leave or !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
+    try wayring.client.sendRequest(
+        standard_protocol.wl_data_offer,
+        client_objects,
+        &actor.transmit,
+        handler.offer.?,
+        .{ .accept = .{ .serial = 99, .mime_type = "text/plain" } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_data_offer,
+        client_objects,
+        &actor.transmit,
+        handler.offer.?,
+        .{ .set_actions = .{
+            .dnd_actions = .fromInt(3),
+            .preferred_action = .move,
+        } },
+    );
     var offer_pipe: [2]linux.fd_t = undefined;
     const pipe_result = linux.pipe2(&offer_pipe, .{ .CLOEXEC = true });
     if (linux.errno(pipe_result) != .SUCCESS) return error.SystemCallFailed;
@@ -3571,6 +3710,13 @@ fn wayringDataDeviceClient() !u8 {
     if (!std.mem.eql(u8, &offer_bytes, "libwayland-offer\x00"))
         return error.InvalidSelection;
 
+    try wayring.client.sendRequest(
+        standard_protocol.wl_data_offer,
+        client_objects,
+        &actor.transmit,
+        handler.offer.?,
+        .{ .finish = .{} },
+    );
     try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
@@ -3638,6 +3784,7 @@ const DataDeviceClientHandler = struct {
     compositor: ?wayring.objects.Handle = null,
     source: ?wayring.objects.Handle = null,
     device: ?wayring.objects.Handle = null,
+    destination: ?wayring.objects.Handle = null,
     offer: ?wayring.objects.Handle = null,
     synced: bool = false,
     deleted: bool = false,
@@ -3647,7 +3794,12 @@ const DataDeviceClientHandler = struct {
     source_drop_performed: bool = false,
     source_finished: bool = false,
     offer_mime: bool = false,
-    selection_received: bool = false,
+    offer_source_actions: bool = false,
+    offer_action: bool = false,
+    drag_enter: bool = false,
+    drag_motion: bool = false,
+    drag_drop: bool = false,
+    drag_leave: bool = false,
 
     pub fn event(
         handler: *DataDeviceClientHandler,
@@ -3774,12 +3926,24 @@ const DataDeviceClientHandler = struct {
                     )).id;
                 },
                 .selection => |value| {
-                    if (value.id == null or handler.offer == null or
-                        value.id.? != handler.offer.?.id)
-                        return error.InvalidSelection;
-                    handler.selection_received = true;
+                    _ = value;
+                    return error.UnexpectedEvent;
                 },
-                else => return error.UnexpectedEvent,
+                .enter => |value| {
+                    if (value.serial != 99 or value.surface != handler.destination.?.id or
+                        value.x != 384 or
+                        value.y != -512 or value.id == null or
+                        value.id.? != handler.offer.?.id)
+                        return error.InvalidDrag;
+                    handler.drag_enter = true;
+                },
+                .motion => |value| {
+                    if (value.time != 300 or value.x != 512 or value.y != 768)
+                        return error.InvalidDrag;
+                    handler.drag_motion = true;
+                },
+                .drop => handler.drag_drop = true,
+                .leave => handler.drag_leave = true,
             }
         } else if (interface == &standard_protocol.wl_data_offer.info) {
             const event_value = try wayring.client.decodeEvent(
@@ -3795,7 +3959,16 @@ const DataDeviceClientHandler = struct {
                         return error.InvalidMimeType;
                     handler.offer_mime = true;
                 },
-                else => return error.UnexpectedEvent,
+                .source_actions => |value| {
+                    if (value.source_actions.value != 3) return error.InvalidDrag;
+                    handler.offer_source_actions = true;
+                },
+                .action => |value| {
+                    if (value.dnd_action.value !=
+                        standard_protocol.wl_data_device_manager.dnd_action.move.value)
+                        return error.InvalidDrag;
+                    handler.offer_action = true;
+                },
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;

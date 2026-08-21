@@ -161,10 +161,11 @@ as a real GPU dma-buf.
 
 Data-device interoperability mode runs both library pairings. It binds a seat
 and data-device manager, creates a source and device, advertises a MIME type,
-sets the selection, and transfers the source payload through a close-on-exec
-pipe supplied by the server. The reverse pairing also admits a server-created
-data offer and transfers its payload through a client-supplied pipe. Both paths
-validate descriptor ownership and ordered offer, source, device, and seat
+sets the selection, negotiates source and preferred actions, and starts a drag
+with origin and icon surfaces. Each server also creates a destination offer,
+sends enter, motion, drop, and leave events, and transfers both source and offer
+payloads through close-on-exec pipes. Both paths validate drag completion,
+descriptor ownership, and ordered offer, source, device, surface, and seat
 teardown.
 
 Output interoperability mode runs both library pairings. A version-4 output
