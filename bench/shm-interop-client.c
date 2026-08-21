@@ -95,6 +95,7 @@ shm_client_fd(int fd)
 	struct wl_shm_pool *pool = NULL;
 	struct wl_buffer *buffer = NULL;
 	struct wl_surface *surface = NULL;
+	struct wl_region *region = NULL;
 	struct wl_callback *frame = NULL;
 	int memory_fd = -1;
 	int status = EXIT_FAILURE;
@@ -122,8 +123,15 @@ shm_client_fd(int fd)
 	if (buffer == NULL || surface == NULL)
 		goto cleanup;
 	wl_buffer_add_listener(buffer, &buffer_listener, &state);
+	region = wl_compositor_create_region(state.compositor);
+	if (region == NULL)
+		goto cleanup;
+	wl_region_add(region, 1, 2, 3, 4);
+	wl_region_subtract(region, 5, 6, 7, 8);
 	wl_surface_attach(surface, buffer, 2, -3);
 	wl_surface_damage(surface, 1, 2, 3, 4);
+	wl_surface_set_opaque_region(surface, region);
+	wl_surface_set_input_region(surface, region);
 	frame = wl_surface_frame(surface);
 	if (frame == NULL)
 		goto cleanup;
@@ -135,6 +143,8 @@ shm_client_fd(int fd)
 		goto cleanup;
 	frame = NULL;
 
+	wl_region_destroy(region);
+	region = NULL;
 	wl_surface_destroy(surface);
 	surface = NULL;
 	wl_buffer_destroy(buffer);
@@ -156,6 +166,8 @@ cleanup:
 		wl_callback_destroy(frame);
 	if (surface != NULL)
 		wl_surface_destroy(surface);
+	if (region != NULL)
+		wl_region_destroy(region);
 	if (state.shm != NULL)
 		wl_shm_destroy(state.shm);
 	if (state.compositor != NULL)

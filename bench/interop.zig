@@ -516,6 +516,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .shm => if (!handler.pool_created or !handler.buffer_created or
             !handler.surface_created or !handler.surface_committed or
             !handler.buffer_released or !handler.frame_completed or
+            !handler.region_created or !handler.region_added or
+            !handler.region_subtracted or !handler.opaque_region_set or
+            !handler.input_region_set or !handler.region_destroyed or
             !handler.surface_destroyed or !handler.buffer_destroyed or
             !handler.pool_destroyed)
             return error.IncompleteInterop,
@@ -593,6 +596,13 @@ const ProtocolServerHandler = struct {
     frame_completed: bool = false,
     buffer: ?wayring.objects.Handle = null,
     frame_callback: ?wayring.objects.Handle = null,
+    region: ?wayring.objects.Handle = null,
+    region_created: bool = false,
+    region_added: bool = false,
+    region_subtracted: bool = false,
+    region_destroyed: bool = false,
+    opaque_region_set: bool = false,
+    input_region_set: bool = false,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -1450,7 +1460,16 @@ const ProtocolServerHandler = struct {
                         handler.kind == .touch)
                         handler.surface = surface;
                 },
-                .create_region => return error.UnexpectedRequest,
+                .create_region => |value| {
+                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    handler.region = (try standard_protocol.wl_compositor.admit_create_region(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    handler.region_created = true;
+                },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.xdg_wm_base.info) {
@@ -1565,6 +1584,18 @@ const ProtocolServerHandler = struct {
                         value.width != 7 or value.height != 8)
                         return error.InvalidSurface;
                 },
+                .set_opaque_region => |value| {
+                    if (handler.kind != .shm or value.region == null or
+                        value.region.? != handler.region.?.id)
+                        return error.InvalidSurface;
+                    handler.opaque_region_set = true;
+                },
+                .set_input_region => |value| {
+                    if (handler.kind != .shm or value.region == null or
+                        value.region.? != handler.region.?.id)
+                        return error.InvalidSurface;
+                    handler.input_region_set = true;
+                },
                 .commit => {
                     if (handler.kind == .shm) {
                         try wayring.server.sendEvent(
@@ -1587,6 +1618,27 @@ const ProtocolServerHandler = struct {
                     }
                 },
                 else => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_region.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_region,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .add => |value| {
+                    if (value.x != 1 or value.y != 2 or value.width != 3 or value.height != 4)
+                        return error.InvalidRegion;
+                    handler.region_added = true;
+                },
+                .subtract => |value| {
+                    if (value.x != 5 or value.y != 6 or value.width != 7 or value.height != 8)
+                        return error.InvalidRegion;
+                    handler.region_subtracted = true;
+                },
+                .destroy => handler.region_destroyed = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else return error.UnexpectedRequest;
