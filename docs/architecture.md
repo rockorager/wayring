@@ -528,7 +528,10 @@ so shared pools do not leak under disconnect or protocol-error cleanup.
 The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and
-commit requests, including destroying the source region after it is copied.
+viewport crop and destination requests, including destroying the source region
+after it is copied, and checks the committed 3x4 surface size after transform
+and scale. The reverse pairing verifies generated viewporter requests against a
+libwayland server implementation.
 
 SHM import begins with protocol-independent, format-aware metadata validation.
 Applications configure a hard maximum pool size and supply bytes per pixel for

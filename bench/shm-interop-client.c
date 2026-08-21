@@ -1,4 +1,5 @@
 #include "xdg-interop.h"
+#include "viewporter-client-protocol.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 struct shm_client_state {
 	struct wl_shm *shm;
 	struct wl_compositor *compositor;
+	struct wp_viewporter *viewporter;
 	int format_seen;
 	int buffer_released;
 	int frame_done;
@@ -70,6 +72,10 @@ handle_shm_global(void *data, struct wl_registry *registry, uint32_t name,
 		state->compositor = wl_registry_bind(
 			registry, name, &wl_compositor_interface,
 			version < 5 ? version : 5);
+	} else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+		state->viewporter = wl_registry_bind(
+			registry, name, &wp_viewporter_interface,
+			version < 1 ? version : 1);
 	}
 }
 
@@ -97,6 +103,7 @@ shm_client_fd(int fd)
 	struct wl_surface *surface = NULL;
 	struct wl_region *region = NULL;
 	struct wl_callback *frame = NULL;
+	struct wp_viewport *viewport = NULL;
 	int memory_fd = -1;
 	int status = EXIT_FAILURE;
 
@@ -106,6 +113,7 @@ shm_client_fd(int fd)
 	wl_registry_add_listener(registry, &shm_registry_listener, &state);
 	if (wl_display_roundtrip(display) < 0 || state.shm == NULL ||
 	    state.compositor == NULL ||
+	    state.viewporter == NULL ||
 	    wl_display_roundtrip(display) < 0 || !state.format_seen)
 		goto cleanup;
 
@@ -122,6 +130,9 @@ shm_client_fd(int fd)
 	surface = wl_compositor_create_surface(state.compositor);
 	if (buffer == NULL || surface == NULL)
 		goto cleanup;
+	viewport = wp_viewporter_get_viewport(state.viewporter, surface);
+	if (viewport == NULL)
+		goto cleanup;
 	wl_buffer_add_listener(buffer, &buffer_listener, &state);
 	region = wl_compositor_create_region(state.compositor);
 	if (region == NULL)
@@ -134,6 +145,9 @@ shm_client_fd(int fd)
 	wl_surface_set_input_region(surface, region);
 	wl_surface_set_buffer_transform(surface, WL_OUTPUT_TRANSFORM_90);
 	wl_surface_set_buffer_scale(surface, 2);
+	wp_viewport_set_source(viewport, wl_fixed_from_int(0), wl_fixed_from_int(0),
+	                       wl_fixed_from_int(1), wl_fixed_from_int(1));
+	wp_viewport_set_destination(viewport, 3, 4);
 	wl_surface_offset(surface, 2, -3);
 	frame = wl_surface_frame(surface);
 	if (frame == NULL)
@@ -148,6 +162,8 @@ shm_client_fd(int fd)
 
 	wl_region_destroy(region);
 	region = NULL;
+	wp_viewport_destroy(viewport);
+	viewport = NULL;
 	wl_surface_destroy(surface);
 	surface = NULL;
 	wl_buffer_destroy(buffer);
@@ -183,6 +199,8 @@ cleanup:
 		wl_shm_pool_destroy(pool);
 	if (frame != NULL)
 		wl_callback_destroy(frame);
+	if (viewport != NULL)
+		wp_viewport_destroy(viewport);
 	if (surface != NULL)
 		wl_surface_destroy(surface);
 	if (region != NULL)
@@ -191,6 +209,8 @@ cleanup:
 		wl_shm_destroy(state.shm);
 	if (state.compositor != NULL)
 		wl_compositor_destroy(state.compositor);
+	if (state.viewporter != NULL)
+		wp_viewporter_destroy(state.viewporter);
 	wl_registry_destroy(registry);
 	wl_display_flush(display);
 	wl_display_disconnect(display);

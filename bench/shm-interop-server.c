@@ -1,4 +1,5 @@
 #include "xdg-interop.h"
+#include "viewporter-server-protocol.h"
 
 #include <fcntl.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@ struct shm_server_state {
 	struct wl_resource *buffer;
 	struct wl_resource *frame;
 	struct wl_resource *region;
+	struct wl_resource *surface;
 	int pool_created;
 	int buffer_created;
 	int buffer_destroyed;
@@ -30,6 +32,10 @@ struct shm_server_state {
 	int transformed;
 	int scaled;
 	int offset;
+	int viewport_created;
+	int viewport_source;
+	int viewport_destination;
+	int viewport_destroyed;
 };
 
 static void
@@ -142,6 +148,7 @@ surface_destroy(struct wl_client *client, struct wl_resource *resource)
 
 	(void) client;
 	state->surface_destroyed = 1;
+	state->surface = NULL;
 	wl_resource_destroy(resource);
 }
 
@@ -213,6 +220,7 @@ surface_commit(struct wl_client *client, struct wl_resource *resource)
 	struct shm_server_state *state = wl_resource_get_user_data(resource);
 
 	if (!state->attached || !state->damaged || !state->damaged_buffer ||
+	    !state->viewport_source || !state->viewport_destination ||
 	    state->frame == NULL) {
 		wl_client_post_implementation_error(client, "incomplete surface commit");
 		return;
@@ -341,6 +349,7 @@ compositor_create_surface(struct wl_client *client, struct wl_resource *resource
 	}
 	wl_resource_set_implementation(surface, &surface_implementation, state, NULL);
 	state->surface_created = 1;
+	state->surface = surface;
 }
 
 static void
@@ -377,6 +386,93 @@ bind_compositor(struct wl_client *client, void *data, uint32_t version, uint32_t
 }
 
 static void
+viewport_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	(void) client;
+	state->viewport_destroyed = 1;
+	wl_resource_destroy(resource);
+}
+
+static void
+viewport_set_source(struct wl_client *client, struct wl_resource *resource,
+			    wl_fixed_t x, wl_fixed_t y, wl_fixed_t width,
+			    wl_fixed_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (x != wl_fixed_from_int(0) || y != wl_fixed_from_int(0) ||
+	    width != wl_fixed_from_int(1) || height != wl_fixed_from_int(1))
+		wl_client_post_implementation_error(client, "invalid viewport source");
+	else
+		state->viewport_source = 1;
+}
+
+static void
+viewport_set_destination(struct wl_client *client, struct wl_resource *resource,
+			 int32_t width, int32_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (width != 3 || height != 4)
+		wl_client_post_implementation_error(client, "invalid viewport destination");
+	else
+		state->viewport_destination = 1;
+}
+
+static const struct wp_viewport_interface viewport_implementation = {
+	.destroy = viewport_destroy,
+	.set_source = viewport_set_source,
+	.set_destination = viewport_set_destination,
+};
+
+static void
+viewporter_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void) client;
+	wl_resource_destroy(resource);
+}
+
+static void
+viewporter_get_viewport(struct wl_client *client, struct wl_resource *resource,
+			uint32_t id, struct wl_resource *surface)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+	struct wl_resource *viewport;
+
+	if (surface != state->surface) {
+		wl_client_post_implementation_error(client, "invalid viewport surface");
+		return;
+	}
+	viewport = wl_resource_create(client, &wp_viewport_interface, 1, id);
+	if (viewport == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(viewport, &viewport_implementation, state, NULL);
+	state->viewport_created = 1;
+}
+
+static const struct wp_viewporter_interface viewporter_implementation = {
+	.destroy = viewporter_destroy,
+	.get_viewport = viewporter_get_viewport,
+};
+
+static void
+bind_viewporter(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(
+		client, &wp_viewporter_interface, version < 1 ? (int) version : 1, id);
+
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &viewporter_implementation, data, NULL);
+}
+
+static void
 handle_shm_client_destroy(struct wl_listener *listener, void *data)
 {
 	struct shm_server_state *state =
@@ -398,7 +494,9 @@ shm_server_fd(int fd)
 	if (wl_global_create(state.display, &wl_shm_interface, 1,
 	                     &state, bind_shm) == NULL ||
 	    wl_global_create(state.display, &wl_compositor_interface, 5,
-	                     &state, bind_compositor) == NULL) {
+	                     &state, bind_compositor) == NULL ||
+	    wl_global_create(state.display, &wp_viewporter_interface, 1,
+	                     &state, bind_viewporter) == NULL) {
 		wl_display_destroy(state.display);
 		return EXIT_FAILURE;
 	}
@@ -415,6 +513,8 @@ shm_server_fd(int fd)
 	       state.pool_destroyed && state.surface_created && state.surface_destroyed &&
 	       state.committed && state.region_added && state.region_subtracted &&
 	       state.region_destroyed && state.opaque_region_set && state.input_region_set ?
-	       (state.transformed && state.scaled && state.offset ? EXIT_SUCCESS : EXIT_FAILURE) :
+	       (state.transformed && state.scaled && state.offset && state.viewport_created &&
+	        state.viewport_source && state.viewport_destination && state.viewport_destroyed ?
+	        EXIT_SUCCESS : EXIT_FAILURE) :
 	       EXIT_FAILURE;
 }

@@ -19,11 +19,12 @@ zig build-exe -OReleaseSafe --dep wayring \
 xdg_shell="$protocols_source/stable/xdg-shell/xdg-shell.xml"
 presentation_time="$protocols_source/stable/presentation-time/presentation-time.xml"
 linux_dmabuf="$protocols_source/stable/linux-dmabuf/linux-dmabuf-v1.xml"
+viewporter="$protocols_source/stable/viewporter/viewporter.xml"
 # The installed libwayland scanner may predate the stable XML's DTD additions.
 # Its deprecated unstable spelling has the same interfaces exercised at v3.
 linux_dmabuf_c="$protocols_source/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
 "$out/wayring-scanner" "$wayland_source/protocol/wayland.xml" "$xdg_shell" \
-    "$presentation_time" "$linux_dmabuf" \
+    "$presentation_time" "$linux_dmabuf" "$viewporter" \
     "$generated/wayland-xdg.zig"
 
 wayland-scanner client-header "$root/bench/protocol.xml" \
@@ -50,6 +51,12 @@ wayland-scanner server-header "$linux_dmabuf_c" \
     "$generated/linux-dmabuf-server-protocol.h"
 wayland-scanner private-code "$linux_dmabuf_c" \
     "$generated/linux-dmabuf-protocol.c"
+wayland-scanner client-header "$viewporter" \
+    "$generated/viewporter-client-protocol.h"
+wayland-scanner server-header "$viewporter" \
+    "$generated/viewporter-server-protocol.h"
+wayland-scanner private-code "$viewporter" \
+    "$generated/viewporter-protocol.c"
 
 cflags="-std=c11 -O3 -DNDEBUG -D_GNU_SOURCE -Wall -Wextra -Werror"
 
@@ -112,6 +119,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$generated/xdg-shell-protocol.c" \
     "$generated/presentation-time-protocol.c" \
     "$generated/linux-dmabuf-protocol.c" \
+    "$generated/viewporter-protocol.c" \
     --dep wayring -Mcore_protocol="$generated/wayland-core.zig" \
     --dep wayring -Mstandard_protocol="$generated/wayland-xdg.zig" \
     --dep wayring -Mbenchmark_protocol="$generated/wayring-benchmark.zig" \

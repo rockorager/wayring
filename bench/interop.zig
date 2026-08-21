@@ -493,6 +493,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .shm => {
             _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null);
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 5, null);
+            _ = try runtime.globals.add(&standard_protocol.wp_viewporter.info, 1, null);
         },
         .dmabuf => _ = try runtime.globals.add(
             &standard_protocol.zwp_linux_dmabuf_v1.info,
@@ -656,7 +657,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.region_subtracted or !handler.opaque_region_set or
             !handler.input_region_set or !handler.region_destroyed or
             !handler.buffer_transformed or !handler.buffer_scaled or
-            !handler.surface_offset or
+            !handler.surface_offset or !handler.viewport_created or
+            !handler.viewport_source or !handler.viewport_destination or
+            !handler.viewport_destroyed or
             !handler.surface_destroyed or !handler.buffer_destroyed or
             !handler.pool_destroyed)
             return error.IncompleteInterop,
@@ -765,6 +768,11 @@ const ProtocolServerHandler = struct {
     buffer_transformed: bool = false,
     buffer_scaled: bool = false,
     surface_offset: bool = false,
+    viewport: ?wayring.objects.Handle = null,
+    viewport_created: bool = false,
+    viewport_source: bool = false,
+    viewport_destination: bool = false,
+    viewport_destroyed: bool = false,
     surface_state: wayring.compositor.Surface = .{},
     region_state: *wayring.compositor.Region,
     surface_regions: *wayring.compositor.SurfaceRegions,
@@ -1820,6 +1828,60 @@ const ProtocolServerHandler = struct {
                 },
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wp_viewporter.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wp_viewporter,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .get_viewport => |value| {
+                    if (handler.kind != .shm or handler.surface == null or
+                        value.surface != handler.surface.?.id)
+                        return error.InvalidSurface;
+                    handler.viewport = (try standard_protocol.wp_viewporter.admit_get_viewport(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    handler.viewport_created = true;
+                },
+                .destroy => {},
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wp_viewport.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wp_viewport,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .set_source => |value| {
+                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    try handler.surface_state.viewport.setSource(
+                        value.x,
+                        value.y,
+                        value.width,
+                        value.height,
+                    );
+                    handler.viewport_source = true;
+                },
+                .set_destination => |value| {
+                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    try handler.surface_state.viewport.setDestination(value.width, value.height);
+                    handler.viewport_destination = true;
+                },
+                .destroy => {
+                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    handler.surface_state.viewport.clear();
+                    handler.viewport = null;
+                    handler.viewport_destroyed = true;
+                },
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_compositor.info) {
             const decoded = try wayring.server.decodeRequest(
                 standard_protocol.wl_compositor,
@@ -1896,7 +1958,10 @@ const ProtocolServerHandler = struct {
                             return error.UnexpectedRequest;
                         handler.subsurface_surfaces_created += 1;
                     }
-                    if (handler.kind == .shm) handler.surface_created = true;
+                    if (handler.kind == .shm) {
+                        handler.surface_created = true;
+                        handler.surface = surface;
+                    }
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch or handler.kind == .shell)
                         handler.surface = surface;
@@ -2120,7 +2185,8 @@ const ProtocolServerHandler = struct {
                             !std.meta.eql(update.attachment.?.buffer.?.handle, handler.buffer.?) or
                             update.surface_damage.empty or update.buffer_damage.empty or
                             update.transform != .@"90" or update.scale != 2 or
-                            update.offset.x != 2 or update.offset.y != -3)
+                            update.offset.x != 2 or update.offset.y != -3 or
+                            update.size.width != 3 or update.size.height != 4)
                             return error.InvalidSurfaceState;
                         if (content.activateFrames(handler.frame_queue) != 1)
                             return error.InvalidFrameCallbacks;
@@ -4727,7 +4793,8 @@ fn wayringShmClient() !u8 {
     };
     try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (handler.shm == null or handler.compositor == null or !handler.format_seen or
+    while (handler.shm == null or handler.compositor == null or handler.viewporter == null or
+        !handler.format_seen or
         !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
@@ -4764,6 +4831,12 @@ fn wayringShmClient() !u8 {
         &actor.transmit,
         handler.compositor.?,
         .{},
+    )).id;
+    const viewport = (try standard_protocol.wp_viewporter.construct_get_viewport(
+        client_objects,
+        &actor.transmit,
+        handler.viewporter.?,
+        .{ .surface = surface.id },
     )).id;
     const region = (try standard_protocol.wl_compositor.construct_create_region(
         client_objects,
@@ -4830,6 +4903,20 @@ fn wayringShmClient() !u8 {
         .{ .set_buffer_scale = .{ .scale = 2 } },
     );
     try wayring.client.sendRequest(
+        standard_protocol.wp_viewport,
+        client_objects,
+        &actor.transmit,
+        viewport,
+        .{ .set_source = .{ .x = 0, .y = 0, .width = 256, .height = 256 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wp_viewport,
+        client_objects,
+        &actor.transmit,
+        viewport,
+        .{ .set_destination = .{ .width = 3, .height = 4 } },
+    );
+    try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
         &actor.transmit,
@@ -4873,6 +4960,13 @@ fn wayringShmClient() !u8 {
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
     try wayring.client.sendRequest(
+        standard_protocol.wp_viewport,
+        client_objects,
+        &actor.transmit,
+        viewport,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
         standard_protocol.wl_surface,
         client_objects,
         &actor.transmit,
@@ -4915,6 +5009,7 @@ const ShmClientHandler = struct {
     callback: wayring.objects.Handle,
     shm: ?wayring.objects.Handle = null,
     compositor: ?wayring.objects.Handle = null,
+    viewporter: ?wayring.objects.Handle = null,
     buffer: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     frame: ?wayring.objects.Handle = null,
@@ -4968,6 +5063,20 @@ const ShmClientHandler = struct {
                             global.name,
                             &standard_protocol.wl_compositor.info,
                             @min(global.version, 5),
+                            null,
+                        );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wp_viewporter.info.name,
+                    )) {
+                        handler.viewporter = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wp_viewporter.info,
+                            @min(global.version, 1),
                             null,
                         );
                     }
