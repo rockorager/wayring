@@ -19,6 +19,6 @@ Use `zig build fuzz --fuzz=1M` for one million coverage-guided iterations per
 target, or omit the limit for continuous fuzzing with Zig's web interface.
 
 `zig build soak` exercises randomized multi-connection traffic, descriptor
-transfer, forced send backpressure, cancellation, and slot reuse against the
-real kernel io_uring path.
+transfer, forced shared RX/TX pressure, cancellation, and slot reuse against
+the real kernel io_uring path.
 Use `-Dsoak-rounds=N` and `-Dsoak-seed=N` to extend or reproduce a run.

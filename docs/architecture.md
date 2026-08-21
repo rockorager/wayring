@@ -190,6 +190,13 @@ Receive ancillary-control capacity is configured once per reactor rather than
 per peer. Initialization rejects layouts that would leave a provided buffer
 without room for the io_uring receive header, control data, and one minimum
 Wayland frame.
+When every shared provided buffer is selected, the kernel terminates affected
+multishot receives with `ENOBUFS`. The actor reports buffer exhaustion without
+closing the connection. Callers return already delivered buffers before
+rearming inactive peers; repeated rearming while buffers remain held only
+produces more `ENOBUFS` completions. Real-kernel soak coverage retains the whole
+buffer group across concurrent clients, then verifies that every stream and
+transferred descriptor resumes intact after those buffers are returned.
 
 The reusable io_uring backend owns persistent per-connection recvmsg and
 sendmsg operation state while borrowing one reactor-wide provided-buffer group.

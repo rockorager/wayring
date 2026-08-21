@@ -583,6 +583,216 @@ test "close cancels a send blocked by kernel backpressure" {
     try std.testing.expectEqual(@as(usize, 1), reactor.descriptors.available());
 }
 
+const receive_pressure_connections = 4;
+const receive_pressure_buffers = 2;
+const receive_pressure_bytes = 512;
+
+const ReceivePressureState = struct {
+    peer: wayring.io_uring.Peer,
+    remote: linux.fd_t,
+    pattern: u8,
+    received: usize = 0,
+    received_fds: usize = 0,
+};
+
+const HeldReceive = struct {
+    state: *ReceivePressureState,
+    received: wayring.io_uring.Receiver.Received,
+    buffer_id: u16,
+};
+
+test "real io_uring receives recover from shared buffer exhaustion" {
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(std.testing.allocator, .{ .entries = 16 }, .{
+        .max_connections = receive_pressure_connections,
+        .receive_buffer_size = 256,
+        .receive_buffer_count = receive_pressure_buffers,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 1,
+        .descriptor_count = receive_pressure_connections,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(std.testing.allocator);
+    var states: [receive_pressure_connections]ReceivePressureState = undefined;
+    var payload: [receive_pressure_bytes]u8 = undefined;
+
+    for (&states, 0..) |*state, index| {
+        var sockets: [2]linux.fd_t = undefined;
+        try expectSuccess(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            0,
+            &sockets,
+        ));
+        state.* = .{
+            .peer = try reactor.attachReceiving(sockets[0], .{
+                .received_fd_budget = 1,
+                .transmit_byte_budget = 64,
+                .transmit_fd_budget = 0,
+            }),
+            .remote = sockets[1],
+            .pattern = @intCast(index + 0x40),
+        };
+        @memset(&payload, state.pattern);
+        const descriptor = try createDescriptor();
+        try sendWithDescriptor(state.remote, &payload, descriptor);
+        _ = linux.close(descriptor);
+    }
+    _ = try reactor.ring.submit();
+
+    var held: [receive_pressure_buffers]HeldReceive = undefined;
+    var held_count: usize = 0;
+    var saw_exhaustion = false;
+    var completions: usize = 0;
+    while (held_count < held.len or !saw_exhaustion) {
+        completions += 1;
+        if (completions > 100) return error.CompletionLimitExceeded;
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        if (routed.operation != .receive) return error.UnexpectedCompletion;
+        const state = findReceivePressureState(&states, reactor.routedPeer(routed)) orelse
+            return error.UnknownPeer;
+        const actor = try reactor.getActor(state.peer);
+        const event = try actor.completeRouted(.receive, completion);
+        switch (event) {
+            .received => {
+                if (held_count == held.len) return error.ExcessReceiveBuffer;
+                if (completion.flags & linux.IORING_CQE_F_BUF_MORE != 0)
+                    return error.IncrementalBufferNotFilled;
+                const buffer_id = try completion.buffer_id();
+                for (held[0..held_count]) |prior|
+                    try std.testing.expect(prior.buffer_id != buffer_id);
+                held[held_count] = .{
+                    .state = state,
+                    .received = try (try reactor.getReceiver(state.peer)).decodeCompletion(completion),
+                    .buffer_id = buffer_id,
+                };
+                held_count += 1;
+            },
+            .buffers_exhausted => saw_exhaustion = true,
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expectEqual(receive_pressure_buffers, held_count);
+    try std.testing.expect(saw_exhaustion);
+
+    for (&held) |*item| {
+        const actor = try reactor.getActor(item.state.peer);
+        try consumeReceivePressure(item.state, actor, item.received);
+        try (try reactor.getReceiver(item.state.peer)).release(item.received);
+    }
+    var prepared = false;
+    for (&states) |*state| {
+        const actor = try reactor.getActor(state.peer);
+        if (!actor.receive_active) {
+            try reactor.prepareReceive(state.peer);
+            prepared = true;
+        }
+    }
+    if (prepared) _ = try reactor.ring.submit();
+
+    completions = 0;
+    while (!receivePressureComplete(&states)) {
+        completions += 1;
+        if (completions > 10_000) return error.CompletionLimitExceeded;
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        if (routed.operation != .receive) return error.UnexpectedCompletion;
+        const state = findReceivePressureState(&states, reactor.routedPeer(routed)) orelse
+            return error.UnknownPeer;
+        const actor = try reactor.getActor(state.peer);
+        const event = try actor.completeRouted(.receive, completion);
+        switch (event) {
+            .received => {
+                const receiver = try reactor.getReceiver(state.peer);
+                const received = try receiver.decodeCompletion(completion);
+                try consumeReceivePressure(state, actor, received);
+                try receiver.release(received);
+            },
+            .buffers_exhausted => saw_exhaustion = true,
+            else => return error.UnexpectedCompletion,
+        }
+        if (state.received < receive_pressure_bytes and !actor.receive_active) {
+            try reactor.prepareReceive(state.peer);
+            _ = try reactor.ring.submit();
+        }
+    }
+
+    for (states) |state| {
+        try std.testing.expectEqual(receive_pressure_bytes, state.received);
+        try std.testing.expectEqual(@as(usize, 1), state.received_fds);
+    }
+    for (states) |state| {
+        if (!try reactor.prepareClose(state.peer)) try reactor.destroyPeer(state.peer);
+    }
+    _ = try reactor.ring.submit();
+    completions = 0;
+    while (reactor.slots.active_count != 0) {
+        completions += 1;
+        if (completions > 100) return error.CompletionLimitExceeded;
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        const peer = reactor.routedPeer(routed);
+        const actor = try reactor.getActor(peer);
+        const event = try actor.completeRouted(routed.operation, completion);
+        switch (event) {
+            .receive_stopped, .cancel_complete, .buffers_exhausted, .disconnected => {},
+            .received => {
+                const receiver = try reactor.getReceiver(peer);
+                const received = try receiver.decodeCompletion(completion);
+                try receiver.release(received);
+                return error.ExcessPayload;
+            },
+            else => return error.UnexpectedCompletion,
+        }
+        if (actor.canDeinit()) try reactor.destroyPeer(peer);
+    }
+    for (states) |state| _ = linux.close(state.remote);
+    try std.testing.expectEqual(
+        @as(usize, receive_pressure_connections),
+        reactor.descriptors.available(),
+    );
+}
+
+fn findReceivePressureState(
+    states: []ReceivePressureState,
+    peer: wayring.io_uring.Peer,
+) ?*ReceivePressureState {
+    for (states) |*state| {
+        if (state.peer.slot == peer.slot and state.peer.generation == peer.generation)
+            return state;
+    }
+    return null;
+}
+
+fn consumeReceivePressure(
+    state: *ReceivePressureState,
+    actor: *wayring.connection.Actor,
+    received: wayring.io_uring.Receiver.Received,
+) !void {
+    const end = state.received + received.payload.len;
+    if (end > receive_pressure_bytes) return error.ExcessPayload;
+    for (received.payload) |byte| try std.testing.expectEqual(state.pattern, byte);
+    _ = try actor.ingestControl(received.control);
+    while (actor.takeFd()) |fd| {
+        try expectCloseOnExec(fd);
+        _ = linux.close(fd);
+        state.received_fds += 1;
+    } else |err| if (err != error.Empty) return err;
+    state.received = end;
+}
+
+fn receivePressureComplete(states: []const ReceivePressureState) bool {
+    for (states) |state| if (state.received != receive_pressure_bytes) return false;
+    return true;
+}
+
 fn prepareBackpressureSend(
     reactor: *wayring.io_uring.Reactor,
     state: *BackpressureState,
