@@ -9,10 +9,18 @@
 struct shm_server_state {
 	struct wl_display *display;
 	struct wl_listener client_destroy;
+	struct wl_resource *buffer;
+	struct wl_resource *frame;
 	int pool_created;
 	int buffer_created;
 	int buffer_destroyed;
 	int pool_destroyed;
+	int surface_created;
+	int surface_destroyed;
+	int attached;
+	int damaged;
+	int damaged_buffer;
+	int committed;
 };
 
 static void
@@ -48,6 +56,7 @@ pool_create_buffer(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 	wl_resource_set_implementation(buffer, &buffer_implementation, state, NULL);
+	state->buffer = buffer;
 	state->buffer_created = 1;
 }
 
@@ -118,6 +127,134 @@ bind_shm(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 }
 
 static void
+surface_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	(void) client;
+	state->surface_destroyed = 1;
+	wl_resource_destroy(resource);
+}
+
+static void
+surface_attach(struct wl_client *client, struct wl_resource *resource,
+               struct wl_resource *buffer, int32_t x, int32_t y)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (buffer != state->buffer || x != 2 || y != -3) {
+		wl_client_post_implementation_error(client, "invalid surface attach");
+		return;
+	}
+	state->attached = 1;
+}
+
+static void
+surface_damage(struct wl_client *client, struct wl_resource *resource,
+               int32_t x, int32_t y, int32_t width, int32_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (x != 1 || y != 2 || width != 3 || height != 4) {
+		wl_client_post_implementation_error(client, "invalid surface damage");
+		return;
+	}
+	state->damaged = 1;
+}
+
+static void
+surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t id)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	state->frame = wl_resource_create(client, &wl_callback_interface, 1, id);
+	if (state->frame == NULL)
+		wl_client_post_no_memory(client);
+}
+
+static void
+surface_commit(struct wl_client *client, struct wl_resource *resource)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (!state->attached || !state->damaged || !state->damaged_buffer ||
+	    state->frame == NULL) {
+		wl_client_post_implementation_error(client, "incomplete surface commit");
+		return;
+	}
+	wl_buffer_send_release(state->buffer);
+	wl_callback_send_done(state->frame, 123);
+	wl_resource_destroy(state->frame);
+	state->frame = NULL;
+	state->committed = 1;
+}
+
+static void
+surface_damage_buffer(struct wl_client *client, struct wl_resource *resource,
+                      int32_t x, int32_t y, int32_t width, int32_t height)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+
+	if (x != 5 || y != 6 || width != 7 || height != 8) {
+		wl_client_post_implementation_error(client, "invalid buffer damage");
+		return;
+	}
+	state->damaged_buffer = 1;
+}
+
+static const struct wl_surface_interface surface_implementation = {
+	.destroy = surface_destroy,
+	.attach = surface_attach,
+	.damage = surface_damage,
+	.frame = surface_frame,
+	.commit = surface_commit,
+	.damage_buffer = surface_damage_buffer,
+};
+
+static void
+compositor_create_surface(struct wl_client *client, struct wl_resource *resource,
+                          uint32_t id)
+{
+	struct shm_server_state *state = wl_resource_get_user_data(resource);
+	struct wl_resource *surface = wl_resource_create(
+		client, &wl_surface_interface, wl_resource_get_version(resource), id);
+
+	if (surface == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(surface, &surface_implementation, state, NULL);
+	state->surface_created = 1;
+}
+
+static void
+compositor_create_region(struct wl_client *client, struct wl_resource *resource,
+                         uint32_t id)
+{
+	(void) resource;
+	(void) id;
+	wl_client_post_implementation_error(client, "unexpected region");
+}
+
+static const struct wl_compositor_interface compositor_implementation = {
+	.create_surface = compositor_create_surface,
+	.create_region = compositor_create_region,
+};
+
+static void
+bind_compositor(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(
+		client, &wl_compositor_interface, version < 4 ? (int) version : 4, id);
+
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &compositor_implementation, data, NULL);
+}
+
+static void
 handle_shm_client_destroy(struct wl_listener *listener, void *data)
 {
 	struct shm_server_state *state =
@@ -137,7 +274,9 @@ shm_server_fd(int fd)
 	if (state.display == NULL)
 		return EXIT_FAILURE;
 	if (wl_global_create(state.display, &wl_shm_interface, 1,
-	                     &state, bind_shm) == NULL) {
+	                     &state, bind_shm) == NULL ||
+	    wl_global_create(state.display, &wl_compositor_interface, 4,
+	                     &state, bind_compositor) == NULL) {
 		wl_display_destroy(state.display);
 		return EXIT_FAILURE;
 	}
@@ -151,5 +290,6 @@ shm_server_fd(int fd)
 	wl_display_run(state.display);
 	wl_display_destroy(state.display);
 	return state.pool_created && state.buffer_created && state.buffer_destroyed &&
-	       state.pool_destroyed ? EXIT_SUCCESS : EXIT_FAILURE;
+	       state.pool_destroyed && state.surface_created && state.surface_destroyed &&
+	       state.committed ? EXIT_SUCCESS : EXIT_FAILURE;
 }

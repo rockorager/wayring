@@ -3327,7 +3327,7 @@ fn wayringShmClient() !u8 {
     };
     try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (handler.shm == null or !handler.format_seen or
+    while (handler.shm == null or handler.compositor == null or !handler.format_seen or
         !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
@@ -3359,14 +3359,64 @@ fn wayringShmClient() !u8 {
             .format = .argb8888,
         },
     )).id;
+    const surface = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    handler.buffer = buffer;
+    handler.surface = surface;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .attach = .{ .buffer = buffer.id, .x = 2, .y = -3 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .damage = .{ .x = 1, .y = 2, .width = 3, .height = 4 } },
+    );
+    handler.frame = (try standard_protocol.wl_surface.construct_frame(
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{},
+    )).callback;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .damage_buffer = .{ .x = 5, .y = 6, .width = 7, .height = 8 } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .commit = .{} },
+    );
     handler.synced = false;
     handler.deleted = false;
     handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
     if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
     _ = try reactor.ring.submit();
-    while (!handler.synced or !handler.deleted)
+    while (!handler.buffer_released or !handler.frame_done or
+        !handler.synced or !handler.deleted)
         try pumpProtocolClient(&reactor, peer, client_objects, &handler);
 
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .destroy = .{} },
+    );
     try wayring.client.sendRequest(
         standard_protocol.wl_buffer,
         client_objects,
@@ -3402,7 +3452,13 @@ const ShmClientHandler = struct {
     registry: wayring.objects.Handle,
     callback: wayring.objects.Handle,
     shm: ?wayring.objects.Handle = null,
+    compositor: ?wayring.objects.Handle = null,
+    buffer: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    frame: ?wayring.objects.Handle = null,
     format_seen: bool = false,
+    buffer_released: bool = false,
+    frame_done: bool = false,
     synced: bool = false,
     deleted: bool = false,
 
@@ -3427,31 +3483,65 @@ const ShmClientHandler = struct {
                 message,
                 fds,
             )) {
-                .global => |global| if (std.mem.eql(
-                    u8,
-                    global.interface,
-                    standard_protocol.wl_shm.info.name,
-                )) {
-                    handler.shm = try XdgClientCore.bind(
-                        handler.objects,
-                        handler.queue,
-                        handler.registry,
-                        global.name,
-                        &standard_protocol.wl_shm.info,
-                        @min(global.version, 1),
-                        null,
-                    );
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, standard_protocol.wl_shm.info.name)) {
+                        handler.shm = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_shm.info,
+                            @min(global.version, 1),
+                            null,
+                        );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wl_compositor.info.name,
+                    )) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
+                    }
                 },
                 .global_remove => {},
             }
         } else if (interface == &XdgClientCore.Callback.info) {
-            _ = try XdgClientCore.decodeCallbackEvent(
-                handler.objects,
-                handler.callback,
-                message,
-                fds,
-            );
-            handler.synced = true;
+            if (handler.frame) |frame| {
+                if (message.header.object_id == frame.id) {
+                    const event_value = try XdgClientCore.decodeCallbackEvent(
+                        handler.objects,
+                        frame,
+                        message,
+                        fds,
+                    );
+                    if (event_value.done.callback_data != 123) return error.InvalidFrame;
+                    handler.frame_done = true;
+                    handler.frame = null;
+                } else {
+                    _ = try XdgClientCore.decodeCallbackEvent(
+                        handler.objects,
+                        handler.callback,
+                        message,
+                        fds,
+                    );
+                    handler.synced = true;
+                }
+            } else {
+                _ = try XdgClientCore.decodeCallbackEvent(
+                    handler.objects,
+                    handler.callback,
+                    message,
+                    fds,
+                );
+                handler.synced = true;
+            }
         } else if (interface == &standard_protocol.wl_shm.info) {
             const shm_event = try wayring.client.decodeEvent(
                 standard_protocol.wl_shm,
@@ -3465,6 +3555,17 @@ const ShmClientHandler = struct {
                     if (value.format.value == standard_protocol.wl_shm.format.argb8888.value)
                         handler.format_seen = true;
                 },
+            }
+        } else if (interface == &standard_protocol.wl_buffer.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_buffer,
+                handler.objects,
+                handler.buffer orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .release => handler.buffer_released = true,
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
