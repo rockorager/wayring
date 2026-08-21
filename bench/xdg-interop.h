@@ -11,5 +11,6 @@ int data_device_client_fd(int fd);
 int data_device_server_fd(int fd);
 int output_client_fd(int fd);
 int output_server_fd(int fd);
+int pointer_client_fd(int fd);
 
 #endif

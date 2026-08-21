@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -43,6 +43,7 @@ const Options = struct {
         data_device_libwayland_server,
         output_libwayland_client,
         output_libwayland_server,
+        pointer_libwayland_client,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -62,6 +63,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .data_device_libwayland_server => wayringDataDeviceClient(),
         .output_libwayland_client => wayringProtocolServer(.output),
         .output_libwayland_server => wayringOutputClient(),
+        .pointer_libwayland_client => wayringProtocolServer(.pointer),
     };
 }
 
@@ -352,6 +354,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .dmabuf => ffi.dmabuf_client_fd(connected_fd),
             .data_device => ffi.data_device_client_fd(connected_fd),
             .output => ffi.output_client_fd(connected_fd),
+            .pointer => ffi.pointer_client_fd(connected_fd),
         });
     }
 
@@ -398,6 +401,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             _ = try runtime.globals.add(&standard_protocol.wl_data_device_manager.info, 3, null);
         },
         .output => _ = try runtime.globals.add(&standard_protocol.wl_output.info, 4, null),
+        .pointer => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 8, null);
+        },
     }
     try runtime.prepareAccept();
     _ = try reactor.ring.submit();
@@ -411,6 +418,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         return error.InvalidCompletion;
     const actor = try reactor.getActor(peer);
     var handler: ProtocolServerHandler = .{
+        .kind = kind,
         .runtime = &runtime,
         .peer = peer,
         .objects = try runtime.clients.get(peer),
@@ -499,6 +507,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             return error.IncompleteInterop,
         .output => if (!handler.output_sent or !handler.output_released)
             return error.IncompleteInterop,
+        .pointer => if (!handler.seat_advertised or !handler.pointer_created or
+            !handler.pointer_sent or !handler.pointer_released or !handler.surface_destroyed or
+            !handler.seat_released)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -530,6 +542,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
 }
 
 const ProtocolServerHandler = struct {
+    kind: ProtocolInterop,
     runtime: *XdgServerRuntime,
     peer: wayring.io_uring.Peer,
     objects: *wayring.objects.SharedServerObjects,
@@ -565,6 +578,12 @@ const ProtocolServerHandler = struct {
     selection_read_fd: linux.fd_t = -1,
     output_sent: bool = false,
     output_released: bool = false,
+    seat_advertised: bool = false,
+    pointer_created: bool = false,
+    pointer_sent: bool = false,
+    pointer_released: bool = false,
+    surface: ?wayring.objects.Handle = null,
+    surface_destroyed: bool = false,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -703,6 +722,26 @@ const ProtocolServerHandler = struct {
                     .{ .done = .{} },
                 );
                 handler.output_sent = true;
+            } else if (resource_interface == &standard_protocol.wl_seat.info and
+                handler.kind == .pointer)
+            {
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_seat,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .capabilities = .{ .capabilities = .pointer } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_seat,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .name = .{ .name = "wayring-seat" } },
+                );
+                handler.seat_advertised = true;
             }
         } else if (interface == &standard_protocol.wp_presentation.info) {
             const decoded = try wayring.server.decodeRequest(
@@ -851,8 +890,117 @@ const ProtocolServerHandler = struct {
                 fds,
             );
             switch (decoded.value) {
+                .get_pointer => |value| {
+                    const surface = handler.surface orelse return error.MissingSurface;
+                    const pointer = (try standard_protocol.wl_seat.admit_get_pointer(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    handler.pointer_created = true;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .enter = .{
+                            .serial = 41,
+                            .surface = surface.id,
+                            .surface_x = 896,
+                            .surface_y = -576,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .motion = .{ .time = 100, .surface_x = 1024, .surface_y = 1280 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .button = .{
+                            .serial = 42,
+                            .time = 101,
+                            .button = 0x110,
+                            .state = .pressed,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .axis_source = .{ .axis_source = .wheel } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .axis = .{
+                            .time = 102,
+                            .axis = .vertical_scroll,
+                            .value = -256,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .axis_stop = .{ .time = 103, .axis = .vertical_scroll } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_pointer,
+                        handler.objects,
+                        handler.queue,
+                        pointer,
+                        .{ .frame = .{} },
+                    );
+                    handler.pointer_sent = true;
+                },
                 .release => handler.seat_released = true,
-                else => return error.UnexpectedRequest,
+                .get_keyboard, .get_touch => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_pointer.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_pointer,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .release => handler.pointer_released = true,
+                .set_cursor => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_output.info) {
@@ -1021,12 +1169,15 @@ const ProtocolServerHandler = struct {
                 fds,
             );
             switch (decoded.value) {
-                .create_surface => |value| _ = try standard_protocol.wl_compositor.admit_create_surface(
-                    handler.objects,
-                    decoded.handle,
-                    value,
-                    .{},
-                ),
+                .create_surface => |value| {
+                    const surface = (try standard_protocol.wl_compositor.admit_create_surface(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    if (handler.kind == .pointer) handler.surface = surface;
+                },
                 .create_region => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
@@ -1112,7 +1263,10 @@ const ProtocolServerHandler = struct {
                 fds,
             );
             switch (decoded.value) {
-                .commit, .destroy => {},
+                .destroy => {
+                    if (handler.kind == .pointer) handler.surface_destroyed = true;
+                },
+                .commit => {},
                 else => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
@@ -2978,6 +3132,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .output_libwayland_client;
         } else if (std.mem.eql(u8, value, "output-libwayland-server")) {
             options.mode = .output_libwayland_server;
+        } else if (std.mem.eql(u8, value, "pointer-libwayland-client")) {
+            options.mode = .pointer_libwayland_client;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or
