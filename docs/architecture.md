@@ -483,6 +483,10 @@ same-commit non-null buffer requirement transactionally, and detaches an
 independently owned callback batch in O(1). Applications embed that batch in
 the content-update payload and consume callbacks only after `done(0)` plus
 `delete_id` enter the transmit queue, preserving delivery under backpressure.
+Because installed libwayland versions may predate this core protocol request,
+a Wayring-to-Wayring real-kernel test generates the pinned version-7 core
+protocol and exercises attach, `get_release`, commit, CU application,
+`done(0)`, `delete_id`, and client-ID recycling through one borrowed ring.
 The graph implements the established synchronized-subtree behavior; exact
 version-7 scheduling is provided by a lower-level bounded content-update DAG.
 Each per-surface queue automatically links its predecessor and may claim the
