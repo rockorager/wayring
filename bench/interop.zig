@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -41,6 +41,8 @@ const Options = struct {
         dmabuf_libwayland_server,
         data_device_libwayland_client,
         data_device_libwayland_server,
+        output_libwayland_client,
+        output_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -58,6 +60,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .dmabuf_libwayland_server => wayringDmabufClient(),
         .data_device_libwayland_client => wayringProtocolServer(.data_device),
         .data_device_libwayland_server => wayringDataDeviceClient(),
+        .output_libwayland_client => wayringProtocolServer(.output),
+        .output_libwayland_server => wayringOutputClient(),
     };
 }
 
@@ -347,6 +351,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .shm => ffi.shm_client_fd(connected_fd),
             .dmabuf => ffi.dmabuf_client_fd(connected_fd),
             .data_device => ffi.data_device_client_fd(connected_fd),
+            .output => ffi.output_client_fd(connected_fd),
         });
     }
 
@@ -392,6 +397,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             _ = try runtime.globals.add(&standard_protocol.wl_seat.info, 7, null);
             _ = try runtime.globals.add(&standard_protocol.wl_data_device_manager.info, 3, null);
         },
+        .output => _ = try runtime.globals.add(&standard_protocol.wl_output.info, 4, null),
     }
     try runtime.prepareAccept();
     _ = try reactor.ring.submit();
@@ -491,6 +497,8 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.data_source_destroyed or !handler.data_device_released or
             !handler.seat_released)
             return error.IncompleteInterop,
+        .output => if (!handler.output_sent or !handler.output_released)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -555,6 +563,8 @@ const ProtocolServerHandler = struct {
     data_device_released: bool = false,
     seat_released: bool = false,
     selection_read_fd: linux.fd_t = -1,
+    output_sent: bool = false,
+    output_released: bool = false,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -629,6 +639,70 @@ const ProtocolServerHandler = struct {
                     .{ .clock_id = .{ .clk_id = 1 } },
                 );
                 handler.clock_seen = true;
+            } else if (resource_interface == &standard_protocol.wl_output.info) {
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .geometry = .{
+                        .x = -10,
+                        .y = 20,
+                        .physical_width = 600,
+                        .physical_height = 340,
+                        .subpixel = .horizontal_rgb,
+                        .make = "Wayring",
+                        .model = "Virtual-1",
+                        .transform = .@"90",
+                    } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .mode = .{
+                        .flags = .fromInt(3),
+                        .width = 1920,
+                        .height = 1080,
+                        .refresh = 60_000,
+                    } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .scale = .{ .factor = 2 } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .name = .{ .name = "WL-1" } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .description = .{ .description = "Wayring virtual output" } },
+                );
+                try wayring.server.sendEvent(
+                    standard_protocol,
+                    standard_protocol.wl_output,
+                    handler.objects,
+                    handler.queue,
+                    resource,
+                    .{ .done = .{} },
+                );
+                handler.output_sent = true;
             }
         } else if (interface == &standard_protocol.wp_presentation.info) {
             const decoded = try wayring.server.decodeRequest(
@@ -779,6 +853,17 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .release => handler.seat_released = true,
                 else => return error.UnexpectedRequest,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_output.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_output,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .release => handler.output_released = true,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
@@ -1434,6 +1519,189 @@ fn pumpProtocolClient(
     }
     if (prepared) _ = try reactor.ring.submit();
 }
+
+fn wayringOutputClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.output_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 8,
+        .send_descriptor_capacity = 4,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 4,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 4,
+        },
+        .{ .max_objects = 12, .max_client_ids = 11 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: OutputClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.output == null or !handler.geometry or !handler.mode or
+        !handler.scale or !handler.name or !handler.description or !handler.done or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_output,
+        client_objects,
+        &actor.transmit,
+        handler.output.?,
+        .{ .release = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const OutputClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    output: ?wayring.objects.Handle = null,
+    synced: bool = false,
+    deleted: bool = false,
+    geometry: bool = false,
+    mode: bool = false,
+    scale: bool = false,
+    name: bool = false,
+    description: bool = false,
+    done: bool = false,
+
+    pub fn event(
+        handler: *OutputClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| if (std.mem.eql(
+                    u8,
+                    global.interface,
+                    standard_protocol.wl_output.info.name,
+                )) {
+                    handler.output = try XdgClientCore.bind(
+                        handler.objects,
+                        handler.queue,
+                        handler.registry,
+                        global.name,
+                        &standard_protocol.wl_output.info,
+                        @min(global.version, 4),
+                        null,
+                    );
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.wl_output.info) {
+            const event_value = try wayring.client.decodeEvent(
+                standard_protocol.wl_output,
+                handler.objects,
+                handler.output orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (event_value) {
+                .geometry => |value| {
+                    if (value.x != -10 or value.y != 20 or value.physical_width != 600 or
+                        value.physical_height != 340 or value.subpixel.value !=
+                        standard_protocol.wl_output.subpixel.horizontal_rgb.value or
+                        !std.mem.eql(u8, value.make, "Wayring") or
+                        !std.mem.eql(u8, value.model, "Virtual-1") or
+                        value.transform.value != standard_protocol.wl_output.transform.@"90".value)
+                        return error.InvalidOutput;
+                    handler.geometry = true;
+                },
+                .mode => |value| {
+                    if (value.flags.value != 3 or value.width != 1920 or value.height != 1080 or
+                        value.refresh != 60_000)
+                        return error.InvalidOutput;
+                    handler.mode = true;
+                },
+                .scale => |value| {
+                    if (value.factor != 2) return error.InvalidOutput;
+                    handler.scale = true;
+                },
+                .name => |value| {
+                    if (!std.mem.eql(u8, value.name, "WL-1")) return error.InvalidOutput;
+                    handler.name = true;
+                },
+                .description => |value| {
+                    if (!std.mem.eql(u8, value.description, "Wayring virtual output"))
+                        return error.InvalidOutput;
+                    handler.description = true;
+                },
+                .done => handler.done = true,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
 
 fn wayringDataDeviceClient() !u8 {
     var sockets: [2]c_int = undefined;
@@ -2706,6 +2974,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .data_device_libwayland_client;
         } else if (std.mem.eql(u8, value, "data-device-libwayland-server")) {
             options.mode = .data_device_libwayland_server;
+        } else if (std.mem.eql(u8, value, "output-libwayland-client")) {
+            options.mode = .output_libwayland_client;
+        } else if (std.mem.eql(u8, value, "output-libwayland-server")) {
+            options.mode = .output_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

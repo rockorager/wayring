@@ -38,6 +38,7 @@ bench/run.sh interop-syscalls
 bench/run.sh interop-latency
 bench/run.sh xdg-interop
 bench/run.sh data-device-interop
+bench/run.sh output-interop
 ```
 
 Configure a run through environment variables:
@@ -159,3 +160,8 @@ pipe supplied by the server. The reverse pairing also admits a server-created
 data offer and transfers its payload through a client-supplied pipe. Both paths
 validate descriptor ownership and ordered offer, source, device, and seat
 teardown.
+
+Output interoperability mode runs both library pairings. A version-4 output
+publishes geometry, mode flags, scale, stable name, description, and `done` in
+one event burst. Both clients validate every field before releasing the output,
+covering version-gated core events and output-resource teardown.
