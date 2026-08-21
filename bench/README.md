@@ -191,3 +191,9 @@ Subsurface interoperability mode runs both library pairings. Each constructs a
 parent and child surface, assigns the child subsurface role, and validates
 position, sibling stacking, synchronized and desynchronized modes, and ordered
 subsurface, surface, and subcompositor teardown.
+
+Legacy-shell interoperability mode runs both library pairings against the core
+`wl_shell` protocol. It assigns a shell-surface role, exchanges ping/pong,
+configure, and popup completion events, and validates title, class, toplevel,
+and surface teardown. This closes core protocol coverage while modern clients
+remain expected to use xdg-shell.

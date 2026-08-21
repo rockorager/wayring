@@ -98,6 +98,8 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/touch-interop-server.c" \
     "$root/bench/subsurface-interop-client.c" \
     "$root/bench/subsurface-interop-server.c" \
+    "$root/bench/shell-interop-client.c" \
+    "$root/bench/shell-interop-server.c" \
     "$generated/wayring-benchmark-protocol.c" \
     "$generated/xdg-shell-protocol.c" \
     "$generated/presentation-time-protocol.c" \

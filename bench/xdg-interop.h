@@ -19,5 +19,7 @@ int touch_client_fd(int fd);
 int touch_server_fd(int fd);
 int subsurface_client_fd(int fd);
 int subsurface_server_fd(int fd);
+int shell_client_fd(int fd);
+int shell_server_fd(int fd);
 
 #endif

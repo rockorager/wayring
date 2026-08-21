@@ -21,7 +21,7 @@ const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface };
+const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -51,6 +51,8 @@ const Options = struct {
         touch_libwayland_server,
         subsurface_libwayland_client,
         subsurface_libwayland_server,
+        shell_libwayland_client,
+        shell_libwayland_server,
     } = .libwayland_client,
     latency: bool = false,
 };
@@ -78,6 +80,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .touch_libwayland_server => wayringTouchClient(),
         .subsurface_libwayland_client => wayringProtocolServer(.subsurface),
         .subsurface_libwayland_server => wayringSubsurfaceClient(),
+        .shell_libwayland_client => wayringProtocolServer(.shell),
+        .shell_libwayland_server => wayringShellClient(),
     };
 }
 
@@ -372,6 +376,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             .keyboard => ffi.keyboard_client_fd(connected_fd),
             .touch => ffi.touch_client_fd(connected_fd),
             .subsurface => ffi.subsurface_client_fd(connected_fd),
+            .shell => ffi.shell_client_fd(connected_fd),
         });
     }
 
@@ -437,6 +442,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .subsurface => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
             _ = try runtime.globals.add(&standard_protocol.wl_subcompositor.info, 1, null);
+        },
+        .shell => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
+            _ = try runtime.globals.add(&standard_protocol.wl_shell.info, 1, null);
         },
     }
     try runtime.prepareAccept();
@@ -571,6 +580,11 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.subsurface_desync or !handler.subsurface_destroyed or
             !handler.subcompositor_destroyed)
             return error.IncompleteInterop,
+        .shell => if (!handler.surface_created or !handler.shell_surface_created or
+            !handler.shell_events_sent or !handler.shell_ponged or
+            !handler.shell_toplevel or !handler.shell_title or !handler.shell_class or
+            !handler.surface_destroyed)
+            return error.IncompleteInterop,
     }
 
     _ = try runtime.prepareEndpointClose();
@@ -692,6 +706,12 @@ const ProtocolServerHandler = struct {
     subsurface_desync: bool = false,
     subsurface_destroyed: bool = false,
     subcompositor_destroyed: bool = false,
+    shell_surface_created: bool = false,
+    shell_events_sent: bool = false,
+    shell_ponged: bool = false,
+    shell_toplevel: bool = false,
+    shell_title: bool = false,
+    shell_class: bool = false,
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -1680,8 +1700,9 @@ const ProtocolServerHandler = struct {
                     }
                     if (handler.kind == .shm) handler.surface_created = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
-                        handler.kind == .touch)
+                        handler.kind == .touch or handler.kind == .shell)
                         handler.surface = surface;
+                    if (handler.kind == .shell) handler.surface_created = true;
                 },
                 .create_region => |value| {
                     if (handler.kind != .shm) return error.UnexpectedRequest;
@@ -1782,7 +1803,7 @@ const ProtocolServerHandler = struct {
                         handler.subsurface_surfaces_destroyed += 1;
                     if (handler.kind == .shm) handler.surface_destroyed = true;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
-                        handler.kind == .touch)
+                        handler.kind == .touch or handler.kind == .shell)
                         handler.surface_destroyed = true;
                 },
                 .attach => |value| {
@@ -1929,6 +1950,81 @@ const ProtocolServerHandler = struct {
                     handler.region_subtracted = true;
                 },
                 .destroy => handler.region_destroyed = true,
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_shell.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_shell,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .get_shell_surface => |value| {
+                    if (value.surface != handler.surface.?.id) return error.InvalidSurface;
+                    const shell_surface = (try standard_protocol.wl_shell.admit_get_shell_surface(
+                        handler.objects,
+                        decoded.handle,
+                        value,
+                        .{},
+                    )).id;
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_shell_surface,
+                        handler.objects,
+                        handler.queue,
+                        shell_surface,
+                        .{ .ping = .{ .serial = 41 } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_shell_surface,
+                        handler.objects,
+                        handler.queue,
+                        shell_surface,
+                        .{ .configure = .{
+                            .edges = .bottom_right,
+                            .width = 800,
+                            .height = 600,
+                        } },
+                    );
+                    try wayring.server.sendEvent(
+                        standard_protocol,
+                        standard_protocol.wl_shell_surface,
+                        handler.objects,
+                        handler.queue,
+                        shell_surface,
+                        .{ .popup_done = .{} },
+                    );
+                    handler.shell_surface_created = true;
+                    handler.shell_events_sent = true;
+                },
+            }
+            try decoded.finish(standard_protocol, handler.objects, handler.queue);
+        } else if (interface == &standard_protocol.wl_shell_surface.info) {
+            const decoded = try wayring.server.decodeRequest(
+                standard_protocol.wl_shell_surface,
+                handler.objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .pong => |value| {
+                    if (value.serial != 41) return error.InvalidSerial;
+                    handler.shell_ponged = true;
+                },
+                .set_toplevel => handler.shell_toplevel = true,
+                .set_title => |value| {
+                    if (!std.mem.eql(u8, value.title, "wayring-shell"))
+                        return error.InvalidTitle;
+                    handler.shell_title = true;
+                },
+                .set_class => |value| {
+                    if (!std.mem.eql(u8, value.class_, "wayring"))
+                        return error.InvalidClass;
+                    handler.shell_class = true;
+                },
+                else => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else return error.UnexpectedRequest;
@@ -3975,6 +4071,235 @@ const DataDeviceClientHandler = struct {
     }
 };
 
+fn wayringShellClient() !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.shell_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+
+    const allocator = std.heap.c_allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 64 * 1024,
+        .receive_buffer_count = 8,
+        .receive_control_capacity = 256,
+        .fragment_block_size = wayring.wire.max_message_len,
+        .fragment_block_count = 2,
+        .transmit_block_size = 4096,
+        .transmit_block_count = 4,
+        .descriptor_count = 2,
+        .send_descriptor_capacity = 2,
+    });
+    var connection = try XdgClientConnection.attach(
+        allocator,
+        &reactor,
+        sockets[0],
+        .{
+            .received_fd_budget = 2,
+            .transmit_byte_budget = 16 * 1024,
+            .transmit_fd_budget = 2,
+        },
+        .{ .max_objects = 12, .max_client_ids = 11 },
+    );
+    const peer = connection.peer;
+    const actor = try connection.actor();
+    const client_objects = &connection.objects;
+    const registry = try XdgClientCore.getRegistry(client_objects, &actor.transmit, null);
+    const callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    var handler: ShellClientHandler = .{
+        .objects = client_objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .callback = callback,
+    };
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (handler.compositor == null or handler.shell == null or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    const surface = (try standard_protocol.wl_compositor.construct_create_surface(
+        client_objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const shell_surface = (try standard_protocol.wl_shell.construct_get_shell_surface(
+        client_objects,
+        &actor.transmit,
+        handler.shell.?,
+        .{ .surface = surface.id },
+    )).id;
+    handler.shell_surface = shell_surface;
+    try wayring.client.sendRequest(
+        standard_protocol.wl_shell_surface,
+        client_objects,
+        &actor.transmit,
+        shell_surface,
+        .{ .set_title = .{ .title = "wayring-shell" } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_shell_surface,
+        client_objects,
+        &actor.transmit,
+        shell_surface,
+        .{ .set_class = .{ .class_ = "wayring" } },
+    );
+    try wayring.client.sendRequest(
+        standard_protocol.wl_shell_surface,
+        client_objects,
+        &actor.transmit,
+        shell_surface,
+        .{ .set_toplevel = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.ping or !handler.configure or !handler.popup_done or
+        !handler.synced or !handler.deleted)
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        client_objects,
+        &actor.transmit,
+        surface,
+        .{ .destroy = .{} },
+    );
+    handler.synced = false;
+    handler.deleted = false;
+    handler.callback = try XdgClientCore.sync(client_objects, &actor.transmit, null);
+    if (!actor.transmit.sendActive()) try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit();
+    while (!handler.synced or !handler.deleted or
+        actor.transmit.queuedBytes() > 0 or actor.transmit.sendActive())
+        try pumpProtocolClient(&reactor, peer, client_objects, &handler);
+
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
+    try connection.deinit(allocator);
+    reactor.deinit(allocator);
+    return waitChild(child);
+}
+
+const ShellClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    callback: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    shell: ?wayring.objects.Handle = null,
+    shell_surface: ?wayring.objects.Handle = null,
+    synced: bool = false,
+    deleted: bool = false,
+    ping: bool = false,
+    configure: bool = false,
+    popup_done: bool = false,
+
+    pub fn event(
+        handler: *ShellClientHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        const interface = target.object.interface;
+        if (interface == &XdgClientCore.Display.info) {
+            switch (try XdgClientCore.decodeDisplayEvent(handler.objects, message, fds)) {
+                .delete_id => |deleted| {
+                    if (deleted.id == handler.callback.id) handler.deleted = true;
+                },
+                .@"error" => return error.ProtocolError,
+            }
+        } else if (interface == &XdgClientCore.Registry.info) {
+            switch (try XdgClientCore.decodeRegistryEvent(
+                handler.objects,
+                handler.registry,
+                message,
+                fds,
+            )) {
+                .global => |global| {
+                    if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wl_compositor.info.name,
+                    )) {
+                        handler.compositor = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_compositor.info,
+                            @min(global.version, 4),
+                            null,
+                        );
+                    } else if (std.mem.eql(
+                        u8,
+                        global.interface,
+                        standard_protocol.wl_shell.info.name,
+                    )) {
+                        handler.shell = try XdgClientCore.bind(
+                            handler.objects,
+                            handler.queue,
+                            handler.registry,
+                            global.name,
+                            &standard_protocol.wl_shell.info,
+                            1,
+                            null,
+                        );
+                    }
+                },
+                .global_remove => {},
+            }
+        } else if (interface == &XdgClientCore.Callback.info) {
+            _ = try XdgClientCore.decodeCallbackEvent(
+                handler.objects,
+                handler.callback,
+                message,
+                fds,
+            );
+            handler.synced = true;
+        } else if (interface == &standard_protocol.wl_shell_surface.info) {
+            const value = try wayring.client.decodeEvent(
+                standard_protocol.wl_shell_surface,
+                handler.objects,
+                handler.shell_surface orelse return error.UnexpectedEvent,
+                message,
+                fds,
+            );
+            switch (value) {
+                .ping => |ping| {
+                    if (ping.serial != 41) return error.InvalidSerial;
+                    try wayring.client.sendRequest(
+                        standard_protocol.wl_shell_surface,
+                        handler.objects,
+                        handler.queue,
+                        handler.shell_surface.?,
+                        .{ .pong = .{ .serial = ping.serial } },
+                    );
+                    handler.ping = true;
+                },
+                .configure => |configure| {
+                    if (configure.edges.value !=
+                        standard_protocol.wl_shell_surface.resize.bottom_right.value or
+                        configure.width != 800 or configure.height != 600)
+                        return error.InvalidConfigure;
+                    handler.configure = true;
+                },
+                .popup_done => handler.popup_done = true,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
 fn wayringShmClient() !u8 {
     var sockets: [2]c_int = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
@@ -5124,6 +5449,10 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .subsurface_libwayland_client;
         } else if (std.mem.eql(u8, value, "subsurface-libwayland-server")) {
             options.mode = .subsurface_libwayland_server;
+        } else if (std.mem.eql(u8, value, "shell-libwayland-client")) {
+            options.mode = .shell_libwayland_client;
+        } else if (std.mem.eql(u8, value, "shell-libwayland-server")) {
+            options.mode = .shell_libwayland_server;
         } else return error.InvalidMode;
     }
     if (iterator.next() != null or options.messages == 0 or options.batch == 0 or

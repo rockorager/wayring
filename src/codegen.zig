@@ -1357,12 +1357,14 @@ fn emitObjectValidator(
     messages: []const protocol_ir.Message,
 ) Error!void {
     try add(output, allocator, "    pub inline fn validate" ++ direction ++ "Objects(namespace: anytype, value: " ++ direction ++ ") !void {\n        switch (value) {\n");
+    var validated_count: usize = 0;
     for (messages) |message| {
         var object_count: usize = 0;
         for (message.arguments) |argument| if (argument.type == .object) {
             object_count += 1;
         };
         if (object_count == 0) continue;
+        validated_count += 1;
         try add(output, allocator, "            .");
         try identifier(output, allocator, message.name);
         try add(output, allocator, " => |payload| {\n");
@@ -1381,7 +1383,9 @@ fn emitObjectValidator(
         }
         try add(output, allocator, "            },\n");
     }
-    try add(output, allocator, "            else => {},\n        }\n    }\n\n");
+    if (validated_count != messages.len)
+        try add(output, allocator, "            else => {},\n");
+    try add(output, allocator, "        }\n    }\n\n");
 }
 
 fn emitObjectValidation(
@@ -1593,6 +1597,19 @@ test "expands an untyped new id into its dynamic wire arguments" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "wayring.client.NewObject") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "const dynamic_interface = (try arguments.string())") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "try writeString(&reservation, payload.@\"id\".interface)") != null);
+}
+
+test "omits unreachable object validator fallback" {
+    const xml =
+        \\<protocol name="sample"><interface name="sample_v1" version="1">
+        \\<request name="attach"><arg name="surface" type="object" interface="sample_v1"/></request>
+        \\</interface></protocol>
+    ;
+    var protocol = try protocol_ir.Protocol.parse(std.testing.allocator, xml);
+    defer protocol.deinit(std.testing.allocator);
+    const generated = try generate(std.testing.allocator, protocol);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "else => {},") == null);
 }
 
 test "composes protocol interfaces and rejects duplicates" {
