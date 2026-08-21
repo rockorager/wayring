@@ -30,6 +30,7 @@ pub const region = @import("region.zig");
 pub const frame = @import("frame.zig");
 pub const subsurface = @import("subsurface.zig");
 pub const release = @import("release.zig");
+pub const content_update = @import("content_update.zig");
 
 test {
     _ = wire;
@@ -54,4 +55,5 @@ test {
     _ = frame;
     _ = subsurface;
     _ = release;
+    _ = content_update;
 }

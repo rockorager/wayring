@@ -484,8 +484,15 @@ independently owned callback batch in O(1). Applications embed that batch in
 the content-update payload and consume callbacks only after `done(0)` plus
 `delete_id` enter the transmit queue, preserving delivery under backpressure.
 The graph implements the established synchronized-subtree behavior; exact
-version-7 per-content-update dependency edges and generalized constraints
-remain the next scheduler layer. The SHM interoperability server
+version-7 scheduling is provided by a lower-level bounded content-update DAG.
+Each per-surface queue automatically links its predecessor and may claim the
+latest unclaimed SCU of each direct child. DCU candidates inspect their entire
+reachable graph for unsatisfied constraints and caller output capacity before
+atomically applying it. Node and edge exhaustion cannot partially append an
+update, generation-checked edges make destroyed dependencies safely stale, and
+caller-owned queues reserve no storage while idle. Synchronization-transition
+edge rewriting remains to be connected to the subsurface relationship layer.
+The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and
 commit requests, including destroying the source region after it is copied.
