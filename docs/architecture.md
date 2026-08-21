@@ -490,8 +490,13 @@ latest unclaimed SCU of each direct child. DCU candidates inspect their entire
 reachable graph for unsatisfied constraints and caller output capacity before
 atomically applying it. Node and edge exhaustion cannot partially append an
 update, generation-checked edges make destroyed dependencies safely stale, and
-caller-owned queues reserve no storage while idle. Synchronization-transition
-edge rewriting remains to be connected to the subsurface relationship layer.
+caller-owned queues reserve no storage while idle. On effective desync
+transitions, one allocation-free global mark preserves SCUs reachable from any
+DCU; unreachable SCUs become DCUs and lose incoming cross-surface dependencies
+exactly as required by version 7. The relationship graph reports precisely the
+surfaces whose effective mode changed, stopping at explicit synchronization
+barriers, so callers can feed those keys directly to their scheduler queues
+without embedding scheduler policy in relationship storage.
 The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and
