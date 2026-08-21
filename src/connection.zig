@@ -39,6 +39,7 @@ pub const Event = union(enum) {
     },
     disconnected,
     receive_stopped,
+    send_stopped,
     buffers_exhausted,
     cancel_complete,
 };
@@ -236,6 +237,8 @@ pub const Actor = struct {
     fn completeSend(actor: *Actor, cqe: linux.io_uring_cqe) Error!Event {
         if (cqe.res <= 0) {
             try actor.transmit.failed();
+            if (actor.lifecycle == .closing and cqe.err() == .CANCELED)
+                return .send_stopped;
             actor.lifecycle = .closing;
             return error.IoFailure;
         }
@@ -411,6 +414,40 @@ test "completed cancellation remains requested until receive stops" {
         .flags = 0,
     });
     try std.testing.expectEqual(Event.receive_stopped, receive_event);
+    try std.testing.expect(actor.canDeinit());
+    actor.deinit();
+}
+
+test "closing treats a canceled send as orderly teardown" {
+    const allocator = std.testing.allocator;
+    var transmit_blocks = try pools.SharedBlocks.init(allocator, 8, 1);
+    defer transmit_blocks.deinit(allocator);
+    var descriptors = try pools.SharedFds.init(allocator, 1);
+    defer descriptors.deinit(allocator);
+    var fragment_storage: [8]u8 = undefined;
+    var actor = Actor.init(
+        1,
+        1,
+        &fragment_storage,
+        &descriptors,
+        0,
+        &transmit_blocks,
+        8,
+        0,
+    );
+
+    try actor.enqueue("blocked", &.{});
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control_storage: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot_value = try actor.transmit.snapshot(&descriptor_scratch, &control_storage);
+    const send_token = try actor.beginSend(snapshot_value);
+    actor.beginClose();
+    try std.testing.expectEqual(Event.send_stopped, try actor.complete(.{
+        .user_data = send_token,
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .flags = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, "blocked".len), actor.transmit.queuedBytes());
     try std.testing.expect(actor.canDeinit());
     actor.deinit();
 }

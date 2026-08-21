@@ -135,13 +135,13 @@ pub fn Connection(comptime protocol: type) type {
             return connection.reactor.getReceiver(connection.peer);
         }
 
-        /// Queues asynchronous receive cancellation without submitting it.
+        /// Queues asynchronous socket-I/O cancellation without submitting it.
         pub inline fn prepareClose(connection: *Self) !bool {
             return connection.reactor.prepareClose(connection.peer);
         }
 
         /// Closes and recycles a fully quiesced peer, then releases object
-        /// storage. Receive cancellation and send completion remain caller-run.
+        /// storage. I/O cancellation completions remain caller-run.
         pub fn deinit(connection: *Self, allocator: std.mem.Allocator) !void {
             const peer_actor = try connection.actor();
             if (!peer_actor.canDeinit()) return error.ActorBusy;

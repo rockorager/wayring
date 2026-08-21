@@ -291,12 +291,28 @@ pub const Reactor = struct {
         _ = try owner.ring.submit();
     }
 
-    /// Moves a peer to closing and queues receive cancellation without
-    /// submitting, allowing many peers to share one ring enter. Returns false
-    /// when no receive operation needs cancellation.
+    /// Moves a peer to closing and queues cancellation of every active socket
+    /// operation without submitting, allowing many peers to share one ring
+    /// enter. Returns false when no operation needs cancellation.
     pub inline fn prepareClose(owner: *Reactor, peer: Peer) !bool {
         const actor = try owner.getActor(peer);
-        return owner.receiver_storage[peer.slot].prepareStop(owner.ring, actor);
+        actor.beginClose();
+        if (!actor.receive_active and !actor.transmit.sendActive()) return false;
+        if (actor.cancel_requested) return error.CancelAlreadyActive;
+
+        actor.cancel_requested = true;
+        actor.cancel_active = true;
+        errdefer {
+            actor.cancel_requested = false;
+            actor.cancel_active = false;
+        }
+        const submission = try owner.ring.get_sqe();
+        submission.prep_cancel_fd(
+            owner.fd_storage[peer.slot],
+            linux.IORING_ASYNC_CANCEL_ALL,
+        );
+        submission.user_data = actor.cancelToken();
+        return true;
     }
 
     pub inline fn armClose(owner: *Reactor, peer: Peer) !bool {

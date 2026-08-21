@@ -505,6 +505,84 @@ test "real io_uring sends resume after forced kernel backpressure" {
     );
 }
 
+test "close cancels a send blocked by kernel backpressure" {
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = backpressure_block_size,
+        .transmit_block_count = 2,
+        .descriptor_count = 1,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(std.testing.allocator);
+
+    var sockets: [2]linux.fd_t = undefined;
+    try expectSuccess(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    ));
+    defer _ = linux.close(sockets[1]);
+    try setSendBuffer(sockets[0], 4096);
+    const peer = try reactor.attachReceiving(sockets[0], .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 2 * backpressure_block_size,
+        .transmit_fd_budget = 1,
+    });
+    const actor = try reactor.getActor(peer);
+    var payload: [backpressure_block_size]u8 = undefined;
+    @memset(&payload, 0xa5);
+    const descriptor = try createDescriptor();
+    try actor.enqueue(&payload, &.{descriptor});
+    try actor.enqueue(&payload, &.{});
+
+    try reactor.prepareSend(peer);
+    _ = try reactor.ring.submit_and_wait(1);
+    const first_completion = try reactor.ring.copy_cqe();
+    const first_routed = (reactor.route(null, first_completion) orelse
+        return error.InvalidCompletion).connection;
+    if (first_routed.operation != .send) return error.UnexpectedCompletion;
+    const first_event = try actor.completeRouted(.send, first_completion);
+    try std.testing.expect(first_event.sent.length < 2 * backpressure_block_size);
+    try std.testing.expect(first_event.sent.more_queued);
+
+    try reactor.prepareSend(peer);
+    try std.testing.expectError(error.SendAlreadyActive, reactor.prepareSend(peer));
+    _ = try reactor.ring.submit();
+    try std.testing.expect(try reactor.prepareClose(peer));
+    _ = try reactor.ring.submit();
+    var send_stopped = false;
+    var receive_stopped = false;
+    var cancel_complete = false;
+    while (!actor.canDeinit()) {
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        const routed_peer = reactor.routedPeer(routed);
+        try std.testing.expectEqual(peer.slot, routed_peer.slot);
+        try std.testing.expectEqual(peer.generation, routed_peer.generation);
+        const event = try actor.completeRouted(routed.operation, completion);
+        switch (event) {
+            .send_stopped => send_stopped = true,
+            .receive_stopped => receive_stopped = true,
+            .cancel_complete => cancel_complete = true,
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expect(send_stopped);
+    try std.testing.expect(receive_stopped);
+    try std.testing.expect(cancel_complete);
+    try reactor.destroyPeer(peer);
+    try std.testing.expectEqual(@as(usize, 2), reactor.transmit_blocks.available());
+    try std.testing.expectEqual(@as(usize, 1), reactor.descriptors.available());
+}
+
 fn prepareBackpressureSend(
     reactor: *wayring.io_uring.Reactor,
     state: *BackpressureState,

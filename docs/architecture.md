@@ -413,12 +413,13 @@ throughput, round-trip latency, syscalls, and hardware counters without linking
 libwayland into the normal Wayring benchmark executable. Each pairing also
 round-trips a real descriptor through generated protocol arguments and verifies
 that the receiving side observes close-on-exec.
-Peer shutdown is likewise completion-driven and batchable. Each actor tracks its
-receive-cancel operation until both the cancel CQE and terminating receive CQE
-arrive, preventing slot reuse while the kernel can still reference persistent
-receive state. A reactor can queue cancellation for many peers before one shared
-submission; the synchronous stop helper is only a convenience wrapper over the
-same state machine and allocates no temporary completion bitmap.
+Peer shutdown is likewise completion-driven and batchable. One descriptor-wide
+cancel SQE stops every active receive and send on that peer. Each actor remains
+live until the cancel CQE and every terminating operation CQE arrive, preventing
+slot reuse while the kernel can still reference persistent operation state or
+queued TX storage. A reactor can queue cancellation for many peers before one
+shared submission; the receive-only synchronous stop helper remains available
+to lower-level users and allocates no temporary completion bitmap.
 
 The benchmark includes a multi-connection mode in which one ring, one provided
 buffer group, and shared fragment and transmit pools serve up to 64 socket

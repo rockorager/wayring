@@ -605,12 +605,23 @@ fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
                         actor.completeRouted(.send, cqe(.send, if (fail) -1 else 1, 0)),
                     );
                 } else if (fail) {
-                    try std.testing.expectError(
-                        error.IoFailure,
-                        actor.completeRouted(.send, cqe(.send, -1, 0)),
-                    );
+                    if (lifecycle == .closing) {
+                        try std.testing.expectEqual(
+                            wayring.connection.Event.send_stopped,
+                            try actor.completeRouted(
+                                .send,
+                                cqe(.send, -@as(i32, @intFromEnum(linux.E.CANCELED)), 0),
+                            ),
+                        );
+                    } else {
+                        try std.testing.expectError(
+                            error.IoFailure,
+                            actor.completeRouted(.send, cqe(.send, -1, 0)),
+                        );
+                        lifecycle = .closing;
+                    }
                     send_active = false;
-                    lifecycle = .closing;
+                    send_bytes = 0;
                 } else {
                     const written = smith.valueRangeAtMost(u16, 1, @intCast(send_bytes));
                     const event = try actor.completeRouted(
@@ -643,7 +654,7 @@ fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
             8 => {
                 actor.beginClose();
                 lifecycle = .closing;
-                if (receive_active and !cancel_requested) {
+                if ((receive_active or send_active) and !cancel_requested) {
                     actor.cancel_requested = true;
                     actor.cancel_active = true;
                     cancel_requested = true;
@@ -712,7 +723,10 @@ fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
         _ = try actor.completeRouted(.cancel, cqe(.cancel, 0, 0));
     }
     if (actor.transmit.sendActive()) {
-        _ = actor.completeRouted(.send, cqe(.send, -1, 0)) catch {};
+        _ = try actor.completeRouted(
+            .send,
+            cqe(.send, -@as(i32, @intFromEnum(linux.E.CANCELED)), 0),
+        );
     }
     try std.testing.expect(actor.canDeinit());
     actor.deinit();

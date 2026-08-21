@@ -786,7 +786,7 @@ pub fn SharedClients(comptime protocol: type) type {
             return .{ .clients = clients };
         }
 
-        /// Queues asynchronous receive cancellation without submitting it.
+        /// Queues asynchronous socket-I/O cancellation without submitting it.
         pub inline fn prepareClose(clients: *Self, peer: io_uring.Peer) !bool {
             _ = try clients.get(peer);
             return clients.reactor.prepareClose(peer);
