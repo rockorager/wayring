@@ -1907,8 +1907,13 @@ const ProtocolServerHandler = struct {
                 .destroy => {
                     if (handler.kind == .shm) try handler.surface_state.validateDestroy();
                     if (handler.kind == .subsurface) {
-                        if (std.meta.eql(decoded.handle, handler.subsurface_child.?))
+                        if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
                             try handler.subsurface_child_state.validateDestroy();
+                        } else if (std.meta.eql(decoded.handle, handler.subsurface_parent.?)) {
+                            handler.subsurface_graph.surfaceDestroyed(decoded.handle);
+                            if (try handler.subsurface_graph.isVisible(handler.subsurface_child.?))
+                                return error.InvalidSubsurface;
+                        } else return error.InvalidSubsurface;
                         handler.subsurface_surfaces_destroyed += 1;
                     }
                     if (handler.kind == .shm) handler.surface_destroyed = true;
@@ -3588,6 +3593,13 @@ fn wayringSubsurfaceClient() !u8 {
         .{ .set_desync = .{} },
     );
     try wayring.client.sendRequest(
+        standard_protocol.wl_surface,
+        objects,
+        &actor.transmit,
+        parent,
+        .{ .destroy = .{} },
+    );
+    try wayring.client.sendRequest(
         standard_protocol.wl_subsurface,
         objects,
         &actor.transmit,
@@ -3599,13 +3611,6 @@ fn wayringSubsurfaceClient() !u8 {
         objects,
         &actor.transmit,
         child_surface,
-        .{ .destroy = .{} },
-    );
-    try wayring.client.sendRequest(
-        standard_protocol.wl_surface,
-        objects,
-        &actor.transmit,
-        parent,
         .{ .destroy = .{} },
     );
     try wayring.client.sendRequest(

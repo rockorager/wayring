@@ -499,7 +499,9 @@ barriers, so callers can feed those keys directly to their scheduler queues
 without embedding scheduler policy in relationship storage. Effective-mode
 queries determine CU kind, while direct-child enumeration includes pending
 associations and supplies the child queues whose newest unclaimed SCUs become
-dependencies of the parent commit.
+dependencies of the parent commit. Recursive visibility accounts for pending
+ancestor associations, inactive ancestor role objects, and destroyed parent
+surfaces without eagerly walking or rewriting the descendant tree.
 The SHM interoperability server
 exercises all current surface state machines with real libwayland region
 copies, frame callbacks, attach, dual damage, transform, scale, offset, and

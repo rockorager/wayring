@@ -72,6 +72,8 @@ subsurface_client_fd(int fd)
 	wl_subsurface_set_sync(subsurface);
 	wl_surface_commit(child);
 	wl_subsurface_set_desync(subsurface);
+	wl_surface_destroy(parent);
+	parent = NULL;
 	if (wl_display_roundtrip(display) < 0)
 		goto cleanup;
 	status = EXIT_SUCCESS;
