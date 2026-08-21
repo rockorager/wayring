@@ -6,6 +6,7 @@ const linux = std.os.linux;
 const ClientCore = wayring.client.Core(protocol);
 const ServerCore = wayring.server.Core(protocol);
 const ClientConnection = wayring.client.Connection(protocol);
+const ClientDriver = wayring.client.Driver(protocol);
 const ServerConnections = wayring.server.SharedClients(protocol);
 
 test "client and server complete a core round trip on one reactor" {
@@ -68,11 +69,6 @@ test "client and server complete a core round trip on one reactor" {
         &client_actor.transmit,
         null,
     );
-    try reactor.prepareSend(client_peer);
-    const nop_tag: u64 = 0xffff_ffff_ffff_ff00;
-    _ = try ring.nop(nop_tag);
-    _ = try reactor.ring.submit();
-
     var server_handler: ServerHandler = .{
         .objects = server_objects,
         .queue = &(try reactor.getActor(server_peer)).transmit,
@@ -81,6 +77,13 @@ test "client and server complete a core round trip on one reactor" {
         .objects = &client_connection.objects,
         .callback = callback,
     };
+    var client_driver = ClientDriver.init(&client_connection);
+    _ = try client_driver.schedule();
+    var client_progress = try client_driver.prepare(&client_handler);
+    try std.testing.expectEqual(@as(usize, 1), client_progress.prepared);
+    const nop_tag: u64 = 0xffff_ffff_ffff_ff00;
+    _ = try ring.nop(nop_tag);
+    _ = try reactor.ring.submit();
     var nop_seen = false;
 
     while (!client_handler.done or !client_handler.deleted) {
@@ -92,34 +95,28 @@ test "client and server complete a core round trip on one reactor" {
         const routed = (reactor.route(null, completion) orelse
             return error.InvalidCompletion).connection;
         const peer = reactor.routedPeer(routed);
+        if (peer.slot == client_peer.slot) {
+            client_progress = try client_driver.dispatch(&.{completion}, &client_handler);
+            if (client_progress.event_errors != 0) return error.UnexpectedEventError;
+            if (client_progress.prepared != 0 or client_progress.pending)
+                _ = try reactor.ring.submit();
+            continue;
+        }
         const actor = try reactor.getActor(peer);
         const event = try actor.completeRouted(routed.operation, completion);
         var prepared = false;
         switch (event) {
             .received => {
                 const receiver = try reactor.getReceiver(peer);
-                if (peer.slot == server_peer.slot) {
-                    switch (try ServerCore.receivedRequests(
-                        actor,
-                        &server_objects.namespace,
-                        receiver,
-                        completion,
-                        &server_handler,
-                    )) {
-                        .dispatched => {},
-                        .terminal => |failure| return failure.cause,
-                    }
-                } else {
-                    switch (try ClientCore.receivedEvents(
-                        actor,
-                        &client_connection.objects.namespace,
-                        receiver,
-                        completion,
-                        &client_handler,
-                    )) {
-                        .dispatched => {},
-                        .terminal => |failure| return failure.cause,
-                    }
+                switch (try ServerCore.receivedRequests(
+                    actor,
+                    &server_objects.namespace,
+                    receiver,
+                    completion,
+                    &server_handler,
+                )) {
+                    .dispatched => {},
+                    .terminal => |failure| return failure.cause,
                 }
                 if (!actor.receive_active) {
                     try reactor.prepareReceive(peer);
@@ -237,6 +234,8 @@ test "client closes after a transported terminal display error" {
     var handler: TerminalClientHandler = .{
         .objects = &client_connection.objects,
     };
+    var client_driver = ClientDriver.init(&client_connection);
+    var client_progress: ClientDriver.Progress = .{};
     var terminal_seen = false;
     var send_complete = false;
     while (!terminal_seen or !send_complete) {
@@ -244,30 +243,16 @@ test "client closes after a transported terminal display error" {
         const routed = (reactor.route(null, completion) orelse
             return error.InvalidCompletion).connection;
         const peer = reactor.routedPeer(routed);
+        if (peer.slot == client_peer.slot) {
+            client_progress = try client_driver.dispatch(&.{completion}, &handler);
+            terminal_seen = terminal_seen or client_progress.event_errors != 0;
+            if (client_progress.prepared != 0 or client_progress.pending)
+                _ = try reactor.ring.submit();
+            continue;
+        }
         const actor = try reactor.getActor(peer);
         const event = try actor.completeRouted(routed.operation, completion);
         switch (event) {
-            .received => {
-                if (peer.slot != client_peer.slot) return error.InvalidCompletion;
-                const result = try ClientCore.receivedEvents(
-                    actor,
-                    &client_connection.objects.namespace,
-                    try reactor.getReceiver(peer),
-                    completion,
-                    &handler,
-                );
-                const failure = switch (result) {
-                    .terminal => |value| value,
-                    .dispatched => return error.ExpectedProtocolError,
-                };
-                try std.testing.expectEqual(@as(usize, 1), failure.dispatched);
-                try std.testing.expectEqual(
-                    @as(?u32, wayring.objects.display_id),
-                    failure.object_id,
-                );
-                try std.testing.expectEqual(error.ServerProtocolError, failure.cause);
-                terminal_seen = true;
-            },
             .sent => {
                 if (peer.slot != server_peer.slot) return error.InvalidCompletion;
                 send_complete = true;
@@ -281,21 +266,31 @@ test "client closes after a transported terminal display error" {
     }
     try std.testing.expectEqual(@as(usize, 1), handler.errors);
     try std.testing.expectEqual(@as(usize, 0), handler.delete_ids);
+    try std.testing.expectEqual(@as(usize, 1), handler.event_errors);
+    try std.testing.expectEqual(@as(usize, 1), handler.failure_dispatched);
+    try std.testing.expectEqual(
+        @as(?u32, wayring.objects.display_id),
+        handler.failure_object_id,
+    );
+    try std.testing.expectEqual(error.ServerProtocolError, handler.failure_cause.?);
     try std.testing.expectEqual(
         wayring.connection.Lifecycle.closing,
         (try client_connection.actor()).lifecycle,
     );
 
     _ = try server_connections.prepareClose(server_peer);
-    _ = try client_connection.prepareClose();
     _ = try reactor.ring.submit();
-    while (!(try reactor.getActor(server_peer)).canDeinit() or
-        !(try reactor.getActor(client_peer)).canDeinit())
-    {
+    while (!(try reactor.getActor(server_peer)).canDeinit() or !client_progress.quiescent) {
         const completion = try reactor.ring.copy_cqe();
         const routed = (reactor.route(null, completion) orelse
             return error.InvalidCompletion).connection;
         const peer = reactor.routedPeer(routed);
+        if (peer.slot == client_peer.slot) {
+            client_progress = try client_driver.dispatch(&.{completion}, &handler);
+            if (client_progress.prepared != 0 or client_progress.pending)
+                _ = try reactor.ring.submit();
+            continue;
+        }
         const actor = try reactor.getActor(peer);
         const event = try actor.completeRouted(routed.operation, completion);
         switch (event) {
@@ -304,6 +299,7 @@ test "client closes after a transported terminal display error" {
             else => return error.InvalidCompletion,
         }
     }
+    try std.testing.expectEqual(@as(usize, 1), handler.disconnected_count);
     try server_connections.destroy(server_peer);
     try client_connection.deinit(std.testing.allocator);
     server_connections.deinit(std.testing.allocator);
@@ -422,6 +418,29 @@ const TerminalClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
     errors: usize = 0,
     delete_ids: usize = 0,
+    event_errors: usize = 0,
+    failure_dispatched: usize = 0,
+    failure_object_id: ?u32 = null,
+    failure_cause: ?anyerror = null,
+    disconnected_count: usize = 0,
+
+    pub fn eventError(
+        handler: *TerminalClientHandler,
+        _: wayring.io_uring.Peer,
+        failure: ClientCore.EventFailure,
+    ) void {
+        handler.event_errors += 1;
+        handler.failure_dispatched = failure.dispatched;
+        handler.failure_object_id = failure.object_id;
+        handler.failure_cause = failure.cause;
+    }
+
+    pub fn disconnected(
+        handler: *TerminalClientHandler,
+        _: wayring.io_uring.Peer,
+    ) void {
+        handler.disconnected_count += 1;
+    }
 
     pub fn event(
         handler: *TerminalClientHandler,

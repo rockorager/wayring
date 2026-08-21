@@ -169,13 +169,17 @@ pub fn Core(comptime protocol: type) type {
             WrongObject,
         };
 
+        /// Stable payload delivered by terminal event results and the client
+        /// driver's optional `eventError` hook.
+        pub const EventFailure = struct {
+            dispatched: usize,
+            object_id: ?u32,
+            cause: anyerror,
+        };
+
         pub const EventResult = union(enum) {
             dispatched: usize,
-            terminal: struct {
-                dispatched: usize,
-                object_id: ?u32,
-                cause: anyerror,
-            },
+            terminal: EventFailure,
         };
 
         /// Dispatches complete events and closes on framing, object lookup,
@@ -242,6 +246,31 @@ pub fn Core(comptime protocol: type) type {
             var payload = received.payload;
             const result = dispatchEvents(actor, namespace, &payload, context);
             try receiver.release(received);
+            return result;
+        }
+
+        /// Reactor-aware selected-buffer dispatch. Returning a buffer also
+        /// advances the reactor-wide deferred receive scheduler.
+        pub inline fn receivedEventsReactor(
+            actor: *connection_state.Actor,
+            namespace: anytype,
+            reactor: *io_uring.Reactor,
+            peer: io_uring.Peer,
+            completion: std.os.linux.io_uring_cqe,
+            context: anytype,
+        ) !EventResult {
+            const receiver = try reactor.getReceiver(peer);
+            const received = receiver.decodeCompletion(completion) catch |cause| {
+                reactor.noteReceiveBufferReturned(completion);
+                return terminalEvent(actor, 0, null, cause);
+            };
+            _ = actor.ingestControl(received.control) catch |cause| {
+                reactor.releaseReceived(peer, received) catch {};
+                return terminalEvent(actor, 0, null, cause);
+            };
+            var payload = received.payload;
+            const result = dispatchEvents(actor, namespace, &payload, context);
+            try reactor.releaseReceived(peer, received);
             return result;
         }
 
@@ -368,6 +397,188 @@ pub fn Core(comptime protocol: type) type {
                 message.header.opcode,
             );
             if (dispatch.object.interface != interface) return error.WrongInterface;
+        }
+    };
+}
+
+/// Allocation-free completion driver for one client `Connection`. The driver
+/// borrows both connection and ring, keeps submission explicit, and leaves
+/// final `Connection.deinit` to the owner once `Progress.quiescent` is true.
+pub fn Driver(comptime protocol: type) type {
+    return struct {
+        const Self = @This();
+        const ClientConnection = Connection(protocol);
+        const ProtocolCore = Core(protocol);
+
+        connection: *ClientConnection,
+        scheduled: bool = false,
+        disconnected_notified: bool = false,
+
+        pub const Progress = struct {
+            completions: usize = 0,
+            events: usize = 0,
+            event_errors: usize = 0,
+            prepared: usize = 0,
+            pending: bool = false,
+            quiescent: bool = false,
+
+            fn merge(progress: *Progress, other: Progress) void {
+                progress.completions += other.completions;
+                progress.events += other.events;
+                progress.event_errors += other.event_errors;
+                progress.prepared += other.prepared;
+                progress.pending = other.pending;
+                progress.quiescent = other.quiescent;
+            }
+        };
+
+        pub fn init(connection: *ClientConnection) Self {
+            return .{ .connection = connection };
+        }
+
+        /// Marks newly queued output or externally initiated close work.
+        pub fn schedule(driver: *Self) !bool {
+            _ = try driver.connection.actor();
+            if (driver.scheduled) return false;
+            driver.scheduled = true;
+            return true;
+        }
+
+        /// Dispatches CQEs belonging to this connection and prepares resulting
+        /// work without submitting. Shared-ring users must route and filter
+        /// unrelated completions first.
+        pub fn dispatch(
+            driver: *Self,
+            completions: []const std.os.linux.io_uring_cqe,
+            handler: anytype,
+        ) !Progress {
+            var progress: Progress = .{};
+            for (completions) |completion| {
+                try driver.complete(completion, handler, &progress);
+                progress.completions += 1;
+            }
+            progress.merge(try driver.prepare(handler));
+            return progress;
+        }
+
+        /// Prepares send, close cancellation, and deferred receives until the
+        /// SQ fills. Submit and call again while `Progress.pending` is true.
+        pub fn prepare(driver: *Self, handler: anytype) !Progress {
+            var progress: Progress = .{};
+            const reactor = driver.connection.reactor;
+            const actor = try driver.connection.actor();
+            if (driver.scheduled) {
+                if (actor.lifecycle == .closing and actor.canDeinit()) {
+                    driver.scheduled = false;
+                    if (!driver.disconnected_notified) {
+                        driver.disconnected_notified = true;
+                        if (@hasDecl(@TypeOf(handler.*), "disconnected"))
+                            handler.disconnected(driver.connection.peer);
+                    }
+                } else if (actor.lifecycle == .closing) {
+                    if (!actor.cancel_requested) {
+                        const queued = reactor.prepareClose(driver.connection.peer) catch |err| {
+                            if (err == error.SubmissionQueueFull) {
+                                progress.pending = true;
+                                return progress;
+                            }
+                            return err;
+                        };
+                        if (queued) progress.prepared += 1;
+                    }
+                    driver.scheduled = false;
+                } else {
+                    if (actor.transmit.queuedBytes() != 0 and
+                        !actor.transmit.sendActive())
+                    {
+                        reactor.prepareSend(driver.connection.peer) catch |err| {
+                            if (err == error.SubmissionQueueFull) {
+                                progress.pending = true;
+                                return progress;
+                            }
+                            return err;
+                        };
+                        progress.prepared += 1;
+                    }
+                    driver.scheduled = false;
+                }
+            }
+
+            progress.prepared += try reactor.prepareDeferredReceives();
+            progress.pending = driver.scheduled or reactor.deferredReceivesPending();
+            progress.quiescent = actor.canDeinit();
+            return progress;
+        }
+
+        fn complete(
+            driver: *Self,
+            completion: std.os.linux.io_uring_cqe,
+            handler: anytype,
+            progress: *Progress,
+        ) !void {
+            const reactor = driver.connection.reactor;
+            const routed = (reactor.route(null, completion) orelse
+                return error.InvalidCompletion).connection;
+            const peer = reactor.routedPeer(routed);
+            if (peer.slot != driver.connection.peer.slot or
+                peer.generation != driver.connection.peer.generation)
+                return error.InvalidCompletion;
+            const actor = try driver.connection.actor();
+            const event = actor.completeRouted(routed.operation, completion) catch |err| {
+                if (err == error.IoFailure and actor.lifecycle == .closing) {
+                    _ = try driver.schedule();
+                    return;
+                }
+                return err;
+            };
+            switch (event) {
+                .received => {
+                    var context = EventContext(@TypeOf(handler)){
+                        .handler = handler,
+                    };
+                    const result = try ProtocolCore.receivedEventsReactor(
+                        actor,
+                        &driver.connection.objects.namespace,
+                        reactor,
+                        peer,
+                        completion,
+                        &context,
+                    );
+                    switch (result) {
+                        .dispatched => |count| progress.events += count,
+                        .terminal => |failure| {
+                            progress.events += failure.dispatched;
+                            progress.event_errors += 1;
+                            if (@hasDecl(@TypeOf(handler.*), "eventError"))
+                                handler.eventError(peer, failure);
+                        },
+                    }
+                    if (actor.lifecycle == .open and !actor.receive_active)
+                        _ = try reactor.deferReceive(peer);
+                    _ = try driver.schedule();
+                },
+                .sent, .disconnected, .receive_stopped, .send_stopped, .cancel_complete => _ = try driver.schedule(),
+                .buffers_exhausted => {
+                    if (actor.lifecycle == .open)
+                        _ = try reactor.deferReceive(peer);
+                    _ = try driver.schedule();
+                },
+            }
+        }
+
+        fn EventContext(comptime Handler: type) type {
+            return struct {
+                handler: Handler,
+
+                pub fn event(
+                    context: *@This(),
+                    target: objects.Dispatch,
+                    message: wire.Message,
+                    fds: *ancillary.FdQueue,
+                ) !@import("dispatch.zig").Control {
+                    return context.handler.event(target, message, fds);
+                }
+            };
         }
     };
 }

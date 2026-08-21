@@ -301,6 +301,14 @@ namespace and queues the initial receive only after `wl_display` exists. It owns
 setup rollback and final teardown, but deliberately does not consume CQEs,
 submit the ring, dispatch callbacks, or hide completion switches. Borrowed-ring
 applications therefore retain batching policy and unrelated completion traffic.
+An optional allocation-free client driver adds that repetitive completion
+policy without changing ownership. It dispatches only CQEs prefiltered for its
+connection, prepares coalesced sends and close cancellation, participates in
+deferred receive rearming, and reports quiescence; the application still owns
+submission and calls `Connection.deinit` with its allocator. External request
+producers explicitly schedule the driver after queueing output. Typed optional
+hooks report terminal event failures and final disconnection without dynamic
+callback registration.
 Wayring operation tokens reserve low `user_data` bytes 1 through 5; borrowed-ring
 consumers must use a disjoint tag namespace and pass only Wayring candidates to
 reactor routing.
