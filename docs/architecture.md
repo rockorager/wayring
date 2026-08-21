@@ -544,7 +544,9 @@ validated extent; backing truncation becomes `ShortRead` instead of SIGBUS.
 This keeps a process-wide signal handler out of the compositor and reserves
 zero-copy for inputs where the kernel can guarantee safety. The real SHM
 libwayland-server interop path owns its received descriptor and resource
-lifetime through this store.
+lifetime through this store. Its object-removal hook also releases backing
+references during connection teardown, so abrupt disconnect does not depend on
+clients sending `wl_buffer.destroy` or `wl_shm_pool.destroy` first.
 
 ## Initial transport candidate
 

@@ -156,6 +156,22 @@ shm_client_fd(int fd)
 	pool = NULL;
 	if (wl_display_roundtrip(display) < 0)
 		goto cleanup;
+
+	/* Leave a second pool and buffer live to exercise server disconnect cleanup. */
+	memory_fd = memfd_create("wayring-shm-disconnect", MFD_CLOEXEC);
+	if (memory_fd < 0 || ftruncate(memory_fd, 4096) < 0)
+		goto cleanup;
+	pool = wl_shm_create_pool(state.shm, memory_fd, 4096);
+	close(memory_fd);
+	memory_fd = -1;
+	if (pool == NULL)
+		goto cleanup;
+	buffer = wl_shm_pool_create_buffer(
+		pool, 0, 2, 2, 8, WL_SHM_FORMAT_ARGB8888);
+	if (buffer == NULL || wl_display_flush(display) < 0)
+		goto cleanup;
+	buffer = NULL;
+	pool = NULL;
 	status = EXIT_SUCCESS;
 
 cleanup:

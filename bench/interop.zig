@@ -579,6 +579,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .subsurface_graph = &subsurface_graph,
         .shm_store = &shm_store,
     };
+    handler.objects.setRemovalHook(.{
+        .context = &handler,
+        .notify = ProtocolServerHandler.removed,
+    });
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
     }
@@ -738,6 +742,8 @@ const ProtocolServerHandler = struct {
     ponged: bool = false,
     configured: bool = false,
     pool_created: bool = false,
+    shm_pool_resource: ?wayring.objects.Handle = null,
+    shm_buffer_resource: ?wayring.objects.Handle = null,
     shm_pool: ?wayring.shm.PoolToken = null,
     shm_buffer: ?wayring.shm.BufferToken = null,
     buffer_created: bool = false,
@@ -840,6 +846,31 @@ const ProtocolServerHandler = struct {
     shell_toplevel: bool = false,
     shell_title: bool = false,
     shell_class: bool = false,
+
+    fn removed(
+        context: ?*anyopaque,
+        handle: wayring.objects.Handle,
+        object: wayring.objects.Object,
+    ) void {
+        const handler: *ProtocolServerHandler = @ptrCast(@alignCast(context.?));
+        if (object.interface == &standard_protocol.wl_buffer.info and
+            handler.shm_buffer_resource != null and
+            std.meta.eql(handle, handler.shm_buffer_resource.?))
+        {
+            if (handler.shm_buffer) |token|
+                handler.shm_store.destroyBuffer(token) catch unreachable;
+            handler.shm_buffer = null;
+            handler.shm_buffer_resource = null;
+        } else if (object.interface == &standard_protocol.wl_shm_pool.info and
+            handler.shm_pool_resource != null and
+            std.meta.eql(handle, handler.shm_pool_resource.?))
+        {
+            if (handler.shm_pool) |token|
+                handler.shm_store.destroyPoolResource(token) catch unreachable;
+            handler.shm_pool = null;
+            handler.shm_pool_resource = null;
+        }
+    }
 
     pub fn request(
         handler: *ProtocolServerHandler,
@@ -1707,12 +1738,13 @@ const ProtocolServerHandler = struct {
                         return err;
                     };
                     errdefer handler.shm_store.destroyPoolResource(pool) catch {};
-                    _ = try standard_protocol.wl_shm.admit_create_pool(
+                    const resource = (try standard_protocol.wl_shm.admit_create_pool(
                         handler.objects,
                         decoded.handle,
                         value,
                         .{},
-                    );
+                    )).id;
+                    handler.shm_pool_resource = resource;
                     handler.shm_pool = pool;
                     handler.pool_created = true;
                 },
@@ -1749,6 +1781,7 @@ const ProtocolServerHandler = struct {
                         .{},
                     )).id;
                     handler.buffer = buffer;
+                    handler.shm_buffer_resource = buffer;
                     handler.shm_buffer = buffer_token;
                     handler.buffer_created = true;
                 },
@@ -1756,6 +1789,8 @@ const ProtocolServerHandler = struct {
                     try handler.shm_store.destroyPoolResource(
                         handler.shm_pool orelse return error.InvalidShmPool,
                     );
+                    handler.shm_pool = null;
+                    handler.shm_pool_resource = null;
                     handler.pool_destroyed = handler.buffer_destroyed;
                 },
                 .resize => |value| {
@@ -1778,6 +1813,8 @@ const ProtocolServerHandler = struct {
                     try handler.shm_store.destroyBuffer(
                         handler.shm_buffer orelse return error.InvalidShmBuffer,
                     );
+                    handler.shm_buffer = null;
+                    handler.shm_buffer_resource = null;
                     handler.buffer_destroyed = true;
                     handler.buffer_destroyed_count += 1;
                 },
