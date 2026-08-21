@@ -314,14 +314,18 @@ pub fn Core(comptime protocol: type) type {
             try actor.commitProtocolError();
         }
 
+        /// Stable payload delivered by terminal request results and the server
+        /// driver's optional `protocolError` hook.
+        pub const RequestFailure = struct {
+            dispatched: usize,
+            object_id: ?u32,
+            cause: anyerror,
+            error_queued: bool,
+        };
+
         pub const RequestResult = union(enum) {
             dispatched: usize,
-            terminal: struct {
-                dispatched: usize,
-                object_id: ?u32,
-                cause: anyerror,
-                error_queued: bool,
-            },
+            terminal: RequestFailure,
         };
 
         const DisplayErrorCode = enum(u32) {

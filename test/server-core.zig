@@ -1251,7 +1251,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     );
 }
 
-test "server driver batches accept dispatch send and disconnect" {
+test "server driver recovers SQ pressure and drains protocol errors" {
     const allocator = std.testing.allocator;
     var path_storage: [100]u8 = undefined;
     const path = try std.fmt.bufPrint(
@@ -1264,19 +1264,19 @@ test "server driver batches accept dispatch send and disconnect" {
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
+        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,
         .fragment_block_size = 64,
-        .fragment_block_count = 1,
+        .fragment_block_count = 2,
         .transmit_block_size = 64,
-        .transmit_block_count = 1,
-        .descriptor_count = 1,
+        .transmit_block_count = 2,
+        .descriptor_count = 2,
         .send_descriptor_capacity = 1,
     });
     defer reactor.deinit(allocator);
-    const listener_fd = try wayring.unix_socket.listen(path, 1);
+    const listener_fd = try wayring.unix_socket.listen(path, 2);
     var runtime = try wayring.server.Runtime(protocol).init(
         allocator,
         &reactor,
@@ -1287,25 +1287,33 @@ test "server driver batches accept dispatch send and disconnect" {
                 .transmit_byte_budget = 64,
                 .transmit_fd_budget = 1,
             },
-            .object_capacity = 2,
+            .object_capacity = 4,
             .object_quota = 2,
             .buckets_per_client = 4,
             .max_globals = 1,
-            .registry_capacity = 1,
+            .registry_capacity = 2,
         },
     );
     defer runtime.deinit(allocator) catch unreachable;
     var driver = try wayring.server.Driver(protocol).init(allocator, &runtime, null);
     defer driver.deinit(allocator);
-    var handler: DriverHandler = .{ .runtime = &runtime };
+    var handler: DriverHandler = .{
+        .runtime = &runtime,
+        .saturate_submission_queue = true,
+    };
 
     try runtime.prepareAccept();
-    const client_fd = try wayring.unix_socket.connect(path);
+    const client_fds = [2]linux.fd_t{
+        try wayring.unix_socket.connect(path),
+        try wayring.unix_socket.connect(path),
+    };
     _ = try reactor.ring.submit();
-    var completion = try reactor.ring.copy_cqe();
-    var progress = try driver.dispatch(&.{completion}, &handler);
-    try std.testing.expectEqual(@as(usize, 1), progress.accepted);
-    try std.testing.expectEqual(@as(usize, 1), handler.connected_count);
+    var completions: [2]linux.io_uring_cqe = undefined;
+    var completion: linux.io_uring_cqe = undefined;
+    var count = try reactor.ring.copy_cqes(&completions, 2);
+    var progress = try driver.dispatch(completions[0..count], &handler);
+    try std.testing.expectEqual(@as(usize, 2), progress.accepted);
+    try std.testing.expectEqual(@as(usize, 2), handler.connected_count);
     _ = try reactor.ring.submit();
 
     var request: [12]u8 = undefined;
@@ -1320,36 +1328,86 @@ test "server driver batches accept dispatch send and disconnect" {
         2,
         @import("builtin").cpu.arch.endian(),
     );
-    try std.testing.expectEqual(
+    for (client_fds) |client_fd| try std.testing.expectEqual(
         request.len,
         linux.write(client_fd, &request, request.len),
     );
-    completion = try reactor.ring.copy_cqe();
-    progress = try driver.dispatch(&.{completion}, &handler);
-    try std.testing.expectEqual(@as(usize, 1), progress.requests);
-    try std.testing.expectEqual(@as(usize, 1), progress.prepared);
+    count = try reactor.ring.copy_cqes(&completions, 2);
+    progress = try driver.dispatch(completions[0..count], &handler);
+    try std.testing.expectEqual(@as(usize, 2), progress.requests);
+    try std.testing.expectEqual(@as(usize, 0), progress.prepared);
+    try std.testing.expect(progress.pending);
+    _ = try reactor.ring.submit();
+    var completed_nops: usize = 0;
+    var pressure_prepared: usize = 0;
+    while (completed_nops < handler.queued_nops) {
+        completion = try reactor.ring.copy_cqe();
+        if (completion.user_data == std.math.maxInt(u64)) {
+            completed_nops += 1;
+        } else {
+            progress = try driver.dispatch(&.{completion}, &handler);
+            pressure_prepared += progress.prepared;
+        }
+    }
+    progress = try driver.prepare(&handler);
+    pressure_prepared += progress.prepared;
+    try std.testing.expect(pressure_prepared >= 2);
+    try std.testing.expect(!progress.pending);
     _ = try reactor.ring.submit();
 
+    count = try reactor.ring.copy_cqes(&completions, 2);
+    progress = try driver.dispatch(completions[0..count], &handler);
+    try std.testing.expectEqual(@as(usize, 0), progress.requests);
+    for (client_fds) |client_fd| {
+        var response: [24]u8 = undefined;
+        try std.testing.expectEqual(
+            response.len,
+            linux.read(client_fd, &response, response.len),
+        );
+        const done = (try wayring.wire.Message.decode(&response)).?;
+        try std.testing.expectEqual(@as(u32, 2), done.header.object_id);
+        const deleted = (try wayring.wire.Message.decode(response[done.header.size..])).?;
+        try std.testing.expectEqual(wayring.objects.display_id, deleted.header.object_id);
+    }
+
+    var invalid: [wayring.wire.header_len]u8 = undefined;
+    try (wayring.wire.Header{
+        .object_id = 99,
+        .opcode = 0,
+        .size = invalid.len,
+    }).encode(&invalid);
+    try std.testing.expectEqual(
+        invalid.len,
+        linux.write(client_fds[0], &invalid, invalid.len),
+    );
     completion = try reactor.ring.copy_cqe();
     progress = try driver.dispatch(&.{completion}, &handler);
-    try std.testing.expectEqual(@as(usize, 0), progress.requests);
-    var response: [24]u8 = undefined;
-    try std.testing.expectEqual(
-        response.len,
-        linux.read(client_fd, &response, response.len),
-    );
-    const done = (try wayring.wire.Message.decode(&response)).?;
-    try std.testing.expectEqual(@as(u32, 2), done.header.object_id);
-    const deleted = (try wayring.wire.Message.decode(response[done.header.size..])).?;
-    try std.testing.expectEqual(wayring.objects.display_id, deleted.header.object_id);
+    try std.testing.expectEqual(@as(usize, 1), progress.protocol_errors);
+    try std.testing.expectEqual(@as(usize, 1), handler.protocol_error_count);
+    try std.testing.expect(progress.prepared != 0);
+    _ = try reactor.ring.submit();
 
-    _ = linux.close(client_fd);
     while (handler.disconnected_count == 0) {
         completion = try reactor.ring.copy_cqe();
         progress = try driver.dispatch(&.{completion}, &handler);
-        if (progress.prepared != 0) _ = try reactor.ring.submit();
+        if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
     }
     try std.testing.expectEqual(@as(usize, 1), handler.disconnected_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime.clients.reactor.slots.active_count);
+    var error_response: [128]u8 = undefined;
+    const error_size = linux.read(client_fds[0], &error_response, error_response.len);
+    try std.testing.expect(error_size >= wayring.wire.header_len);
+    const display_error = (try wayring.wire.Message.decode(error_response[0..error_size])).?;
+    try std.testing.expectEqual(wayring.objects.display_id, display_error.header.object_id);
+    try std.testing.expectEqual(@as(u16, 0), display_error.header.opcode);
+    _ = linux.close(client_fds[0]);
+
+    _ = linux.close(client_fds[1]);
+    while (handler.disconnected_count != 2) {
+        completion = try reactor.ring.copy_cqe();
+        progress = try driver.dispatch(&.{completion}, &handler);
+        if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
+    }
     try std.testing.expectEqual(@as(usize, 0), runtime.clients.reactor.slots.active_count);
 
     _ = try runtime.prepareEndpointClose();
@@ -1362,8 +1420,11 @@ test "server driver batches accept dispatch send and disconnect" {
 
 const DriverHandler = struct {
     runtime: *wayring.server.Runtime(protocol),
+    saturate_submission_queue: bool = false,
+    queued_nops: usize = 0,
     connected_count: usize = 0,
     disconnected_count: usize = 0,
+    protocol_error_count: usize = 0,
 
     pub fn connected(handler: *DriverHandler, _: wayring.io_uring.Peer) void {
         handler.connected_count += 1;
@@ -1371,6 +1432,14 @@ const DriverHandler = struct {
 
     pub fn disconnected(handler: *DriverHandler, _: wayring.io_uring.Peer) void {
         handler.disconnected_count += 1;
+    }
+
+    pub fn protocolError(
+        handler: *DriverHandler,
+        _: wayring.io_uring.Peer,
+        _: Core.RequestFailure,
+    ) void {
+        handler.protocol_error_count += 1;
     }
 
     pub fn request(
@@ -1393,6 +1462,18 @@ const DriverHandler = struct {
             callback,
             77,
         );
+        if (handler.saturate_submission_queue) {
+            handler.saturate_submission_queue = false;
+            while (true) {
+                const submission = handler.runtime.clients.reactor.ring.get_sqe() catch |err| {
+                    if (err != error.SubmissionQueueFull) return err;
+                    break;
+                };
+                submission.prep_nop();
+                submission.user_data = std.math.maxInt(u64);
+                handler.queued_nops += 1;
+            }
+        }
         return .continue_dispatch;
     }
 };
