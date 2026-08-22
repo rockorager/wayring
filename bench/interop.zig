@@ -1840,11 +1840,17 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
-                    try handler.shm_store.destroyBuffer(
-                        handler.shm_buffer orelse return error.InvalidShmBuffer,
-                    );
-                    handler.shm_buffer = null;
-                    handler.shm_buffer_resource = null;
+                    switch (handler.kind) {
+                        .shm => {
+                            try handler.shm_store.destroyBuffer(
+                                handler.shm_buffer orelse return error.InvalidShmBuffer,
+                            );
+                            handler.shm_buffer = null;
+                            handler.shm_buffer_resource = null;
+                        },
+                        .dmabuf => {},
+                        else => return error.UnexpectedRequest,
+                    }
                     handler.buffer_destroyed = true;
                     handler.buffer_destroyed_count += 1;
                 },
