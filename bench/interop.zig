@@ -20,6 +20,7 @@ const ServerRuntime = wayring.server.Runtime(core_protocol);
 const Benchmark = benchmark_protocol.wp_wayring_benchmark_v1;
 const XdgServerCore = wayring.server.Core(standard_protocol);
 const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
+const XdgServerShm = wayring.server.Shm(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
 
@@ -531,6 +532,18 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
         .max_globals = 3,
         .registry_capacity = 2,
     });
+    const shm_formats = [_]wayring.shm.Format{
+        .{ .value = standard_protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
+        .{ .value = standard_protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
+    };
+    var shm_service = try XdgServerShm.init(allocator, .{
+        .limits = .{ .max_pool_bytes = 4096 },
+        .pool_capacity = 1,
+        .buffer_capacity = 1,
+        .formats = &shm_formats,
+        .global_version = 1,
+    });
+    defer shm_service.deinit(allocator);
     switch (kind) {
         .xdg => {
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 4, null);
@@ -538,7 +551,7 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
             _ = try runtime.globals.add(&standard_protocol.wp_presentation.info, 1, null);
         },
         .shm => {
-            _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null);
+            _ = try shm_service.install(&runtime);
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 5, null);
             _ = try runtime.globals.add(&standard_protocol.wp_viewporter.info, 1, null);
         },
@@ -589,20 +602,14 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     const peer = (try runtime.completeListener(accept_completion, null)) orelse
         return error.InvalidCompletion;
     const actor = try reactor.getActor(peer);
-    var shm_store = try wayring.shm.Store.init(
-        allocator,
-        .{ .max_pool_bytes = 4096 },
-        1,
-        1,
-    );
-    defer shm_store.deinit(allocator);
     var handler: ProtocolServerHandler = .{
         .kind = kind,
         .runtime = &runtime,
         .peer = peer,
+        .actor = actor,
         .objects = try runtime.clients.get(peer),
         .queue = &actor.transmit,
-        .shm_store = &shm_store,
+        .shm_service = &shm_service,
     };
     handler.objects.setRemovalHook(.{
         .context = &handler,
@@ -766,15 +773,12 @@ const ProtocolServerHandler = struct {
     kind: ProtocolInterop,
     runtime: *XdgServerRuntime,
     peer: wayring.io_uring.Peer,
+    actor: *wayring.connection.Actor,
     objects: *wayring.objects.SharedServerObjects,
     queue: *wayring.tx.Queue,
     ponged: bool = false,
     configured: bool = false,
     pool_created: bool = false,
-    shm_pool_resource: ?wayring.objects.Handle = null,
-    shm_buffer_resource: ?wayring.objects.Handle = null,
-    shm_pool: ?wayring.shm.PoolToken = null,
-    shm_buffer: ?wayring.shm.BufferToken = null,
     buffer_created: bool = false,
     buffer_destroyed: bool = false,
     pool_destroyed: bool = false,
@@ -803,7 +807,7 @@ const ProtocolServerHandler = struct {
     surface_attached: bool = false,
     surface_damaged: bool = false,
     buffer_damaged: bool = false,
-    shm_store: *wayring.shm.Store,
+    shm_service: *XdgServerShm,
     params_created: bool = false,
     plane_added: bool = false,
     dmabuf_buffer_created: bool = false,
@@ -883,23 +887,7 @@ const ProtocolServerHandler = struct {
         object: wayring.objects.Object,
     ) void {
         const handler: *ProtocolServerHandler = @ptrCast(@alignCast(context.?));
-        if (object.interface == &standard_protocol.wl_buffer.info and
-            handler.shm_buffer_resource != null and
-            std.meta.eql(handle, handler.shm_buffer_resource.?))
-        {
-            if (handler.shm_buffer) |token|
-                handler.shm_store.destroyBuffer(token) catch unreachable;
-            handler.shm_buffer = null;
-            handler.shm_buffer_resource = null;
-        } else if (object.interface == &standard_protocol.wl_shm_pool.info and
-            handler.shm_pool_resource != null and
-            std.meta.eql(handle, handler.shm_pool_resource.?))
-        {
-            if (handler.shm_pool) |token|
-                handler.shm_store.destroyPoolResource(token) catch unreachable;
-            handler.shm_pool = null;
-            handler.shm_pool_resource = null;
-        }
+        _ = handler.shm_service.resourceRemoved(handle, object);
     }
 
     pub fn request(
@@ -909,6 +897,29 @@ const ProtocolServerHandler = struct {
         fds: *wayring.ancillary.FdQueue,
     ) !wayring.dispatch.Control {
         const interface = target.object.interface;
+        if (try handler.shm_service.request(
+            handler.actor,
+            handler.objects,
+            target,
+            message,
+            fds,
+        )) |control| {
+            if (interface == &standard_protocol.wl_shm.info and message.header.opcode == 0) {
+                handler.pool_created = true;
+            } else if (interface == &standard_protocol.wl_shm_pool.info) {
+                if (message.header.opcode == 0) {
+                    handler.buffer_created = true;
+                } else if (message.header.opcode == 1) {
+                    handler.pool_destroyed = handler.buffer_destroyed;
+                }
+            } else if (interface == &standard_protocol.wl_buffer.info and
+                message.header.opcode == 0)
+            {
+                handler.buffer_destroyed = true;
+                handler.buffer_destroyed_count += 1;
+            }
+            return control;
+        }
         if (interface == &XdgServerCore.Display.info) {
             switch (try handler.runtime.decodeDisplayRequest(handler.peer, message, fds, null)) {
                 .sync => |callback| try XdgServerCore.completeSync(
@@ -942,15 +953,6 @@ const ProtocolServerHandler = struct {
                     handler.queue,
                     resource,
                     .{ .ping = .{ .serial = 41 } },
-                );
-            } else if (resource_interface == &standard_protocol.wl_shm.info) {
-                try wayring.server.sendEvent(
-                    standard_protocol,
-                    standard_protocol.wl_shm,
-                    handler.objects,
-                    handler.queue,
-                    resource,
-                    .{ .format = .{ .format = .argb8888 } },
                 );
             } else if (resource_interface == &standard_protocol.zwp_linux_dmabuf_v1.info) {
                 try wayring.server.sendEvent(
@@ -1749,88 +1751,6 @@ const ProtocolServerHandler = struct {
                 .set_sampling_device => return error.UnexpectedRequest,
             }
             try decoded.finish(standard_protocol, handler.objects, handler.queue);
-        } else if (interface == &standard_protocol.wl_shm.info) {
-            const decoded = try wayring.server.decodeRequest(
-                standard_protocol.wl_shm,
-                handler.objects,
-                message,
-                fds,
-            );
-            switch (decoded.value) {
-                .create_pool => |value| {
-                    const flags = linux.fcntl(value.fd, linux.F.GETFD, 0);
-                    if (linux.errno(flags) != .SUCCESS or flags & linux.FD_CLOEXEC == 0) {
-                        _ = linux.close(value.fd);
-                        return error.InvalidShmPool;
-                    }
-                    const pool = handler.shm_store.addPool(value.fd, value.size) catch |err| {
-                        _ = linux.close(value.fd);
-                        return err;
-                    };
-                    errdefer handler.shm_store.destroyPoolResource(pool) catch {};
-                    const resource = (try standard_protocol.wl_shm.admit_create_pool(
-                        handler.objects,
-                        decoded.handle,
-                        value,
-                        .{},
-                    )).id;
-                    handler.shm_pool_resource = resource;
-                    handler.shm_pool = pool;
-                    handler.pool_created = true;
-                },
-                .release => return error.UnexpectedRequest,
-            }
-            try decoded.finish(standard_protocol, handler.objects, handler.queue);
-        } else if (interface == &standard_protocol.wl_shm_pool.info) {
-            const decoded = try wayring.server.decodeRequest(
-                standard_protocol.wl_shm_pool,
-                handler.objects,
-                message,
-                fds,
-            );
-            switch (decoded.value) {
-                .create_buffer => |value| {
-                    const buffer_token = try handler.shm_store.addBuffer(
-                        handler.shm_pool orelse return error.InvalidShmPool,
-                        .{ .value = value.format.value, .bytes_per_pixel = 4 },
-                        value.offset,
-                        value.width,
-                        value.height,
-                        value.stride,
-                    );
-                    errdefer handler.shm_store.destroyBuffer(buffer_token) catch {};
-                    const metadata = try handler.shm_store.bufferInfo(buffer_token);
-                    if (metadata.offset != 0 or metadata.width != 2 or
-                        metadata.height != 2 or metadata.stride != 8 or
-                        metadata.format.value != standard_protocol.wl_shm.format.argb8888.value)
-                        return error.InvalidShmBuffer;
-                    const buffer = (try standard_protocol.wl_shm_pool.admit_create_buffer(
-                        handler.objects,
-                        decoded.handle,
-                        value,
-                        .{},
-                    )).id;
-                    handler.buffer = buffer;
-                    handler.shm_buffer_resource = buffer;
-                    handler.shm_buffer = buffer_token;
-                    handler.buffer_created = true;
-                },
-                .destroy => {
-                    try handler.shm_store.destroyPoolResource(
-                        handler.shm_pool orelse return error.InvalidShmPool,
-                    );
-                    handler.shm_pool = null;
-                    handler.shm_pool_resource = null;
-                    handler.pool_destroyed = handler.buffer_destroyed;
-                },
-                .resize => |value| {
-                    try handler.shm_store.resize(
-                        handler.shm_pool orelse return error.InvalidShmPool,
-                        value.size,
-                    );
-                },
-            }
-            try decoded.finish(standard_protocol, handler.objects, handler.queue);
         } else if (interface == &standard_protocol.wl_buffer.info) {
             const decoded = try wayring.server.decodeRequest(
                 standard_protocol.wl_buffer,
@@ -1840,17 +1760,7 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
-                    switch (handler.kind) {
-                        .shm => {
-                            try handler.shm_store.destroyBuffer(
-                                handler.shm_buffer orelse return error.InvalidShmBuffer,
-                            );
-                            handler.shm_buffer = null;
-                            handler.shm_buffer_resource = null;
-                        },
-                        .dmabuf => {},
-                        else => return error.UnexpectedRequest,
-                    }
+                    if (handler.kind != .dmabuf) return error.UnexpectedRequest;
                     handler.buffer_destroyed = true;
                     handler.buffer_destroyed_count += 1;
                 },
@@ -2109,13 +2019,20 @@ const ProtocolServerHandler = struct {
                 },
                 .attach => |value| {
                     if (handler.kind != .shm or value.buffer == null or
-                        value.buffer.? != handler.buffer.?.id or value.x != 0 or value.y != 0)
+                        value.x != 0 or value.y != 0)
                         return error.InvalidSurface;
-                    const metadata = try handler.shm_store.bufferInfo(
-                        handler.shm_buffer orelse return error.InvalidShmBuffer,
-                    );
-                    if (metadata.width != 2 or metadata.height != 2)
+                    const buffer = handler.objects.namespace.lookupHandle(value.buffer.?) orelse
                         return error.InvalidShmBuffer;
+                    const object = handler.objects.namespace.resolve(buffer) orelse
+                        return error.InvalidShmBuffer;
+                    const token = handler.shm_service.bufferToken(object) orelse
+                        return error.InvalidShmBuffer;
+                    const metadata = try handler.shm_service.store.bufferInfo(token);
+                    if (metadata.offset != 0 or metadata.width != 2 or
+                        metadata.height != 2 or metadata.stride != 8 or
+                        metadata.format.value != standard_protocol.wl_shm.format.argb8888.value)
+                        return error.InvalidShmBuffer;
+                    handler.buffer = buffer;
                     handler.surface_attached = true;
                 },
                 .damage => |value| {
