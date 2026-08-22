@@ -1,6 +1,6 @@
 .{
     .name = .wayring,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x2d5145f087694a37,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -11,10 +11,13 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "tools",
+        "tools/wayring-scanner.zig",
+        "tools/upstream/build.zig",
+        "tools/upstream/build.zig.zon",
         "test",
         "bench",
         "docs",
         "README.md",
+        "LICENSE",
     },
 }

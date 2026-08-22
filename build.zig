@@ -21,6 +21,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(scanner);
 
+    const documentation = b.addObject(.{
+        .name = "wayring-docs",
+        .root_module = wayring,
+    });
+    const install_documentation = b.addInstallDirectory(.{
+        .source_dir = documentation.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const documentation_step = b.step("docs", "Generate API documentation");
+    documentation_step.dependOn(&install_documentation.step);
+
     const tests = b.addTest(.{ .root_module = wayring });
     const run_tests = b.addRunArtifact(tests);
 
