@@ -86,9 +86,8 @@ Viewport mode sends the same three real protocol requests per operation from
 the same libwayland client: `set_source`, `set_destination`, and
 `wl_surface.commit`. It alternates a libwayland server with a Wayring server and
 uses one sync round trip per `BATCH`. The libwayland handler validates values
-and ordering; Wayring additionally applies its transform/scale-aware,
-double-buffered compositor state. A final state-only sample isolates that extra
-semantic cost from transport and protocol dispatch.
+and ordering; the Wayring handler performs equivalent request-value and order
+validation so the result compares core transport and generated dispatch.
 
 The multi-connection modes compare Wayring and libwayland across identical
 socket counts and messages per connection. Wayring uses one io_uring instance
@@ -208,8 +207,8 @@ server and a Wayring client against a libwayland server. Each pairing performs
 pool and buffer construction, surface attachment, surface- and buffer-coordinate
 damage, opaque and input region geometry, buffer transform and scale, surface
 offset, frame completion, commit, buffer release, synchronization, and ordered
-destruction. The Wayring server routes these through transactional region and
-surface publication, DAG application, and per-content-update frame ownership.
+destruction. The Wayring server validates request values, ordering, generated
+object construction, and event delivery without embedding compositor policy.
 This exercises production FD ownership, asynchronous presentation, and nested
 core object lifecycles in both directions.
 
@@ -250,11 +249,10 @@ and touch object, then validates contact down, motion, shape, orientation, frame
 up, and cancellation semantics before ordered touch, surface, and seat teardown.
 
 Subsurface interoperability mode runs both library pairings. Each constructs a
-parent and child surface, assigns the child subsurface role, and validates
-parent-latched position and stacking, cached synchronized child commits,
-desynchronization release, permanent role lifetime, and ordered subsurface,
-surface, and subcompositor teardown, including immediate child unmapping when
-the parent surface is destroyed first.
+parent and child surface and exercises position, stacking, synchronization,
+desynchronization, commits, and ordered subsurface, surface, and subcompositor
+teardown. The Wayring side checks generated request values and ordering; role
+and scene-graph semantics belong to the compositor.
 
 Legacy-shell interoperability mode runs both library pairings against the core
 `wl_shell` protocol. It assigns a shell-surface role, exchanges ping/pong,

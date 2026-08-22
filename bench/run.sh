@@ -432,8 +432,6 @@ case "$mode" in
             fi
             sample=$((sample + 1))
         done
-        "$root/zig-out/bench/wayring-interop" \
-            "$messages" "$batch" "$warmup" viewport-state
         ;;
     dmabuf-interop)
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-client

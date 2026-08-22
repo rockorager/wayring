@@ -22,9 +22,6 @@ const XdgServerCore = wayring.server.Core(standard_protocol);
 const XdgServerRuntime = wayring.server.Runtime(standard_protocol);
 const XdgClientCore = wayring.client.Core(standard_protocol);
 const XdgClientConnection = wayring.client.Connection(standard_protocol);
-const InteropSubsurfaceGraph = wayring.compositor.SubsurfaceGraph(wayring.objects.Handle, u32);
-const InteropCommitState = wayring.compositor.CommitState(u32);
-const subsurface_role_id = 1;
 
 const ProtocolInterop = enum { xdg, shm, viewport_benchmark, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
 const drm_format_argb8888: u32 = 0x34325241;
@@ -46,7 +43,6 @@ const Options = struct {
         shm_libwayland_server,
         viewport_libwayland,
         viewport_libwayland_client,
-        viewport_state,
         dmabuf_libwayland_client,
         dmabuf_libwayland_server,
         data_device_libwayland_client,
@@ -78,7 +74,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .shm_libwayland_server => wayringShmClient(),
         .viewport_libwayland => libwaylandViewport(options),
         .viewport_libwayland_client => wayringProtocolServer(.viewport_benchmark, options),
-        .viewport_state => viewportState(options),
         .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf, options),
         .dmabuf_libwayland_server => wayringDmabufClient(),
         .data_device_libwayland_client => wayringProtocolServer(.data_device, options),
@@ -480,42 +475,6 @@ fn libwaylandViewport(options: Options) !u8 {
     return 0;
 }
 
-noinline fn viewportStateOperation(
-    surface: *wayring.compositor.Surface,
-    destination_width: i32,
-) !u32 {
-    try surface.viewport.setSource(0, 0, 256, 256);
-    try surface.viewport.setDestination(destination_width, 4);
-    return (try surface.commit()).size.width;
-}
-
-fn viewportState(options: Options) !u8 {
-    var surface: wayring.compositor.Surface = .{};
-    try surface.attach(7, .{
-        .handle = .{ .id = 1, .generation = 1 },
-        .width = 2,
-        .height = 2,
-    }, 0, 0);
-    try surface.setScale(2);
-    var checksum: u64 = 0;
-    for (0..options.warmup) |index|
-        checksum +%= try viewportStateOperation(&surface, 3 + @as(i32, @intCast(index & 1)));
-    const start = try monotonicNs();
-    for (0..options.messages) |index|
-        checksum +%= try viewportStateOperation(&surface, 3 + @as(i32, @intCast(index & 1)));
-    const elapsed = try monotonicNs() - start;
-    _ = c.printf(
-        "backend=wayring operation=viewport_state operations=%llu elapsed_ns=%llu ns_per_operation=%.1f operations_per_second=%.0f checksum=%llu\n",
-        options.messages,
-        elapsed,
-        @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(options.messages)),
-        @as(f64, @floatFromInt(options.messages)) * @as(f64, std.time.ns_per_s) /
-            @as(f64, @floatFromInt(elapsed)),
-        checksum,
-    );
-    return 0;
-}
-
 fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     var path_storage: [100]u8 = undefined;
     const path = try std.fmt.bufPrint(
@@ -630,26 +589,6 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     const peer = (try runtime.completeListener(accept_completion, null)) orelse
         return error.InvalidCompletion;
     const actor = try reactor.getActor(peer);
-    var region_pool = try wayring.compositor.RegionPool.init(allocator, 16);
-    defer region_pool.deinit(allocator);
-    var region_state = wayring.compositor.Region.init(&region_pool);
-    defer region_state.deinit();
-    var surface_regions = wayring.compositor.SurfaceRegions.init(&region_pool);
-    defer surface_regions.deinit();
-    var frame_pool = try wayring.compositor.FramePool.init(allocator, 4);
-    defer frame_pool.deinit(allocator);
-    var frame_queue = wayring.compositor.FrameQueue.init(&frame_pool);
-    defer frame_queue.deinit();
-    var release_pool = try wayring.compositor.ReleasePool.init(allocator, 4);
-    defer release_pool.deinit(allocator);
-    var release_queue = wayring.compositor.ReleaseQueue.init(&release_pool);
-    defer release_queue.deinit();
-    var commit_scheduler = try InteropCommitState.Scheduler.init(allocator, 4, 4);
-    defer commit_scheduler.deinit(allocator);
-    var commit_queue = InteropCommitState.Scheduler.Queue.init(&commit_scheduler, 1);
-    defer InteropCommitState.deinitQueue(&commit_queue);
-    var subsurface_graph = try InteropSubsurfaceGraph.init(allocator, 4, 4);
-    defer subsurface_graph.deinit(allocator);
     var shm_store = try wayring.shm.Store.init(
         allocator,
         .{ .max_pool_bytes = 4096 },
@@ -663,13 +602,6 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
         .peer = peer,
         .objects = try runtime.clients.get(peer),
         .queue = &actor.transmit,
-        .region_state = &region_state,
-        .surface_regions = &surface_regions,
-        .frame_queue = &frame_queue,
-        .release_queue = &release_queue,
-        .commit_scheduler = &commit_scheduler,
-        .commit_queue = &commit_queue,
-        .subsurface_graph = &subsurface_graph,
         .shm_store = &shm_store,
     };
     handler.objects.setRemovalHook(.{
@@ -750,7 +682,6 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
             !handler.input_region_set or !handler.region_destroyed or
             !handler.buffer_transformed or !handler.buffer_scaled or
             !handler.surface_offset or !handler.viewport_created or
-            !handler.viewport_source or !handler.viewport_destination or
             !handler.viewport_destroyed or
             !handler.surface_destroyed or !handler.buffer_destroyed or
             !handler.pool_destroyed)
@@ -869,14 +800,9 @@ const ProtocolServerHandler = struct {
     viewport_destination: bool = false,
     viewport_destroyed: bool = false,
     viewport_commits: u64 = 0,
-    surface_state: wayring.compositor.Surface = .{},
-    region_state: *wayring.compositor.Region,
-    surface_regions: *wayring.compositor.SurfaceRegions,
-    frame_queue: *wayring.compositor.FrameQueue,
-    release_queue: *wayring.compositor.ReleaseQueue,
-    commit_scheduler: *InteropCommitState.Scheduler,
-    commit_queue: *InteropCommitState.Scheduler.Queue,
-    subsurface_graph: *InteropSubsurfaceGraph,
+    surface_attached: bool = false,
+    surface_damaged: bool = false,
+    buffer_damaged: bool = false,
     shm_store: *wayring.shm.Store,
     params_created: bool = false,
     plane_added: bool = false,
@@ -942,7 +868,7 @@ const ProtocolServerHandler = struct {
     subsurface_parent_latched: bool = false,
     subsurface_desync_applied: bool = false,
     subsurface_destroyed: bool = false,
-    subsurface_child_state: wayring.compositor.Surface = .{},
+    subsurface_child_pending: bool = false,
     subcompositor_destroyed: bool = false,
     shell_surface_created: bool = false,
     shell_events_sent: bool = false,
@@ -1959,24 +1885,24 @@ const ProtocolServerHandler = struct {
                 .set_source => |value| {
                     if (handler.kind != .shm and handler.kind != .viewport_benchmark)
                         return error.UnexpectedRequest;
-                    try handler.surface_state.viewport.setSource(
-                        value.x,
-                        value.y,
-                        value.width,
-                        value.height,
-                    );
+                    if (handler.viewport_source or handler.viewport_destination or
+                        value.x != 0 or value.y != 0 or value.width != 256 or value.height != 256)
+                        return error.InvalidViewport;
                     handler.viewport_source = true;
                 },
                 .set_destination => |value| {
                     if (handler.kind != .shm and handler.kind != .viewport_benchmark)
                         return error.UnexpectedRequest;
-                    try handler.surface_state.viewport.setDestination(value.width, value.height);
+                    if (!handler.viewport_source or handler.viewport_destination or
+                        (value.width != 3 and value.width != 4) or value.height != 4)
+                        return error.InvalidViewport;
                     handler.viewport_destination = true;
                 },
                 .destroy => {
                     if (handler.kind != .shm and handler.kind != .viewport_benchmark)
                         return error.UnexpectedRequest;
-                    handler.surface_state.viewport.clear();
+                    if (handler.viewport_source or handler.viewport_destination)
+                        return error.InvalidViewport;
                     handler.viewport = null;
                     handler.viewport_destroyed = true;
                 },
@@ -2164,17 +2090,10 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .destroy => {
-                    if (handler.kind == .shm) try handler.surface_state.validateDestroy();
-                    if (handler.kind == .viewport_benchmark)
-                        try handler.surface_state.validateDestroy();
                     if (handler.kind == .subsurface) {
-                        if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
-                            try handler.subsurface_child_state.validateDestroy();
-                        } else if (std.meta.eql(decoded.handle, handler.subsurface_parent.?)) {
-                            handler.subsurface_graph.surfaceDestroyed(decoded.handle);
-                            if (try handler.subsurface_graph.isVisible(handler.subsurface_child.?))
-                                return error.InvalidSubsurface;
-                        } else return error.InvalidSubsurface;
+                        if (!std.meta.eql(decoded.handle, handler.subsurface_child.?) and
+                            !std.meta.eql(decoded.handle, handler.subsurface_parent.?))
+                            return error.InvalidSubsurface;
                         handler.subsurface_surfaces_destroyed += 1;
                     }
                     if (handler.kind == .shm) handler.surface_destroyed = true;
@@ -2189,22 +2108,15 @@ const ProtocolServerHandler = struct {
                     const metadata = try handler.shm_store.bufferInfo(
                         handler.shm_buffer orelse return error.InvalidShmBuffer,
                     );
-                    try handler.surface_state.attach(
-                        target.object.version,
-                        .{
-                            .handle = handler.buffer.?,
-                            .width = metadata.width,
-                            .height = metadata.height,
-                        },
-                        value.x,
-                        value.y,
-                    );
+                    if (metadata.width != 2 or metadata.height != 2)
+                        return error.InvalidShmBuffer;
+                    handler.surface_attached = true;
                 },
                 .damage => |value| {
                     if (handler.kind != .shm or value.x != 1 or value.y != 2 or
                         value.width != 3 or value.height != 4)
                         return error.InvalidSurface;
-                    handler.surface_state.damage(value.x, value.y, value.width, value.height);
+                    handler.surface_damaged = true;
                 },
                 .frame => |value| {
                     if (handler.kind != .shm) return error.UnexpectedRequest;
@@ -2214,85 +2126,58 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     )).callback;
-                    try handler.frame_queue.addPending(handler.frame_callback.?);
                 },
                 .damage_buffer => |value| {
                     if (handler.kind != .shm or value.x != 5 or value.y != 6 or
                         value.width != 7 or value.height != 8)
                         return error.InvalidSurface;
-                    handler.surface_state.damageBuffer(value.x, value.y, value.width, value.height);
+                    handler.buffer_damaged = true;
                 },
                 .set_opaque_region => |value| {
                     if (handler.kind != .shm or value.region == null or
                         value.region.? != handler.region.?.id)
                         return error.InvalidSurface;
-                    try handler.surface_regions.setOpaque(handler.region_state);
+                    if (!handler.region_added or !handler.region_subtracted)
+                        return error.InvalidRegion;
                     handler.opaque_region_set = true;
                 },
                 .set_input_region => |value| {
                     if (handler.kind != .shm or value.region == null or
                         value.region.? != handler.region.?.id)
                         return error.InvalidSurface;
-                    try handler.surface_regions.setInput(handler.region_state);
+                    if (!handler.region_added or !handler.region_subtracted)
+                        return error.InvalidRegion;
                     handler.input_region_set = true;
                 },
                 .set_buffer_transform => |value| {
                     if (handler.kind != .shm or value.transform.value !=
                         standard_protocol.wl_output.transform.@"90".value)
                         return error.InvalidSurface;
-                    try handler.surface_state.setTransform(value.transform.value);
                     handler.buffer_transformed = true;
                 },
                 .set_buffer_scale => |value| {
                     if (handler.kind != .shm or value.scale != 2)
                         return error.InvalidSurface;
-                    try handler.surface_state.setScale(value.scale);
                     handler.buffer_scaled = true;
                 },
                 .offset => |value| {
                     if (handler.kind != .shm or value.x != 2 or value.y != -3)
                         return error.InvalidSurface;
-                    handler.surface_state.setOffset(value.x, value.y);
                     handler.surface_offset = true;
                 },
                 .commit => {
                     if (handler.kind == .shm) {
-                        _ = try InteropCommitState.commit(
-                            handler.commit_scheduler,
-                            handler.commit_queue,
-                            &handler.surface_state,
-                            handler.surface_regions,
-                            handler.frame_queue,
-                            handler.release_queue,
-                            .desync,
-                            &.{},
-                            0,
-                        );
-                        var applied: [1]InteropCommitState.Scheduler.Applied = undefined;
-                        const updates = try handler.commit_scheduler.tryApply(
-                            handler.commit_queue,
-                            &applied,
-                        );
-                        if (updates.len != 1) return error.InvalidSurfaceState;
-                        var content = updates[0].payload;
-                        defer content.deinit();
-                        const region_changes = content.regions;
-                        if (!region_changes.opaque_changed or !region_changes.input_changed or
-                            handler.surface_regions.current_opaque.count != 2 or
-                            handler.surface_regions.current_input.count != 2 or
-                            handler.surface_regions.current_input_infinite)
-                            return error.InvalidSurfaceRegions;
-                        const update = content.surface;
-                        if (update.attachment == null or
-                            update.attachment.?.buffer == null or
-                            !std.meta.eql(update.attachment.?.buffer.?.handle, handler.buffer.?) or
-                            update.surface_damage.empty or update.buffer_damage.empty or
-                            update.transform != .@"90" or update.scale != 2 or
-                            update.offset.x != 2 or update.offset.y != -3 or
-                            update.size.width != 3 or update.size.height != 4)
-                            return error.InvalidSurfaceState;
-                        if (content.activateFrames(handler.frame_queue) != 1)
-                            return error.InvalidFrameCallbacks;
+                        if (!handler.surface_attached) return error.MissingAttachment;
+                        if (!handler.surface_damaged or !handler.buffer_damaged)
+                            return error.MissingDamage;
+                        if (!handler.opaque_region_set) return error.MissingOpaqueRegion;
+                        if (!handler.input_region_set) return error.MissingInputRegion;
+                        if (!handler.buffer_transformed or !handler.buffer_scaled or
+                            !handler.surface_offset)
+                            return error.MissingSurfaceState;
+                        if (!handler.viewport_source or !handler.viewport_destination)
+                            return error.MissingViewportState;
+                        if (handler.frame_callback == null) return error.MissingCallback;
                         try wayring.server.sendEvent(
                             standard_protocol,
                             standard_protocol.wl_buffer,
@@ -2305,54 +2190,29 @@ const ProtocolServerHandler = struct {
                         try XdgServerCore.completeSync(
                             handler.objects,
                             handler.queue,
-                            handler.frame_queue.peekReady() orelse return error.MissingCallback,
-                            123,
-                        );
-                        try handler.frame_queue.consumeReady(
                             handler.frame_callback orelse return error.MissingCallback,
+                            123,
                         );
                         handler.frame_completed = true;
                         handler.surface_committed = true;
+                        handler.viewport_source = false;
+                        handler.viewport_destination = false;
                     } else if (handler.kind == .viewport_benchmark) {
-                        const update = try handler.surface_state.commit();
-                        if (update.size.width != 0 or update.size.height != 0 or
-                            update.viewport.source() == null or
-                            update.viewport.destination() == null or
-                            update.viewport.destination().?.width != 3 or
-                            update.viewport.destination().?.height != 4)
+                        if (!handler.viewport_source or !handler.viewport_destination)
                             return error.InvalidSurfaceState;
                         handler.viewport_commits += 1;
+                        handler.viewport_source = false;
+                        handler.viewport_destination = false;
                     } else if (handler.kind == .subsurface) {
-                        var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
                         if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
-                            const payload: u32 = if (handler.subsurface_parent_latched) 22 else 21;
-                            if ((try handler.subsurface_graph.commitToken(
-                                handler.subsurface_graph.token(decoded.handle) orelse
-                                    return error.InvalidSubsurface,
-                                payload,
-                                &applied,
-                            )).len != 0) return error.InvalidSubsurface;
+                            if (!handler.subsurface_created or handler.subsurface_child_pending)
+                                return error.InvalidSubsurface;
+                            handler.subsurface_child_pending = true;
                         } else if (std.meta.eql(decoded.handle, handler.subsurface_parent.?)) {
-                            const updates = try handler.subsurface_graph.commitToken(
-                                handler.subsurface_graph.token(decoded.handle) orelse
-                                    return error.InvalidSubsurface,
-                                10,
-                                &applied,
-                            );
-                            if (updates.len != 2 or updates[0].payload != 10 or
-                                updates[1].payload != 21)
+                            if (!handler.subsurface_child_pending or
+                                !handler.subsurface_positioned or !handler.subsurface_below)
                                 return error.InvalidSubsurface;
-                            const position = try handler.subsurface_graph.position(
-                                handler.subsurface_child.?,
-                            );
-                            var stack_entries: [1]InteropSubsurfaceGraph.StackEntry = undefined;
-                            const stack = try handler.subsurface_graph.stack(
-                                handler.subsurface_parent.?,
-                                &stack_entries,
-                            );
-                            if (position.x != -7 or position.y != 11 or stack.len != 1 or
-                                stack[0].above_parent)
-                                return error.InvalidSubsurface;
+                            handler.subsurface_child_pending = false;
                             handler.subsurface_parent_latched = true;
                         } else return error.InvalidSubsurface;
                     }
@@ -2378,11 +2238,7 @@ const ProtocolServerHandler = struct {
                         value,
                         .{},
                     );
-                    try handler.subsurface_child_state.role.assign(subsurface_role_id, true);
-                    try handler.subsurface_graph.add(
-                        handler.subsurface_child.?,
-                        handler.subsurface_parent.?,
-                    );
+                    if (handler.subsurface_created) return error.InvalidSubsurface;
                     handler.subsurface_created = true;
                 },
                 .destroy => handler.subcompositor_destroyed = true,
@@ -2398,53 +2254,40 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .set_position => |value| {
                     if (value.x != -7 or value.y != 11) return error.InvalidSubsurface;
-                    try handler.subsurface_graph.setPosition(
-                        handler.subsurface_child.?,
-                        value.x,
-                        value.y,
-                    );
+                    if (!handler.subsurface_created or handler.subsurface_positioned)
+                        return error.InvalidSubsurface;
                     handler.subsurface_positioned = true;
                 },
                 .place_above => |value| {
                     if (value.sibling != handler.subsurface_parent.?.id)
                         return error.InvalidSubsurface;
-                    try handler.subsurface_graph.placeAbove(
-                        handler.subsurface_child.?,
-                        handler.subsurface_parent.?,
-                    );
+                    if (!handler.subsurface_positioned or handler.subsurface_above)
+                        return error.InvalidSubsurface;
                     handler.subsurface_above = true;
                 },
                 .place_below => |value| {
                     if (value.sibling != handler.subsurface_parent.?.id)
                         return error.InvalidSubsurface;
-                    try handler.subsurface_graph.placeBelow(
-                        handler.subsurface_child.?,
-                        handler.subsurface_parent.?,
-                    );
+                    if (!handler.subsurface_above or handler.subsurface_below)
+                        return error.InvalidSubsurface;
                     handler.subsurface_below = true;
                 },
                 .set_sync => {
-                    try handler.subsurface_graph.setSync(handler.subsurface_child.?);
+                    if (!handler.subsurface_parent_latched or handler.subsurface_sync)
+                        return error.InvalidSubsurface;
                     handler.subsurface_sync = true;
                 },
                 .set_desync => {
-                    var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
-                    const updates = try handler.subsurface_graph.setDesync(
-                        handler.subsurface_child.?,
-                        &applied,
-                    );
-                    if (updates.len != 1 or updates[0].payload != 22)
+                    if (!handler.subsurface_sync or !handler.subsurface_child_pending or
+                        handler.subsurface_desync)
                         return error.InvalidSubsurface;
+                    handler.subsurface_child_pending = false;
                     handler.subsurface_desync = true;
                     handler.subsurface_desync_applied = true;
                 },
                 .destroy => {
-                    var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
-                    if ((try handler.subsurface_graph.remove(
-                        handler.subsurface_child.?,
-                        &applied,
-                    )).len != 0) return error.InvalidSubsurface;
-                    try handler.subsurface_child_state.role.deactivateObject(subsurface_role_id);
+                    if (!handler.subsurface_desync_applied or handler.subsurface_destroyed)
+                        return error.InvalidSubsurface;
                     handler.subsurface_destroyed = true;
                 },
             }
@@ -2460,27 +2303,20 @@ const ProtocolServerHandler = struct {
                 .add => |value| {
                     if (value.x != 1 or value.y != 2 or value.width != 3 or value.height != 4)
                         return error.InvalidRegion;
-                    try handler.region_state.add(.{
-                        .x = value.x,
-                        .y = value.y,
-                        .width = value.width,
-                        .height = value.height,
-                    });
+                    if (handler.region_added) return error.InvalidRegion;
                     handler.region_added = true;
                 },
                 .subtract => |value| {
                     if (value.x != 5 or value.y != 6 or value.width != 7 or value.height != 8)
                         return error.InvalidRegion;
-                    try handler.region_state.subtract(.{
-                        .x = value.x,
-                        .y = value.y,
-                        .width = value.width,
-                        .height = value.height,
-                    });
+                    if (!handler.region_added or handler.region_subtracted)
+                        return error.InvalidRegion;
                     handler.region_subtracted = true;
                 },
                 .destroy => {
-                    handler.region_state.clear();
+                    if (!handler.opaque_region_set or !handler.input_region_set or
+                        handler.region_destroyed)
+                        return error.InvalidRegion;
                     handler.region_destroyed = true;
                 },
             }
@@ -6077,8 +5913,6 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .viewport_libwayland;
         } else if (std.mem.eql(u8, value, "viewport-libwayland-client")) {
             options.mode = .viewport_libwayland_client;
-        } else if (std.mem.eql(u8, value, "viewport-state")) {
-            options.mode = .viewport_state;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-client")) {
             options.mode = .dmabuf_libwayland_client;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-server")) {

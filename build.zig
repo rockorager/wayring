@@ -84,27 +84,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_end_to_end_tests = b.addRunArtifact(end_to_end_tests);
-    const generate_core_protocol = b.addRunArtifact(scanner);
-    generate_core_protocol.addFileArg(wayland_source.path("protocol/wayland.xml"));
-    const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayring-core-protocol.zig");
-    const generated_core_module = b.createModule(.{
-        .root_source_file = generated_core_protocol,
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "wayring", .module = wayring }},
-    });
-    const release_end_to_end_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/release-end-to-end.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "wayring", .module = wayring },
-                .{ .name = "core_protocol", .module = generated_core_module },
-            },
-        }),
-    });
-    const run_release_end_to_end_tests = b.addRunArtifact(release_end_to_end_tests);
     const fuzz_optimize: std.builtin.OptimizeMode = if (optimize == .Debug)
         .ReleaseSafe
     else
@@ -130,7 +109,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_client_core_tests.step);
     test_step.dependOn(&run_server_core_tests.step);
     test_step.dependOn(&run_end_to_end_tests.step);
-    test_step.dependOn(&run_release_end_to_end_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
 
     const fuzz_step = b.step("fuzz", "Fuzz wire and connection state machines");

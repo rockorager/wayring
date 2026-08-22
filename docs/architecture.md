@@ -440,11 +440,16 @@ shared server namespace directly. Its
 million for the prior per-client table and about 3–5 million for libwayland in
 the same orb.
 
-## Compositor state
+## Compositor boundary
 
-Reusable compositor policy is layered above generated protocol dispatch rather
-than embedded in transport actors. The first protocol-independent primitive is
-a fixed-size `wl_surface` state machine. It enforces permanent role identity and
+Wayring owns transport, generated protocol dispatch, object/resource lifetimes,
+globals, descriptor ownership, socket setup, and safe SHM access. Compositor
+policy now lives in Ouro, the compositor built on Wayring. The extracted design
+below records Ouro's initial state architecture; none of these state machines
+are part of Wayring's API.
+
+The first protocol-independent primitive is a fixed-size `wl_surface` state
+machine. It enforces permanent role identity and
 live role-object destruction ordering, validates scale, transform, and
 version-dependent attach offsets, carries factory-supplied buffer dimensions,
 and rejects commits whose effective dimensions are not divisible by the pending
@@ -459,13 +464,10 @@ checking the 24.8 fixed-point source rectangle, rejects fractional source sizes
 when no destination is present, and derives the renderer-facing surface size.
 A null attachment has zero surface size but still applies pending viewport
 state; destroying the viewport clears both properties on the next commit.
-With the same libwayland client sending `set_source`, `set_destination`, and
-`commit` in 256-operation batches, a five-sample alternating run measured a
-median 1.13 million commits/second through the Wayring server versus 836
-thousand through the libwayland server. Wayring performs full geometry and
-double-buffered-state validation while the control validates only values and
-request order. The isolated Wayring semantic state transition costs 17.9 ns
-per commit in the same orb.
+Before extraction, an equivalent libwayland client benchmark established that
+this state design was not a transport bottleneck. Current Wayring viewport
+benchmarks validate the same request values and ordering on both servers so
+they compare core transport and generated dispatch rather than Ouro policy.
 
 Damage uses one conservative bounding rectangle per coordinate space. This may
 overdraw but cannot miss changed pixels, requires no region allocation, and
@@ -532,13 +534,13 @@ infallible publish phase. Frame callbacks remain owned by their CU and become
 ready only when that CU applies, rather than when a synchronized request is
 merely queued. Unapplied queue teardown explicitly discards callback batches,
 so shared pools do not leak under disconnect or protocol-error cleanup.
-The SHM interoperability server
-exercises all current surface state machines with real libwayland region
-copies, frame callbacks, attach, dual damage, transform, scale, offset, and
-viewport crop and destination requests, including destroying the source region
-after it is copied, and checks the committed 3x4 surface size after transform
-and scale. The reverse pairing verifies generated viewporter requests against a
-libwayland server implementation.
+Ouro retains the state-machine tests, including the real-kernel release callback
+test. Wayring's interoperability server validates the corresponding generated
+requests, object lifetimes, values, ordering, and event delivery without
+embedding compositor policy. The reverse pairing verifies generated viewporter
+requests against a libwayland server implementation.
+
+## SHM resources
 
 SHM import begins with protocol-independent, format-aware metadata validation.
 Applications configure a hard maximum pool size and supply bytes per pixel for

@@ -7,6 +7,11 @@ Wayring targets Wayland wire compatibility, not libwayland API or architecture
 compatibility. Its interfaces are unstable while the transport and ownership
 model are established through measurement.
 
+Wayring stops at client/server runtime mechanics: wire and generated protocol
+dispatch, io_uring transport, objects and resources, globals, descriptors,
+socket setup, and safe SHM access. Surface, renderer, input, and shell semantics
+belong to Ouro, the compositor built on Wayring.
+
 See [the architecture notes](docs/architecture.md) for the initial design.
 
 `zig build test` runs the dependency-free unit and integration suite.

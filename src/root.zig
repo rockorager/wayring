@@ -25,14 +25,7 @@ pub const server = @import("server.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const io_uring = @import("io_uring.zig");
 pub const unix_socket = @import("unix_socket.zig");
-pub const compositor = @import("compositor.zig");
-pub const region = @import("region.zig");
-pub const frame = @import("frame.zig");
-pub const subsurface = @import("subsurface.zig");
-pub const release = @import("release.zig");
-pub const content_update = @import("content_update.zig");
 pub const shm = @import("shm.zig");
-pub const viewport = @import("viewport.zig");
 
 test {
     _ = wire;
@@ -52,12 +45,5 @@ test {
     _ = dispatch;
     _ = io_uring;
     _ = unix_socket;
-    _ = compositor;
-    _ = region;
-    _ = frame;
-    _ = subsurface;
-    _ = release;
-    _ = content_update;
     _ = shm;
-    _ = viewport;
 }
