@@ -82,6 +82,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_server_core_tests = b.addRunArtifact(server_core_tests);
+    const server_shm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/server-shm.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "generated_protocol", .module = generated_test_module },
+            },
+        }),
+    });
+    const run_server_shm_tests = b.addRunArtifact(server_shm_tests);
     const end_to_end_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/end-to-end.zig"),
@@ -118,6 +130,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_generated_tests.step);
     test_step.dependOn(&run_client_core_tests.step);
     test_step.dependOn(&run_server_core_tests.step);
+    test_step.dependOn(&run_server_shm_tests.step);
     test_step.dependOn(&run_end_to_end_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
 

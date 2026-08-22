@@ -231,7 +231,7 @@ reactor-wide transmit pools. Send preparation can be batched before one shared
 ring submission while each connection retains at most one active send SQE.
 Receive decoding and buffer return are force-inlined across the module boundary;
 the benchmark uses these exact library types rather than private equivalents.
-After extraction, the isolated eight-connection median is about 93.2 million
+The current isolated eight-connection median is about 93.2 million
 messages/second.
 
 The production reactor owner initializes the ring, provided-buffer group,
@@ -440,107 +440,37 @@ shared server namespace directly. Its
 million for the prior per-client table and about 3–5 million for libwayland in
 the same orb.
 
-## Compositor boundary
+## Consumer boundary
 
-Wayring owns transport, generated protocol dispatch, object/resource lifetimes,
-globals, descriptor ownership, socket setup, and safe SHM access. Compositor
-policy now lives in Ouro, the compositor built on Wayring. The extracted design
-below records Ouro's initial state architecture; none of these state machines
-are part of Wayring's API.
+Wayring owns behavior that every client or server runtime must implement
+identically to preserve wire compatibility, ownership, ordering, and memory
+safety. This includes transport, generated protocol dispatch, object and
+resource lifetimes, core display and registry behavior, globals, descriptor
+ownership, socket bootstrap primitives, and safe SHM backing.
 
-The first protocol-independent primitive is a fixed-size `wl_surface` state
-machine. It enforces permanent role identity and
-live role-object destruction ordering, validates scale, transform, and
-version-dependent attach offsets, carries factory-supplied buffer dimensions,
-and rejects commits whose effective dimensions are not divisible by the pending
-scale. It atomically commits buffer attachment, surface and buffer damage,
-transform, scale, and content offset. Persistent properties remain
-pending/current values while attachment, damage, and offset are extracted and
-reset as one content update.
+Consumers own application scheduling and behavior that assigns meaning to
+protocol objects. This includes surface and role state, rendering and
+presentation, input and output policy, shell behavior, application-semantic
+protocol errors, and application event routing. The reactor prepares and
+completes Wayland I/O while the consumer retains submission, waiting, and
+multiplexing policy for its ring.
 
-Viewporter crop and destination state is fixed-size and double-buffered with
-the surface. Commit validation applies buffer transform and scale before
-checking the 24.8 fixed-point source rectangle, rejects fractional source sizes
-when no destination is present, and derives the renderer-facing surface size.
-A null attachment has zero surface size but still applies pending viewport
-state; destroying the viewport clears both properties on the next commit.
-Before extraction, an equivalent libwayland client benchmark established that
-this state design was not a transport bottleneck. Current Wayring viewport
-benchmarks validate the same request values and ordering on both servers so
-they compare core transport and generated dispatch rather than Ouro policy.
-
-Damage uses one conservative bounding rectangle per coordinate space. This may
-overdraw but cannot miss changed pixels, requires no region allocation, and
-keeps the common surface commit path fixed-size. Exact opaque/input regions,
-which affect hit testing and occlusion correctness, use ordered add/subtract
-programs leased from one compositor-wide node pool. Idle regions and surfaces
-reserve no command nodes. Region-to-surface copies and double-buffered commits
-are transactional under pool pressure, and null input retains its distinct
-infinite-region semantics. Frame callbacks similarly lease nodes from one
-shared pool. Commit splices a surface's pending callbacks onto its ready queue
-in O(1), preserving request and commit order. Compositors peek the oldest ready
-handle, transactionally enqueue `done` plus `delete_id`, and consume it only
-after TX succeeds, so backpressure cannot lose a callback.
-
-Synchronized subsurface state is also a separate composable graph with generic
-application payloads. Surface relationships and queued content updates lease
-nodes from compositor-wide bounded pools, so idle clients reserve no graph
-storage. It rejects duplicate roles, self-parenting, and ancestor cycles;
-tracks inherited effective synchronization; preserves every cached commit in
-order; and atomically returns parent-latched update batches through
-caller-provided storage. Generic keys may include a client identity when the
-pool spans clients. Generation-checked tokens let the hot commit path bypass
-key lookup without making stale storage references valid. Relationship
-visibility and position are double-buffered on the parent, while role-object
-destruction is immediate. Exact top-to-bottom child stacking includes the
-parent plane, validates sibling references, and latches restacks on parent
-commit without allocating.
-Version-7 per-commit buffer releases use another compositor-wide callback node
-pool. Each surface accumulates pending `get_release` callbacks, validates the
-same-commit non-null buffer requirement transactionally, and detaches an
-independently owned callback batch in O(1). Applications embed that batch in
-the content-update payload and consume callbacks only after `done(0)` plus
-`delete_id` enter the transmit queue, preserving delivery under backpressure.
-Because installed libwayland versions may predate this core protocol request,
-a Wayring-to-Wayring real-kernel test generates the pinned version-7 core
-protocol and exercises attach, `get_release`, commit, CU application,
-`done(0)`, `delete_id`, and client-ID recycling through one borrowed ring.
-The graph implements the established synchronized-subtree behavior; exact
-version-7 scheduling is provided by a lower-level bounded content-update DAG.
-Each per-surface queue automatically links its predecessor and may claim the
-latest unclaimed SCU of each direct child. DCU candidates inspect their entire
-reachable graph for unsatisfied constraints and caller output capacity before
-atomically applying it. Node and edge exhaustion cannot partially append an
-update, generation-checked edges make destroyed dependencies safely stale, and
-caller-owned queues reserve no storage while idle. On effective desync
-transitions, one allocation-free global mark preserves SCUs reachable from any
-DCU; unreachable SCUs become DCUs and lose incoming cross-surface dependencies
-exactly as required by version 7. The relationship graph reports precisely the
-surfaces whose effective mode changed, stopping at explicit synchronization
-barriers, so callers can feed those keys directly to their scheduler queues
-without embedding scheduler policy in relationship storage. Effective-mode
-queries determine CU kind, while direct-child enumeration includes pending
-associations and supplies the child queues whose newest unclaimed SCUs become
-dependencies of the parent commit. Recursive visibility accounts for pending
-ancestor associations, inactive ancestor role objects, and destroyed parent
-surfaces without eagerly walking or rewriting the descendant tree.
-
-The transactional `CommitState` boundary composes scalar surface state, exact
-region snapshots, frame callbacks, per-commit release callbacks, and DAG
-admission. Scheduler capacity and dependencies are preflighted without
-mutation; region replacements are prepared in temporary shared-pool nodes; and
-the release callback's same-commit buffer requirement is validated before the
-infallible publish phase. Frame callbacks remain owned by their CU and become
-ready only when that CU applies, rather than when a synchronized request is
-merely queued. Unapplied queue teardown explicitly discards callback batches,
-so shared pools do not leak under disconnect or protocol-error cleanup.
-Ouro retains the state-machine tests, including the real-kernel release callback
-test. Wayring's interoperability server validates the corresponding generated
-requests, object lifetimes, values, ordering, and event delivery without
-embedding compositor policy. The reverse pairing verifies generated viewporter
-requests against a libwayland server implementation.
+The boundary is determined by correctness rather than by whether libwayland
+offers a similarly named helper. A mechanism belongs in Wayring when unrelated
+consumers would otherwise duplicate correctness-sensitive connection or
+resource code. Behavior that depends on application state or compositor policy
+remains at the consumer boundary.
 
 ## SHM resources
+
+The optional generated-protocol `server.Shm` service owns the reusable
+`wl_shm`, `wl_shm_pool`, and SHM-backed `wl_buffer` mechanics. It installs a
+format-advertising global, validates and admits pool and buffer resources,
+selects standard SHM protocol errors, and maps their destruction onto the safe
+store. Consumers configure formats and hard capacities, forward externally
+initiated resource removals through their central removal hook, and can recover
+a store token from a live owned buffer. Surface attachment, backing pins,
+import, presentation, and release policy remain outside the service.
 
 SHM import begins with protocol-independent, format-aware metadata validation.
 Applications configure a hard maximum pool size and supply bytes per pixel for
@@ -548,7 +478,7 @@ every advertised core or custom format. Pool creation and growth, positive
 dimensions, minimum row stride, conservative `stride * height` extent, and
 final offset are checked before publication with overflow-safe arithmetic. This
 bounded metadata layer is the prerequisite for shared mapping lifetime and
-SIGBUS-safe pixel access. One compositor-wide bounded store allocates pool,
+SIGBUS-safe pixel access. One server-wide bounded store allocates pool,
 buffer, and importer-pin slots at initialization. Pool resources, every child
 buffer, and active pins independently retain the mapping, so either protocol
 resource may be destroyed first. Generation-checked tokens reject stale slot
@@ -560,7 +490,7 @@ and queues one positional io_uring read into caller-owned memory, without
 submitting the ring. Consumers can batch that copy with unrelated SQEs and
 route it in their own user-data namespace. Completion requires the full
 validated extent; backing truncation becomes `ShortRead` instead of SIGBUS.
-This keeps a process-wide signal handler out of the compositor and reserves
+This keeps a process-wide signal handler out of the consumer and reserves
 zero-copy for inputs where the kernel can guarantee safety. The real SHM
 libwayland-server interop path owns its received descriptor and resource
 lifetime through this store. Its object-removal hook also releases backing

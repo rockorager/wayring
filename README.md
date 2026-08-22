@@ -9,8 +9,8 @@ model are established through measurement.
 
 Wayring stops at client/server runtime mechanics: wire and generated protocol
 dispatch, io_uring transport, objects and resources, globals, descriptors,
-socket setup, and safe SHM access. Surface, renderer, input, and shell semantics
-belong to Ouro, the compositor built on Wayring.
+socket setup, and safe SHM access. Consumers own application scheduling,
+protocol-specific object semantics, rendering, input, and shell policy.
 
 See [the architecture notes](docs/architecture.md) for the initial design.
 
@@ -60,7 +60,8 @@ The primary entry points are:
 
 - `wayring.io_uring.Reactor`: owned or borrowed-ring transport reactor
 - `wayring.client`: generated request/event dispatch and client drivers
-- `wayring.server`: globals, resources, generated dispatch, and server drivers
+- `wayring.server`: globals, resources, generated dispatch, server drivers, and
+  the optional `wl_shm` protocol service
 - `wayring.objects`: bounded generation-checked object namespaces
 - `wayring.shm`: validated SHM metadata, mapping lifetime, and safe import paths
 - `wayring.unix_socket`: Wayland display socket setup and connection helpers

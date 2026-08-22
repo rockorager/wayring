@@ -35,6 +35,44 @@
       <arg name="callback_data" type="uint"/>
     </event>
   </interface>
+  <interface name="wl_shm" version="2">
+    <enum name="error">
+      <entry name="invalid_format" value="0"/>
+      <entry name="invalid_stride" value="1"/>
+      <entry name="invalid_fd" value="2"/>
+    </enum>
+    <enum name="format">
+      <entry name="argb8888" value="0"/>
+      <entry name="xrgb8888" value="1"/>
+    </enum>
+    <request name="create_pool">
+      <arg name="id" type="new_id" interface="wl_shm_pool"/>
+      <arg name="fd" type="fd"/>
+      <arg name="size" type="int"/>
+    </request>
+    <request name="release" type="destructor" since="2"/>
+    <event name="format">
+      <arg name="format" type="uint" enum="format"/>
+    </event>
+  </interface>
+  <interface name="wl_shm_pool" version="1">
+    <request name="create_buffer">
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="offset" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="stride" type="int"/>
+      <arg name="format" type="uint" enum="wl_shm.format"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+    <request name="resize">
+      <arg name="size" type="int"/>
+    </request>
+  </interface>
+  <interface name="wl_buffer" version="1">
+    <request name="destroy" type="destructor"/>
+    <event name="release"/>
+  </interface>
   <interface name="wl_compositor" version="6">
     <request name="create_surface">
       <arg name="id" type="new_id" interface="wl_surface"/>

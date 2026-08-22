@@ -3,9 +3,11 @@
 const std = @import("std");
 const ancillary = @import("ancillary.zig");
 const connection = @import("connection.zig");
+const dispatch_control = @import("dispatch.zig");
 const io_uring = @import("io_uring.zig");
 const metadata = @import("metadata.zig");
 const objects = @import("objects.zig");
+const shared_memory = @import("shm.zig");
 const tx = @import("tx.zig");
 const wire = @import("wire.zig");
 
@@ -177,6 +179,461 @@ pub const GlobalCursor = struct {
     iterator: objects.Table(Global).Iterator,
     pending: ?objects.Table(Global).Entry = null,
 };
+
+/// Optional server-side wl_shm protocol service. It composes generated core
+/// protocol dispatch with the bounded safe mapping store while leaving buffer
+/// attachment, presentation, and rendering policy to the consumer.
+pub fn Shm(comptime protocol: type) type {
+    return struct {
+        const Self = @This();
+        const ProtocolCore = Core(protocol);
+        const ShmInterface = protocol.wl_shm;
+        const PoolInterface = protocol.wl_shm_pool;
+        const BufferInterface = protocol.wl_buffer;
+        const no_index = std.math.maxInt(u32);
+
+        const PoolBinding = struct {
+            active: bool = false,
+            next_free: u32 = no_index,
+            resource: objects.Handle = undefined,
+            token: shared_memory.PoolToken = undefined,
+        };
+
+        const BufferBinding = struct {
+            active: bool = false,
+            next_free: u32 = no_index,
+            resource: objects.Handle = undefined,
+            token: shared_memory.BufferToken = undefined,
+        };
+
+        pub const Config = struct {
+            limits: shared_memory.Limits,
+            pool_capacity: usize,
+            buffer_capacity: usize,
+            /// Every advertised format and its storage width. ARGB8888 and
+            /// XRGB8888 with four bytes per pixel are mandatory.
+            formats: []const shared_memory.Format,
+            global_version: u32 = ShmInterface.info.version,
+        };
+
+        store: shared_memory.Store,
+        formats: []shared_memory.Format,
+        global_version: u32,
+        pool_bindings: []PoolBinding,
+        buffer_bindings: []BufferBinding,
+        pool_free: u32,
+        buffer_free: u32,
+        runtime: ?*Runtime(protocol) = null,
+        global: ?objects.Handle = null,
+
+        pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
+            try validateConfig(config);
+            var store = try shared_memory.Store.init(
+                allocator,
+                config.limits,
+                config.pool_capacity,
+                config.buffer_capacity,
+            );
+            errdefer store.deinit(allocator);
+            const pool_bindings = try allocator.alloc(PoolBinding, config.pool_capacity);
+            errdefer allocator.free(pool_bindings);
+            const buffer_bindings = try allocator.alloc(
+                BufferBinding,
+                config.buffer_capacity,
+            );
+            errdefer allocator.free(buffer_bindings);
+            const formats = try allocator.dupe(shared_memory.Format, config.formats);
+            errdefer allocator.free(formats);
+            for (pool_bindings, 0..) |*binding, index| binding.* = .{
+                .next_free = if (index + 1 < pool_bindings.len)
+                    @intCast(index + 1)
+                else
+                    no_index,
+            };
+            for (buffer_bindings, 0..) |*binding, index| binding.* = .{
+                .next_free = if (index + 1 < buffer_bindings.len)
+                    @intCast(index + 1)
+                else
+                    no_index,
+            };
+            return .{
+                .store = store,
+                .formats = formats,
+                .global_version = config.global_version,
+                .pool_bindings = pool_bindings,
+                .buffer_bindings = buffer_bindings,
+                .pool_free = 0,
+                .buffer_free = 0,
+            };
+        }
+
+        pub fn deinit(service: *Self, allocator: std.mem.Allocator) void {
+            for (service.pool_bindings) |binding| std.debug.assert(!binding.active);
+            for (service.buffer_bindings) |binding| std.debug.assert(!binding.active);
+            service.store.deinit(allocator);
+            allocator.free(service.formats);
+            allocator.free(service.buffer_bindings);
+            allocator.free(service.pool_bindings);
+            service.* = undefined;
+        }
+
+        /// Adds the wl_shm global. The service must retain a stable address and
+        /// outlive the runtime global and every resource created from it.
+        pub fn install(
+            service: *Self,
+            runtime: *Runtime(protocol),
+        ) !objects.Handle {
+            if (service.runtime != null) return error.AlreadyInstalled;
+            service.runtime = runtime;
+            errdefer service.runtime = null;
+            const global = try runtime.addGlobalWithBinder(
+                &ShmInterface.info,
+                service.global_version,
+                service,
+                bind,
+            );
+            service.global = global;
+            return global;
+        }
+
+        /// Dispatches one request owned by this service. Null means the target
+        /// belongs to another implementation, including non-SHM wl_buffer
+        /// resources. Semantic SHM failures queue the required protocol error.
+        pub fn request(
+            service: *Self,
+            actor: *connection.Actor,
+            server_objects: anytype,
+            target: objects.Dispatch,
+            message: wire.Message,
+            fds: *ancillary.FdQueue,
+        ) !?dispatch_control.Control {
+            const interface = target.object.interface;
+            if (interface == &ShmInterface.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(service))) return null;
+                const decoded = try decodeRequest(
+                    ShmInterface,
+                    server_objects,
+                    message,
+                    fds,
+                );
+                switch (decoded.value) {
+                    .create_pool => |value| {
+                        var owns_fd = true;
+                        defer {
+                            if (owns_fd) _ = std.os.linux.close(value.fd);
+                        }
+                        const token = service.store.addPool(value.fd, value.size) catch |cause|
+                            return try service.poolError(actor, decoded.handle.id, cause);
+                        owns_fd = false;
+                        const binding = service.acquirePool(token) catch unreachable;
+                        errdefer service.releasePool(binding);
+                        const admitted = try ShmInterface.admit_create_pool(
+                            server_objects,
+                            decoded.handle,
+                            value,
+                            .{ .id = binding },
+                        );
+                        binding.resource = admitted.id;
+                    },
+                    .release => {},
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+
+            if (interface == &PoolInterface.info) {
+                const binding = service.poolBinding(target.object) orelse return null;
+                const decoded = try decodeRequest(
+                    PoolInterface,
+                    server_objects,
+                    message,
+                    fds,
+                );
+                switch (decoded.value) {
+                    .create_buffer => |value| {
+                        const format = service.findFormat(value.format.value) orelse
+                            return try service.protocolError(
+                                actor,
+                                decoded.handle.id,
+                                0,
+                                "unsupported wl_shm format",
+                            );
+                        const token = service.store.addBuffer(
+                            binding.token,
+                            format,
+                            value.offset,
+                            value.width,
+                            value.height,
+                            value.stride,
+                        ) catch |cause| return try service.bufferError(
+                            actor,
+                            decoded.handle.id,
+                            cause,
+                        );
+                        const buffer_binding = service.acquireBuffer(token) catch unreachable;
+                        errdefer service.releaseBuffer(buffer_binding);
+                        const admitted = try PoolInterface.admit_create_buffer(
+                            server_objects,
+                            decoded.handle,
+                            value,
+                            .{ .id = buffer_binding },
+                        );
+                        buffer_binding.resource = admitted.id;
+                    },
+                    .destroy => {},
+                    .resize => |value| service.store.resize(binding.token, value.size) catch |cause|
+                        return try service.resizeError(actor, decoded.handle.id, cause),
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                if (decoded.destructor) service.releasePool(binding);
+                return .continue_dispatch;
+            }
+
+            if (interface == &BufferInterface.info) {
+                const binding = service.bufferBinding(target.object) orelse return null;
+                const decoded = try decodeRequest(
+                    BufferInterface,
+                    server_objects,
+                    message,
+                    fds,
+                );
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                if (decoded.destructor) service.releaseBuffer(binding);
+                return .continue_dispatch;
+            }
+            return null;
+        }
+
+        /// Releases SHM backing after an externally initiated resource removal
+        /// or disconnect. Consumers with other resource state should call this
+        /// from their central removal hook and continue their own dispatch.
+        pub fn resourceRemoved(
+            service: *Self,
+            handle: objects.Handle,
+            object: objects.Object,
+        ) bool {
+            if (object.interface == &PoolInterface.info) {
+                const binding = service.poolBinding(&object) orelse return false;
+                if (!std.meta.eql(binding.resource, handle)) return false;
+                service.releasePool(binding);
+                return true;
+            }
+            if (object.interface == &BufferInterface.info) {
+                const binding = service.bufferBinding(&object) orelse return false;
+                if (!std.meta.eql(binding.resource, handle)) return false;
+                service.releaseBuffer(binding);
+                return true;
+            }
+            return object.interface == &ShmInterface.info and
+                object.context == @as(?*anyopaque, @ptrCast(service));
+        }
+
+        /// Returns the safe-store token only for a live wl_buffer owned by this
+        /// service. Attachment and import semantics remain consumer policy.
+        pub fn bufferToken(
+            service: *Self,
+            object: *const objects.Object,
+        ) ?shared_memory.BufferToken {
+            return (service.bufferBinding(object) orelse return null).token;
+        }
+
+        fn validateConfig(config: Config) !void {
+            try config.limits.validate();
+            try ShmInterface.info.validateVersion(config.global_version);
+            if (config.pool_capacity == 0 or config.buffer_capacity == 0 or
+                config.pool_capacity >= no_index or config.buffer_capacity >= no_index or
+                config.formats.len == 0)
+                return error.InvalidConfig;
+            var argb = false;
+            var xrgb = false;
+            for (config.formats, 0..) |format, index| {
+                if (format.bytes_per_pixel == 0) return error.InvalidConfig;
+                if (format.value == ShmInterface.format.argb8888.value) {
+                    if (format.bytes_per_pixel != 4) return error.InvalidConfig;
+                    argb = true;
+                }
+                if (format.value == ShmInterface.format.xrgb8888.value) {
+                    if (format.bytes_per_pixel != 4) return error.InvalidConfig;
+                    xrgb = true;
+                }
+                for (config.formats[0..index]) |previous| {
+                    if (previous.value == format.value) return error.InvalidConfig;
+                }
+            }
+            if (!argb or !xrgb) return error.InvalidConfig;
+        }
+
+        fn bind(context: ?*anyopaque, binding: Binding) !?*anyopaque {
+            const service: *Self = @ptrCast(@alignCast(context.?));
+            const runtime = service.runtime orelse return error.NotInstalled;
+            const actor = try runtime.clients.reactor.getActor(binding.peer);
+            var total_size: usize = 0;
+            for (service.formats) |format| total_size = try std.math.add(
+                usize,
+                total_size,
+                try ShmInterface.eventSize(.{ .format = .{
+                    .format = ShmInterface.format.fromInt(format.value),
+                } }),
+            );
+            try actor.transmit.ensureCapacity(total_size, 0);
+            for (service.formats) |format| try ShmInterface.encodeEvent(
+                &actor.transmit,
+                binding.resource.id,
+                .{ .format = .{
+                    .format = ShmInterface.format.fromInt(format.value),
+                } },
+            );
+            return service;
+        }
+
+        fn findFormat(service: *Self, value: u32) ?shared_memory.Format {
+            for (service.formats) |format| if (format.value == value) return format;
+            return null;
+        }
+
+        fn acquirePool(
+            service: *Self,
+            token: shared_memory.PoolToken,
+        ) !*PoolBinding {
+            if (service.pool_free == no_index) return error.Exhausted;
+            const index = service.pool_free;
+            const binding = &service.pool_bindings[index];
+            service.pool_free = binding.next_free;
+            binding.* = .{ .active = true, .token = token };
+            return binding;
+        }
+
+        fn acquireBuffer(
+            service: *Self,
+            token: shared_memory.BufferToken,
+        ) !*BufferBinding {
+            if (service.buffer_free == no_index) return error.Exhausted;
+            const index = service.buffer_free;
+            const binding = &service.buffer_bindings[index];
+            service.buffer_free = binding.next_free;
+            binding.* = .{ .active = true, .token = token };
+            return binding;
+        }
+
+        fn releasePool(service: *Self, binding: *PoolBinding) void {
+            if (!binding.active) return;
+            service.store.destroyPoolResource(binding.token) catch unreachable;
+            const index: u32 = @intCast(
+                (@intFromPtr(binding) - @intFromPtr(service.pool_bindings.ptr)) /
+                    @sizeOf(PoolBinding),
+            );
+            binding.active = false;
+            binding.next_free = service.pool_free;
+            service.pool_free = index;
+        }
+
+        fn releaseBuffer(service: *Self, binding: *BufferBinding) void {
+            if (!binding.active) return;
+            service.store.destroyBuffer(binding.token) catch unreachable;
+            const index: u32 = @intCast(
+                (@intFromPtr(binding) - @intFromPtr(service.buffer_bindings.ptr)) /
+                    @sizeOf(BufferBinding),
+            );
+            binding.active = false;
+            binding.next_free = service.buffer_free;
+            service.buffer_free = index;
+        }
+
+        fn poolBinding(
+            service: *Self,
+            object: *const objects.Object,
+        ) ?*PoolBinding {
+            return bindingFromContext(PoolBinding, service.pool_bindings, object.context);
+        }
+
+        fn bufferBinding(
+            service: *Self,
+            object: *const objects.Object,
+        ) ?*BufferBinding {
+            return bindingFromContext(BufferBinding, service.buffer_bindings, object.context);
+        }
+
+        fn bindingFromContext(
+            comptime T: type,
+            bindings: []T,
+            context: ?*anyopaque,
+        ) ?*T {
+            const context_ptr = context orelse return null;
+            const address = @intFromPtr(context_ptr);
+            const start = @intFromPtr(bindings.ptr);
+            const bytes = std.math.mul(usize, bindings.len, @sizeOf(T)) catch return null;
+            const end = std.math.add(usize, start, bytes) catch return null;
+            if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
+                return null;
+            const binding = &bindings[(address - start) / @sizeOf(T)];
+            if (!binding.active or @intFromPtr(binding) != address) return null;
+            return binding;
+        }
+
+        fn protocolError(
+            service: *Self,
+            actor: *connection.Actor,
+            object_id: u32,
+            code: u32,
+            message: []const u8,
+        ) !dispatch_control.Control {
+            _ = service;
+            try ProtocolCore.postError(actor, object_id, code, message);
+            return .stop;
+        }
+
+        fn noMemory(service: *Self, actor: *connection.Actor) !dispatch_control.Control {
+            return service.protocolError(actor, objects.display_id, 2, "out of shared memory");
+        }
+
+        fn poolError(
+            service: *Self,
+            actor: *connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !dispatch_control.Control {
+            return switch (cause) {
+                error.PoolTooLarge, error.Exhausted => service.noMemory(actor),
+                error.InvalidPoolSize => service.protocolError(
+                    actor,
+                    object_id,
+                    1,
+                    "invalid wl_shm pool size",
+                ),
+                else => service.protocolError(actor, object_id, 2, "invalid wl_shm pool fd"),
+            };
+        }
+
+        fn bufferError(
+            service: *Self,
+            actor: *connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !dispatch_control.Control {
+            return switch (cause) {
+                error.Exhausted => service.noMemory(actor),
+                else => service.protocolError(
+                    actor,
+                    object_id,
+                    1,
+                    "invalid wl_shm buffer",
+                ),
+            };
+        }
+
+        fn resizeError(
+            service: *Self,
+            actor: *connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !dispatch_control.Control {
+            return switch (cause) {
+                error.PoolTooLarge, error.Exhausted => service.noMemory(actor),
+                else => service.protocolError(actor, object_id, 2, "invalid wl_shm pool resize"),
+            };
+        }
+    };
+}
 
 pub fn DecodedRequest(comptime Interface: type) type {
     return struct {
