@@ -415,6 +415,26 @@ case "$mode" in
         strace -f -c "$root/zig-out/bench/wayring-shm" \
             copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
         ;;
+    viewport)
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample scope=viewport" >&2
+            if [ $((sample % 2)) -eq 1 ]; then
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" viewport-libwayland
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" viewport-libwayland-client
+            else
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" viewport-libwayland-client
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" viewport-libwayland
+            fi
+            sample=$((sample + 1))
+        done
+        "$root/zig-out/bench/wayring-interop" \
+            "$messages" "$batch" "$warmup" viewport-state
+        ;;
     dmabuf-interop)
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-client
         "$root/zig-out/bench/wayring-interop" 1 1 1 dmabuf-libwayland-server
@@ -444,7 +464,7 @@ case "$mode" in
         "$root/zig-out/bench/wayring-interop" 1 1 1 subsurface-libwayland-server
         ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|shm|shm-perf|shm-syscalls|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|shm|shm-perf|shm-syscalls|viewport|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
         exit 2
         ;;
 esac

@@ -459,6 +459,13 @@ checking the 24.8 fixed-point source rectangle, rejects fractional source sizes
 when no destination is present, and derives the renderer-facing surface size.
 A null attachment has zero surface size but still applies pending viewport
 state; destroying the viewport clears both properties on the next commit.
+With the same libwayland client sending `set_source`, `set_destination`, and
+`commit` in 256-operation batches, a five-sample alternating run measured a
+median 1.13 million commits/second through the Wayring server versus 836
+thousand through the libwayland server. Wayring performs full geometry and
+double-buffered-state validation while the control validates only values and
+request order. The isolated Wayring semantic state transition costs 17.9 ns
+per commit in the same orb.
 
 Damage uses one conservative bounding rectangle per coordinate space. This may
 overdraw but cannot miss changed pixels, requires no region allocation, and

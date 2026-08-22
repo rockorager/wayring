@@ -99,6 +99,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep core_protocol --dep standard
     "$root/bench/xdg-interop-server.c" \
     "$root/bench/shm-interop-client.c" \
     "$root/bench/shm-interop-server.c" \
+    "$root/bench/viewport-benchmark.c" \
     "$root/bench/dmabuf-interop-client.c" \
     "$root/bench/dmabuf-interop-server.c" \
     "$root/bench/data-device-interop-client.c" \

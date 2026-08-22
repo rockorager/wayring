@@ -59,6 +59,7 @@ bench/run.sh subsurface-interop
 bench/run.sh shm
 bench/run.sh shm-perf
 bench/run.sh shm-syscalls
+bench/run.sh viewport
 ```
 
 Configure a run through environment variables:
@@ -80,6 +81,14 @@ buffer availability. Copy mode moves every reported byte into caller-owned
 memory. `SHM_TARGET_BYTES` controls work per matrix cell and
 `SHM_MAX_WORKING_BYTES` caps `size * batch` destination storage. Perf and syscall
 modes use `SHM_SIZE`, `SHM_BATCH`, `SHM_OPERATIONS`, and `SHM_WARMUP`.
+
+Viewport mode sends the same three real protocol requests per operation from
+the same libwayland client: `set_source`, `set_destination`, and
+`wl_surface.commit`. It alternates a libwayland server with a Wayring server and
+uses one sync round trip per `BATCH`. The libwayland handler validates values
+and ordering; Wayring additionally applies its transform/scale-aware,
+double-buffered compositor state. A final state-only sample isolates that extra
+semantic cost from transport and protocol dispatch.
 
 The multi-connection modes compare Wayring and libwayland across identical
 socket counts and messages per connection. Wayring uses one io_uring instance

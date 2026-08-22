@@ -6,6 +6,7 @@ const benchmark_protocol = @import("benchmark_protocol");
 
 const ffi = @cImport({
     @cInclude("benchmark.h");
+    @cInclude("viewport-benchmark.h");
     @cInclude("xdg-interop.h");
     @cInclude("stdio.h");
 });
@@ -25,7 +26,7 @@ const InteropSubsurfaceGraph = wayring.compositor.SubsurfaceGraph(wayring.object
 const InteropCommitState = wayring.compositor.CommitState(u32);
 const subsurface_role_id = 1;
 
-const ProtocolInterop = enum { xdg, shm, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
+const ProtocolInterop = enum { xdg, shm, viewport_benchmark, dmabuf, data_device, output, pointer, keyboard, touch, subsurface, shell };
 const drm_format_argb8888: u32 = 0x34325241;
 const drm_format_modifier_invalid_hi: u32 = 0x00ffffff;
 const drm_format_modifier_invalid_lo: u32 = 0xffffffff;
@@ -43,6 +44,9 @@ const Options = struct {
         xdg_libwayland_server,
         shm_libwayland_client,
         shm_libwayland_server,
+        viewport_libwayland,
+        viewport_libwayland_client,
+        viewport_state,
         dmabuf_libwayland_client,
         dmabuf_libwayland_server,
         data_device_libwayland_client,
@@ -68,25 +72,28 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     return switch (options.mode) {
         .libwayland_client, .libwayland_client_driver => wayringServer(options),
         .libwayland_server, .libwayland_server_driver => wayringClient(options),
-        .xdg_libwayland_client => wayringProtocolServer(.xdg),
+        .xdg_libwayland_client => wayringProtocolServer(.xdg, options),
         .xdg_libwayland_server => wayringXdgClient(),
-        .shm_libwayland_client => wayringProtocolServer(.shm),
+        .shm_libwayland_client => wayringProtocolServer(.shm, options),
         .shm_libwayland_server => wayringShmClient(),
-        .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf),
+        .viewport_libwayland => libwaylandViewport(options),
+        .viewport_libwayland_client => wayringProtocolServer(.viewport_benchmark, options),
+        .viewport_state => viewportState(options),
+        .dmabuf_libwayland_client => wayringProtocolServer(.dmabuf, options),
         .dmabuf_libwayland_server => wayringDmabufClient(),
-        .data_device_libwayland_client => wayringProtocolServer(.data_device),
+        .data_device_libwayland_client => wayringProtocolServer(.data_device, options),
         .data_device_libwayland_server => wayringDataDeviceClient(),
-        .output_libwayland_client => wayringProtocolServer(.output),
+        .output_libwayland_client => wayringProtocolServer(.output, options),
         .output_libwayland_server => wayringOutputClient(),
-        .pointer_libwayland_client => wayringProtocolServer(.pointer),
+        .pointer_libwayland_client => wayringProtocolServer(.pointer, options),
         .pointer_libwayland_server => wayringPointerClient(),
-        .keyboard_libwayland_client => wayringProtocolServer(.keyboard),
+        .keyboard_libwayland_client => wayringProtocolServer(.keyboard, options),
         .keyboard_libwayland_server => wayringKeyboardClient(),
-        .touch_libwayland_client => wayringProtocolServer(.touch),
+        .touch_libwayland_client => wayringProtocolServer(.touch, options),
         .touch_libwayland_server => wayringTouchClient(),
-        .subsurface_libwayland_client => wayringProtocolServer(.subsurface),
+        .subsurface_libwayland_client => wayringProtocolServer(.subsurface, options),
         .subsurface_libwayland_server => wayringSubsurfaceClient(),
-        .shell_libwayland_client => wayringProtocolServer(.shell),
+        .shell_libwayland_client => wayringProtocolServer(.shell, options),
         .shell_libwayland_server => wayringShellClient(),
     };
 }
@@ -429,7 +436,87 @@ const ServerHandler = struct {
     }
 };
 
-fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
+fn viewportClient(fd: c_int, options: Options, server_name: [*:0]const u8) c_int {
+    var result: ffi.struct_viewport_benchmark_result = undefined;
+    const status = ffi.viewport_benchmark_client_fd(
+        fd,
+        options.messages,
+        options.batch,
+        options.warmup,
+        &result,
+    );
+    if (status == 0 and result.operations == options.messages) {
+        _ = c.printf(
+            "server=%s client=libwayland operation=viewport_commit operations=%llu wire_messages=%llu batch=%u elapsed_ns=%llu operations_per_second=%.0f wire_messages_per_second=%.0f\n",
+            server_name,
+            result.operations,
+            result.operations * 3,
+            options.batch,
+            result.elapsed_ns,
+            @as(f64, @floatFromInt(result.operations)) * @as(f64, std.time.ns_per_s) /
+                @as(f64, @floatFromInt(result.elapsed_ns)),
+            @as(f64, @floatFromInt(result.operations * 3)) * @as(f64, std.time.ns_per_s) /
+                @as(f64, @floatFromInt(result.elapsed_ns)),
+        );
+        _ = ffi.fflush(null);
+    }
+    return status;
+}
+
+fn libwaylandViewport(options: Options) !u8 {
+    var sockets: [2]c_int = undefined;
+    if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
+        return error.SystemCallFailed;
+    const child = c.fork();
+    if (child < 0) return error.SystemCallFailed;
+    if (child == 0) {
+        _ = c.close(sockets[0]);
+        c._exit(ffi.viewport_benchmark_server_fd(sockets[1]));
+    }
+    _ = c.close(sockets[1]);
+    const status = viewportClient(sockets[0], options, "libwayland");
+    _ = try waitChild(child);
+    if (status != 0) return error.PeerFailed;
+    return 0;
+}
+
+noinline fn viewportStateOperation(
+    surface: *wayring.compositor.Surface,
+    destination_width: i32,
+) !u32 {
+    try surface.viewport.setSource(0, 0, 256, 256);
+    try surface.viewport.setDestination(destination_width, 4);
+    return (try surface.commit()).size.width;
+}
+
+fn viewportState(options: Options) !u8 {
+    var surface: wayring.compositor.Surface = .{};
+    try surface.attach(7, .{
+        .handle = .{ .id = 1, .generation = 1 },
+        .width = 2,
+        .height = 2,
+    }, 0, 0);
+    try surface.setScale(2);
+    var checksum: u64 = 0;
+    for (0..options.warmup) |index|
+        checksum +%= try viewportStateOperation(&surface, 3 + @as(i32, @intCast(index & 1)));
+    const start = try monotonicNs();
+    for (0..options.messages) |index|
+        checksum +%= try viewportStateOperation(&surface, 3 + @as(i32, @intCast(index & 1)));
+    const elapsed = try monotonicNs() - start;
+    _ = c.printf(
+        "backend=wayring operation=viewport_state operations=%llu elapsed_ns=%llu ns_per_operation=%.1f operations_per_second=%.0f checksum=%llu\n",
+        options.messages,
+        elapsed,
+        @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(options.messages)),
+        @as(f64, @floatFromInt(options.messages)) * @as(f64, std.time.ns_per_s) /
+            @as(f64, @floatFromInt(elapsed)),
+        checksum,
+    );
+    return 0;
+}
+
+fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     var path_storage: [100]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_storage,
@@ -447,6 +534,7 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         c._exit(switch (kind) {
             .xdg => ffi.xdg_client_fd(connected_fd),
             .shm => ffi.shm_client_fd(connected_fd),
+            .viewport_benchmark => viewportClient(connected_fd, options, "wayring"),
             .dmabuf => ffi.dmabuf_client_fd(connected_fd),
             .data_device => ffi.data_device_client_fd(connected_fd),
             .output => ffi.output_client_fd(connected_fd),
@@ -493,6 +581,10 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
         .shm => {
             _ = try runtime.globals.add(&standard_protocol.wl_shm.info, 1, null);
             _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 5, null);
+            _ = try runtime.globals.add(&standard_protocol.wp_viewporter.info, 1, null);
+        },
+        .viewport_benchmark => {
+            _ = try runtime.globals.add(&standard_protocol.wl_compositor.info, 1, null);
             _ = try runtime.globals.add(&standard_protocol.wp_viewporter.info, 1, null);
         },
         .dmabuf => _ = try runtime.globals.add(
@@ -663,6 +755,9 @@ fn wayringProtocolServer(kind: ProtocolInterop) !u8 {
             !handler.surface_destroyed or !handler.buffer_destroyed or
             !handler.pool_destroyed)
             return error.IncompleteInterop,
+        .viewport_benchmark => if (!handler.viewport_created or
+            handler.viewport_commits != options.warmup + options.messages)
+            return error.IncompleteInterop,
         .dmabuf => if (!handler.params_created or !handler.plane_added or
             !handler.dmabuf_buffer_created or !handler.buffer_destroyed or
             !handler.params_destroyed or !handler.async_buffer_created or
@@ -773,6 +868,7 @@ const ProtocolServerHandler = struct {
     viewport_source: bool = false,
     viewport_destination: bool = false,
     viewport_destroyed: bool = false,
+    viewport_commits: u64 = 0,
     surface_state: wayring.compositor.Surface = .{},
     region_state: *wayring.compositor.Region,
     surface_regions: *wayring.compositor.SurfaceRegions,
@@ -1837,7 +1933,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .get_viewport => |value| {
-                    if (handler.kind != .shm or handler.surface == null or
+                    if ((handler.kind != .shm and handler.kind != .viewport_benchmark) or
+                        handler.surface == null or
                         value.surface != handler.surface.?.id)
                         return error.InvalidSurface;
                     handler.viewport = (try standard_protocol.wp_viewporter.admit_get_viewport(
@@ -1860,7 +1957,8 @@ const ProtocolServerHandler = struct {
             );
             switch (decoded.value) {
                 .set_source => |value| {
-                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    if (handler.kind != .shm and handler.kind != .viewport_benchmark)
+                        return error.UnexpectedRequest;
                     try handler.surface_state.viewport.setSource(
                         value.x,
                         value.y,
@@ -1870,12 +1968,14 @@ const ProtocolServerHandler = struct {
                     handler.viewport_source = true;
                 },
                 .set_destination => |value| {
-                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    if (handler.kind != .shm and handler.kind != .viewport_benchmark)
+                        return error.UnexpectedRequest;
                     try handler.surface_state.viewport.setDestination(value.width, value.height);
                     handler.viewport_destination = true;
                 },
                 .destroy => {
-                    if (handler.kind != .shm) return error.UnexpectedRequest;
+                    if (handler.kind != .shm and handler.kind != .viewport_benchmark)
+                        return error.UnexpectedRequest;
                     handler.surface_state.viewport.clear();
                     handler.viewport = null;
                     handler.viewport_destroyed = true;
@@ -1962,6 +2062,7 @@ const ProtocolServerHandler = struct {
                         handler.surface_created = true;
                         handler.surface = surface;
                     }
+                    if (handler.kind == .viewport_benchmark) handler.surface = surface;
                     if (handler.kind == .pointer or handler.kind == .keyboard or
                         handler.kind == .touch or handler.kind == .shell)
                         handler.surface = surface;
@@ -2064,6 +2165,8 @@ const ProtocolServerHandler = struct {
             switch (decoded.value) {
                 .destroy => {
                     if (handler.kind == .shm) try handler.surface_state.validateDestroy();
+                    if (handler.kind == .viewport_benchmark)
+                        try handler.surface_state.validateDestroy();
                     if (handler.kind == .subsurface) {
                         if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
                             try handler.subsurface_child_state.validateDestroy();
@@ -2210,6 +2313,15 @@ const ProtocolServerHandler = struct {
                         );
                         handler.frame_completed = true;
                         handler.surface_committed = true;
+                    } else if (handler.kind == .viewport_benchmark) {
+                        const update = try handler.surface_state.commit();
+                        if (update.size.width != 0 or update.size.height != 0 or
+                            update.viewport.source() == null or
+                            update.viewport.destination() == null or
+                            update.viewport.destination().?.width != 3 or
+                            update.viewport.destination().?.height != 4)
+                            return error.InvalidSurfaceState;
+                        handler.viewport_commits += 1;
                     } else if (handler.kind == .subsurface) {
                         var applied: [4]InteropSubsurfaceGraph.Applied = undefined;
                         if (std.meta.eql(decoded.handle, handler.subsurface_child.?)) {
@@ -5961,6 +6073,12 @@ fn parseOptions(args: std.process.Args) !Options {
             options.mode = .shm_libwayland_client;
         } else if (std.mem.eql(u8, value, "shm-libwayland-server")) {
             options.mode = .shm_libwayland_server;
+        } else if (std.mem.eql(u8, value, "viewport-libwayland")) {
+            options.mode = .viewport_libwayland;
+        } else if (std.mem.eql(u8, value, "viewport-libwayland-client")) {
+            options.mode = .viewport_libwayland_client;
+        } else if (std.mem.eql(u8, value, "viewport-state")) {
+            options.mode = .viewport_state;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-client")) {
             options.mode = .dmabuf_libwayland_client;
         } else if (std.mem.eql(u8, value, "dmabuf-libwayland-server")) {
