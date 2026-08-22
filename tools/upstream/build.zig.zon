@@ -1,0 +1,26 @@
+.{
+    .name = .wayring_upstream_tools,
+    .version = "0.0.0",
+    .fingerprint = 0xd8fefffeb7dabf2f,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .wayring = .{ .path = "../.." },
+        // Source XML only: these packages are never compiled or linked into
+        // Wayring. The outer build enters this package only for optional
+        // protocol compatibility checks and libwayland benchmarks.
+        .wayland = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
+            .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
+            .lazy = true,
+        },
+        .wayland_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
+            .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}
