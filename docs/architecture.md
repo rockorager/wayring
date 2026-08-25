@@ -488,14 +488,17 @@ buffer, and active pins independently retain the mapping, so either protocol
 resource may be destroyed first. Generation-checked tokens reject stale slot
 reuse. Growth uses `mremap` immediately when idle and is deferred while pinned,
 preventing address movement beneath an importer. Shrink-sealed files whose
-length covers the complete mapping expose a zero-copy read-only slice; unsealed
-files deliberately reject raw access. Their fault-safe path pins the backing
-and queues one positional io_uring read into caller-owned memory, without
-submitting the ring. Consumers can batch that copy with unrelated SQEs and
-route it in their own user-data namespace. Completion requires the full
-validated extent; backing truncation becomes `ShortRead` instead of SIGBUS.
-This keeps a process-wide signal handler out of the consumer and reserves
-zero-copy for inputs where the kernel can guarantee safety. The real SHM
+length covers the complete mapping expose an unguarded zero-copy read-only
+slice. Scoped access to ordinary unsealed files installs a process-wide SIGBUS
+guard modeled on the MIT-licensed Wayland reference server. If a client
+truncates active backing, the handler replaces the complete mapping at its
+existing address with zero-filled anonymous pages so the faulting instruction
+can finish; the outer access then reports `InvalidBacking` for a protocol owner
+to disconnect that client. Unrelated SIGBUS retains the action captured at
+handler installation, and a later competing handler makes guarded access fail
+rather than silently running unprotected. The positional io_uring copy API
+remains available to consumers which cannot own the process signal policy.
+It requires the full validated extent, making truncation a `ShortRead`. The real SHM
 libwayland-server interop path owns its received descriptor and resource
 lifetime through this store. Its object-removal hook also releases backing
 references during connection teardown, so abrupt disconnect does not depend on

@@ -1,9 +1,74 @@
 //! Bounded protocol-independent wl_shm metadata and shared mapping ownership.
+//!
+//! Unsealed mappings are exposed only through scoped SIGBUS-guarded access.
+//! The recovery model follows the MIT-licensed Wayland reference server: a
+//! truncation fault replaces the mapping with zero pages and is reported when
+//! the outer access ends, while unrelated faults retain their prior action.
 
 const std = @import("std");
 const linux = std.os.linux;
 
 const none = std.math.maxInt(u32);
+
+var handler_mutex: std.atomic.Mutex = .unlocked;
+var handler_installed = false;
+var previous_sigbus: linux.Sigaction = .{
+    .handler = .{ .handler = std.posix.SIG.DFL },
+    .mask = std.mem.zeroes(linux.sigset_t),
+    .flags = 0,
+};
+
+threadlocal var active_pool_address: std.atomic.Value(usize) = .init(0);
+threadlocal var access_depth: usize = 0;
+threadlocal var backing_faulted: std.atomic.Value(bool) = .init(false);
+
+fn ensureSigbusHandler() error{SignalSetupFailed}!void {
+    while (!handler_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer handler_mutex.unlock();
+
+    var current: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(.BUS, null, &current)) != .SUCCESS)
+        return error.SignalSetupFailed;
+    if (handler_installed) {
+        if (current.handler.sigaction != handleSigbus)
+            return error.SignalSetupFailed;
+        return;
+    }
+    previous_sigbus = current;
+    const action: linux.Sigaction = .{
+        .handler = .{ .sigaction = handleSigbus },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = linux.SA.SIGINFO | linux.SA.NODEFER,
+    };
+    if (linux.errno(linux.sigaction(.BUS, &action, null)) != .SUCCESS)
+        return error.SignalSetupFailed;
+    handler_installed = true;
+}
+
+fn handleSigbus(_: linux.SIG, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    const pool_address = active_pool_address.load(.acquire);
+    if (pool_address != 0) {
+        const pool: *PoolNode = @ptrFromInt(pool_address);
+        const address = @intFromPtr(info.fields.sigfault.addr);
+        const start = @intFromPtr(pool.mapping.ptr);
+        const end = std.math.add(usize, start, pool.mapping.len) catch 0;
+        if (end != 0 and address >= start and address < end) {
+            backing_faulted.store(true, .release);
+            const result = linux.mmap(pool.mapping.ptr, pool.mapping.len, .{
+                .READ = true,
+                .WRITE = true,
+            }, .{
+                .TYPE = .PRIVATE,
+                .FIXED = true,
+                .ANONYMOUS = true,
+            }, -1, 0);
+            if (linux.errno(result) == .SUCCESS and result == start) return;
+        }
+    }
+
+    _ = linux.sigaction(.BUS, &previous_sigbus, null);
+    _ = linux.tkill(linux.gettid(), .BUS);
+}
 
 pub const Error = error{
     InvalidConfig,
@@ -29,6 +94,9 @@ pub const StoreError = Error || std.mem.Allocator.Error || std.posix.MMapError |
     InvalidCompletion,
     CopyFailed,
     ShortRead,
+    SignalSetupFailed,
+    AccessConflict,
+    InvalidBacking,
 };
 
 /// Compositor-supplied metadata for an advertised wl_shm format. Keeping the
@@ -143,6 +211,7 @@ const PoolNode = struct {
     buffer_count: usize = 0,
     pin_count: usize = 0,
     sealed_direct: bool = false,
+    invalid_backing: bool = false,
 };
 
 const BufferNode = struct {
@@ -384,6 +453,70 @@ pub const Store = struct {
         const pool = try store.resolvePool(pin_node.pool);
         if (!pool.sealed_direct) return error.UnsafeAccess;
         return pool.mapping[pin_node.metadata.offset..pin_node.metadata.end()];
+    }
+
+    pub const Access = struct {
+        store: *Store,
+        pin: Pin,
+        pool: *PoolNode,
+        guarded: bool,
+        active: bool = true,
+        bytes: []const u8,
+
+        /// Ends access and invalidates `bytes`. If backing truncation faulted
+        /// during the guarded scope, the mapping has already been replaced by
+        /// zero pages and this reports the client-owned backing as invalid.
+        pub fn end(self: *Access) StoreError!void {
+            if (!self.active) return error.StalePin;
+            _ = try self.store.resolvePin(self.pin.token);
+            if (self.guarded) {
+                std.debug.assert(
+                    active_pool_address.load(.acquire) == @intFromPtr(self.pool) and
+                        access_depth > 0,
+                );
+                access_depth -= 1;
+                if (access_depth == 0) {
+                    _ = active_pool_address.swap(0, .seq_cst);
+                    if (backing_faulted.swap(false, .seq_cst)) {
+                        self.pool.invalid_backing = true;
+                        self.active = false;
+                        self.bytes = &.{};
+                        return error.InvalidBacking;
+                    }
+                }
+            }
+            self.active = false;
+            self.bytes = &.{};
+        }
+    };
+
+    /// Begins scoped direct access to a pinned buffer. Ordinary unsealed pools
+    /// are protected against concurrent truncation by a process-wide SIGBUS
+    /// guard; shrink-sealed pools need no signal scope. Nested access on one
+    /// thread is allowed only for the same pool.
+    pub fn access(store: *Store, pin_value: Pin) StoreError!Access {
+        const pin_node = try store.resolvePin(pin_value.token);
+        const pool = try store.resolvePool(pin_node.pool);
+        if (pool.invalid_backing) return error.InvalidBacking;
+        const guarded = !pool.sealed_direct;
+        if (guarded) {
+            const pool_address = active_pool_address.load(.acquire);
+            if (pool_address != 0 and pool_address != @intFromPtr(pool))
+                return error.AccessConflict;
+            try ensureSigbusHandler();
+            if (pool_address == 0) {
+                backing_faulted.store(false, .seq_cst);
+                _ = active_pool_address.swap(@intFromPtr(pool), .seq_cst);
+            }
+            access_depth += 1;
+        }
+        return .{
+            .store = store,
+            .pin = pin_value,
+            .pool = pool,
+            .guarded = guarded,
+            .bytes = pool.mapping[pin_node.metadata.offset..pin_node.metadata.end()],
+        };
     }
 
     pub fn unpin(store: *Store, pin_value: Pin) StoreError!void {
@@ -654,6 +787,47 @@ test "pins retain destroyed unsealed pools without exposing raw bytes" {
     try std.testing.expectEqual(@as(usize, 0), store.active_pools);
     try std.testing.expectError(error.StalePool, store.poolInfo(pool));
     try std.testing.expectError(error.StalePin, store.unpin(retained));
+}
+
+test "guarded access converts unsealed backing truncation into an error" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .max_pool_bytes = 4096 },
+        1,
+        1,
+    );
+    defer store.deinit(std.testing.allocator);
+    const fd = try testMemfd(4096, false);
+    const payload = [_]u8{ 1, 2, 3, 4 };
+    try std.testing.expectEqual(
+        @as(usize, payload.len),
+        linux.write(fd, &payload, payload.len),
+    );
+    const pool = try store.addPool(fd, 4096);
+    const buffer = try store.addBuffer(
+        pool,
+        .{ .value = 0, .bytes_per_pixel = 4 },
+        0,
+        1,
+        1,
+        4,
+    );
+    const pin_value = try store.pin(buffer);
+
+    var readable = try store.access(pin_value);
+    try std.testing.expectEqualSlices(u8, &payload, readable.bytes[0..payload.len]);
+    try readable.end();
+
+    var truncated = try store.access(pin_value);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 0)));
+    const first: *const volatile u8 = @ptrCast(truncated.bytes.ptr);
+    try std.testing.expectEqual(@as(u8, 0), first.*);
+    try std.testing.expectError(error.InvalidBacking, truncated.end());
+    try std.testing.expectError(error.InvalidBacking, store.access(pin_value));
+
+    try store.unpin(pin_value);
+    try store.destroyBuffer(buffer);
+    try store.destroyPoolResource(pool);
 }
 
 fn testMemfd(size: usize, sealed: bool) !linux.fd_t {
