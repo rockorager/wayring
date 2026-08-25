@@ -47,6 +47,56 @@ pub const Peer = struct {
 const deferred_end = std.math.maxInt(u32);
 const deferred_none = deferred_end - 1;
 
+fn initReceiveBufferGroup(
+    ring: *linux.IoUring,
+    allocator: std.mem.Allocator,
+    group_id: u16,
+    buffer_size: u32,
+    buffer_count: u16,
+) !linux.IoUring.BufferGroup {
+    const buffers = try allocator.alloc(u8, buffer_size * buffer_count);
+    errdefer allocator.free(buffers);
+    const heads = try allocator.alloc(u32, buffer_count);
+    errdefer allocator.free(heads);
+    @memset(heads, 0);
+
+    // Multishot recvmsg needs the complete metadata prefix at the start of
+    // every selected buffer. Incremental consumption can leave a tail too
+    // short for that prefix and make the kernel complete the receive with
+    // EFAULT (liburing issue #1433).
+    const buffer_ring = try linux.IoUring.setup_buf_ring(
+        ring.fd,
+        buffer_count,
+        group_id,
+        .{ .inc = false },
+    );
+    errdefer linux.IoUring.free_buf_ring(ring.fd, buffer_ring, buffer_count, group_id);
+    linux.IoUring.buf_ring_init(buffer_ring);
+
+    const mask = linux.IoUring.buf_ring_mask(buffer_count);
+    for (0..buffer_count) |index| {
+        const start = @as(usize, buffer_size) * index;
+        linux.IoUring.buf_ring_add(
+            buffer_ring,
+            buffers[start..][0..buffer_size],
+            @intCast(index),
+            mask,
+            @intCast(index),
+        );
+    }
+    linux.IoUring.buf_ring_advance(buffer_ring, buffer_count);
+
+    return .{
+        .ring = ring,
+        .br = buffer_ring,
+        .buffers = buffers,
+        .buffer_size = buffer_size,
+        .buffers_count = buffer_count,
+        .heads = heads,
+        .group_id = group_id,
+    };
+}
+
 const DeferredReceive = struct {
     generation: u32 = 0,
     previous: u32 = deferred_none,
@@ -160,7 +210,7 @@ pub const Reactor = struct {
         allocator: std.mem.Allocator,
         config: Config,
     ) !void {
-        owner.receive_buffers = try linux.IoUring.BufferGroup.init(
+        owner.receive_buffers = try initReceiveBufferGroup(
             owner.ring,
             allocator,
             config.buffer_group_id,

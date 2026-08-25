@@ -192,6 +192,10 @@ Receive ancillary-control capacity is configured once per reactor rather than
 per peer. Initialization rejects layouts that would leave a provided buffer
 without room for the io_uring receive header, control data, and one minimum
 Wayland frame.
+The receive buffer ring deliberately disables incremental consumption. A
+multishot `recvmsg` output needs its configured name/control prefix at the
+start of every selected region; reusing a partially consumed buffer can leave
+a tail too short for that prefix and produce a spurious kernel `EFAULT`.
 When every shared provided buffer is selected, the kernel terminates affected
 multishot receives with `ENOBUFS`. The actor reports buffer exhaustion without
 closing the connection. Callers return already delivered buffers before

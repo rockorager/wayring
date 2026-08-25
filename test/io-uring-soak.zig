@@ -806,6 +806,104 @@ fn receivePressureComplete(states: []const ReceivePressureState) bool {
     return true;
 }
 
+test "non-incremental recvmsg cycles provided buffers with payloads and descriptors" {
+    const buffer_count = 8;
+    const completion_count = 33;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
+        .max_connections = 1,
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = buffer_count,
+        .receive_control_capacity = 512,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 1,
+        .descriptor_count = 1,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(std.testing.allocator);
+
+    var sockets: [2]linux.fd_t = undefined;
+    try expectSuccess(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &sockets,
+    ));
+    defer _ = linux.close(sockets[1]);
+    const peer = try reactor.attachReceiving(sockets[0], .{
+        .received_fd_budget = 1,
+        .transmit_byte_budget = 64,
+        .transmit_fd_budget = 1,
+    });
+    const actor = try reactor.getActor(peer);
+    const receiver = try reactor.getReceiver(peer);
+    _ = try reactor.ring.submit();
+
+    for (0..completion_count) |index| {
+        const descriptor = try createDescriptor();
+        const expected_value: u64 = index + 1;
+        try std.testing.expectEqual(
+            @sizeOf(u64),
+            try syscallLength(linux.write(
+                descriptor,
+                std.mem.asBytes(&expected_value).ptr,
+                @sizeOf(u64),
+            )),
+        );
+        const payload = [_]u8{ 0xa5, @intCast(index) };
+        try sendWithDescriptor(sockets[1], &payload, descriptor);
+        _ = linux.close(descriptor);
+
+        const completion = try reactor.ring.copy_cqe();
+        if (completion.err() == .FAULT) return error.UnexpectedEFAULT;
+        try std.testing.expect(completion.res > 0);
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        try std.testing.expectEqual(peer, reactor.routedPeer(routed));
+        try std.testing.expectEqual(wayring.completion.Operation.receive, routed.operation);
+        const event = try actor.completeRouted(routed.operation, completion);
+        try std.testing.expect(event.received.more);
+
+        const received = try receiver.decodeCompletion(completion);
+        try std.testing.expectEqualSlices(u8, &payload, received.payload);
+        try std.testing.expectEqual(@as(usize, 1), try actor.ingestControl(received.control));
+        const received_fd = try actor.takeFd();
+        defer _ = linux.close(received_fd);
+        try expectCloseOnExec(received_fd);
+        var actual_value: u64 = 0;
+        try std.testing.expectEqual(
+            @sizeOf(u64),
+            try syscallLength(linux.read(
+                received_fd,
+                std.mem.asBytes(&actual_value).ptr,
+                @sizeOf(u64),
+            )),
+        );
+        try std.testing.expectEqual(expected_value, actual_value);
+        try std.testing.expectError(error.Empty, actor.takeFd());
+        try std.testing.expectEqual(@as(u16, @intCast(index % buffer_count)), try completion.buffer_id());
+        try std.testing.expectEqual(@as(u32, 0), completion.flags & linux.IORING_CQE_F_BUF_MORE);
+        try reactor.releaseReceived(peer, received);
+    }
+
+    try std.testing.expect(try reactor.prepareClose(peer));
+    _ = try reactor.ring.submit();
+    while (!actor.canDeinit()) {
+        const completion = try reactor.ring.copy_cqe();
+        const routed = (reactor.route(null, completion) orelse
+            return error.InvalidCompletion).connection;
+        const event = try actor.completeRouted(routed.operation, completion);
+        switch (event) {
+            .receive_stopped, .cancel_complete => {},
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try reactor.destroyPeer(peer);
+    try std.testing.expectEqual(@as(usize, 1), reactor.descriptors.available());
+}
+
 fn prepareBackpressureSend(
     reactor: *wayring.io_uring.Reactor,
     state: *BackpressureState,
