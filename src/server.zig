@@ -195,6 +195,7 @@ pub fn Shm(comptime protocol: type) type {
         const PoolBinding = struct {
             active: bool = false,
             next_free: u32 = no_index,
+            index: u32 = undefined,
             resource: objects.Handle = undefined,
             token: shared_memory.PoolToken = undefined,
         };
@@ -202,6 +203,7 @@ pub fn Shm(comptime protocol: type) type {
         const BufferBinding = struct {
             active: bool = false,
             next_free: u32 = no_index,
+            index: u32 = undefined,
             resource: objects.Handle = undefined,
             token: shared_memory.BufferToken = undefined,
         };
@@ -217,10 +219,11 @@ pub fn Shm(comptime protocol: type) type {
         };
 
         store: shared_memory.Store,
+        allocator: std.mem.Allocator,
         formats: []shared_memory.Format,
         global_version: u32,
-        pool_bindings: []PoolBinding,
-        buffer_bindings: []BufferBinding,
+        pool_bindings: std.ArrayList(*PoolBinding),
+        buffer_bindings: std.ArrayList(*BufferBinding),
         pool_free: u32,
         buffer_free: u32,
         runtime: ?*Runtime(protocol) = null,
@@ -235,45 +238,30 @@ pub fn Shm(comptime protocol: type) type {
                 config.buffer_capacity,
             );
             errdefer store.deinit(allocator);
-            const pool_bindings = try allocator.alloc(PoolBinding, config.pool_capacity);
-            errdefer allocator.free(pool_bindings);
-            const buffer_bindings = try allocator.alloc(
-                BufferBinding,
-                config.buffer_capacity,
-            );
-            errdefer allocator.free(buffer_bindings);
             const formats = try allocator.dupe(shared_memory.Format, config.formats);
             errdefer allocator.free(formats);
-            for (pool_bindings, 0..) |*binding, index| binding.* = .{
-                .next_free = if (index + 1 < pool_bindings.len)
-                    @intCast(index + 1)
-                else
-                    no_index,
-            };
-            for (buffer_bindings, 0..) |*binding, index| binding.* = .{
-                .next_free = if (index + 1 < buffer_bindings.len)
-                    @intCast(index + 1)
-                else
-                    no_index,
-            };
-            return .{
+            var service: Self = .{
                 .store = store,
+                .allocator = allocator,
                 .formats = formats,
                 .global_version = config.global_version,
-                .pool_bindings = pool_bindings,
-                .buffer_bindings = buffer_bindings,
-                .pool_free = 0,
-                .buffer_free = 0,
+                .pool_bindings = .empty,
+                .buffer_bindings = .empty,
+                .pool_free = no_index,
+                .buffer_free = no_index,
             };
+            errdefer service.deinitBindings();
+            for (0..config.pool_capacity) |_| try service.growPoolBinding();
+            for (0..config.buffer_capacity) |_| try service.growBufferBinding();
+            return service;
         }
 
         pub fn deinit(service: *Self, allocator: std.mem.Allocator) void {
-            for (service.pool_bindings) |binding| std.debug.assert(!binding.active);
-            for (service.buffer_bindings) |binding| std.debug.assert(!binding.active);
+            for (service.pool_bindings.items) |binding| std.debug.assert(!binding.active);
+            for (service.buffer_bindings.items) |binding| std.debug.assert(!binding.active);
             service.store.deinit(allocator);
             allocator.free(service.formats);
-            allocator.free(service.buffer_bindings);
-            allocator.free(service.pool_bindings);
+            service.deinitBindings();
             service.* = undefined;
         }
 
@@ -325,7 +313,10 @@ pub fn Shm(comptime protocol: type) type {
                         const token = service.store.addPool(value.fd, value.size) catch |cause|
                             return try service.poolError(actor, decoded.handle.id, cause);
                         owns_fd = false;
-                        const binding = service.acquirePool(token) catch unreachable;
+                        const binding = service.acquirePool(token) catch |err| {
+                            try service.store.destroyPoolResource(token);
+                            return err;
+                        };
                         errdefer service.releasePool(binding);
                         const admitted = try ShmInterface.admit_create_pool(
                             server_objects,
@@ -370,7 +361,10 @@ pub fn Shm(comptime protocol: type) type {
                             decoded.handle.id,
                             cause,
                         );
-                        const buffer_binding = service.acquireBuffer(token) catch unreachable;
+                        const buffer_binding = service.acquireBuffer(token) catch |err| {
+                            try service.store.destroyBuffer(token);
+                            return err;
+                        };
                         errdefer service.releaseBuffer(buffer_binding);
                         const admitted = try PoolInterface.admit_create_buffer(
                             server_objects,
@@ -495,11 +489,11 @@ pub fn Shm(comptime protocol: type) type {
             service: *Self,
             token: shared_memory.PoolToken,
         ) !*PoolBinding {
-            if (service.pool_free == no_index) return error.Exhausted;
+            if (service.pool_free == no_index) try service.growPoolBinding();
             const index = service.pool_free;
-            const binding = &service.pool_bindings[index];
+            const binding = service.pool_bindings.items[index];
             service.pool_free = binding.next_free;
-            binding.* = .{ .active = true, .token = token };
+            binding.* = .{ .active = true, .token = token, .index = index };
             return binding;
         }
 
@@ -507,21 +501,18 @@ pub fn Shm(comptime protocol: type) type {
             service: *Self,
             token: shared_memory.BufferToken,
         ) !*BufferBinding {
-            if (service.buffer_free == no_index) return error.Exhausted;
+            if (service.buffer_free == no_index) try service.growBufferBinding();
             const index = service.buffer_free;
-            const binding = &service.buffer_bindings[index];
+            const binding = service.buffer_bindings.items[index];
             service.buffer_free = binding.next_free;
-            binding.* = .{ .active = true, .token = token };
+            binding.* = .{ .active = true, .token = token, .index = index };
             return binding;
         }
 
         fn releasePool(service: *Self, binding: *PoolBinding) void {
             if (!binding.active) return;
             service.store.destroyPoolResource(binding.token) catch unreachable;
-            const index: u32 = @intCast(
-                (@intFromPtr(binding) - @intFromPtr(service.pool_bindings.ptr)) /
-                    @sizeOf(PoolBinding),
-            );
+            const index = binding.index;
             binding.active = false;
             binding.next_free = service.pool_free;
             service.pool_free = index;
@@ -530,10 +521,7 @@ pub fn Shm(comptime protocol: type) type {
         fn releaseBuffer(service: *Self, binding: *BufferBinding) void {
             if (!binding.active) return;
             service.store.destroyBuffer(binding.token) catch unreachable;
-            const index: u32 = @intCast(
-                (@intFromPtr(binding) - @intFromPtr(service.buffer_bindings.ptr)) /
-                    @sizeOf(BufferBinding),
-            );
+            const index = binding.index;
             binding.active = false;
             binding.next_free = service.buffer_free;
             service.buffer_free = index;
@@ -543,31 +531,54 @@ pub fn Shm(comptime protocol: type) type {
             service: *Self,
             object: *const objects.Object,
         ) ?*PoolBinding {
-            return bindingFromContext(PoolBinding, service.pool_bindings, object.context);
+            return bindingFromContext(PoolBinding, service.pool_bindings.items, object.context);
         }
 
         fn bufferBinding(
             service: *Self,
             object: *const objects.Object,
         ) ?*BufferBinding {
-            return bindingFromContext(BufferBinding, service.buffer_bindings, object.context);
+            return bindingFromContext(BufferBinding, service.buffer_bindings.items, object.context);
         }
 
         fn bindingFromContext(
             comptime T: type,
-            bindings: []T,
+            bindings: []*T,
             context: ?*anyopaque,
         ) ?*T {
             const context_ptr = context orelse return null;
-            const address = @intFromPtr(context_ptr);
-            const start = @intFromPtr(bindings.ptr);
-            const bytes = std.math.mul(usize, bindings.len, @sizeOf(T)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
-                return null;
-            const binding = &bindings[(address - start) / @sizeOf(T)];
-            if (!binding.active or @intFromPtr(binding) != address) return null;
-            return binding;
+            for (bindings) |binding| {
+                if (@intFromPtr(binding) == @intFromPtr(context_ptr))
+                    return if (binding.active) binding else null;
+            }
+            return null;
+        }
+
+        fn growPoolBinding(service: *Self) !void {
+            if (service.pool_bindings.items.len >= no_index) return error.OutOfMemory;
+            const binding = try service.allocator.create(PoolBinding);
+            errdefer service.allocator.destroy(binding);
+            const index: u32 = @intCast(service.pool_bindings.items.len);
+            binding.* = .{ .next_free = service.pool_free, .index = index };
+            try service.pool_bindings.append(service.allocator, binding);
+            service.pool_free = index;
+        }
+
+        fn growBufferBinding(service: *Self) !void {
+            if (service.buffer_bindings.items.len >= no_index) return error.OutOfMemory;
+            const binding = try service.allocator.create(BufferBinding);
+            errdefer service.allocator.destroy(binding);
+            const index: u32 = @intCast(service.buffer_bindings.items.len);
+            binding.* = .{ .next_free = service.buffer_free, .index = index };
+            try service.buffer_bindings.append(service.allocator, binding);
+            service.buffer_free = index;
+        }
+
+        fn deinitBindings(service: *Self) void {
+            for (service.buffer_bindings.items) |binding| service.allocator.destroy(binding);
+            for (service.pool_bindings.items) |binding| service.allocator.destroy(binding);
+            service.buffer_bindings.deinit(service.allocator);
+            service.pool_bindings.deinit(service.allocator);
         }
 
         fn protocolError(

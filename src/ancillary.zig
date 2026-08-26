@@ -12,8 +12,8 @@ pub const Error = pools.Error || error{
     Empty,
 };
 
-/// A bounded FIFO. Descriptors in the queue are owned by the queue until
-/// removed with `pop`; `deinit` closes everything still queued.
+/// A byte-budgeted FIFO. Descriptors in the queue are owned by the queue until
+/// removed with `pop`; shared backing storage grows on demand.
 pub const FdQueue = struct {
     pool: *pools.SharedFds,
     budget: usize,
@@ -41,7 +41,7 @@ pub const FdQueue = struct {
 
     pub fn ensureCapacity(queue: FdQueue, count: usize) Error!void {
         if (count > queue.available()) return error.DescriptorBudgetExceeded;
-        if (count > queue.pool.available()) return error.Exhausted;
+        try queue.pool.ensureAvailable(count);
     }
 
     /// Transfers ownership of the oldest descriptor to the caller.

@@ -246,13 +246,15 @@ pub const PoolInfo = struct {
 };
 
 /// A compositor-wide bounded store. Protocol pool resources, child buffers,
-/// and importer pins hold independent references to one mapping. All slot
-/// storage is allocated once; resource creation performs only mmap work.
+/// and importer pins hold independent references to one mapping. Capacities
+/// are initial reserves; individually allocated nodes keep addresses stable as
+/// the index tables grow.
 pub const Store = struct {
+    allocator: std.mem.Allocator,
     limits: Limits,
-    pools: []PoolNode,
-    buffers: []BufferNode,
-    pins: []PinNode,
+    pools: std.ArrayList(*PoolNode),
+    buffers: std.ArrayList(*BufferNode),
+    pins: std.ArrayList(*PinNode),
     pool_free: u32,
     buffer_free: u32,
     pin_free: u32,
@@ -270,45 +272,36 @@ pub const Store = struct {
         if (pool_capacity == 0 or buffer_capacity == 0 or
             pool_capacity >= none or buffer_capacity >= none)
             return error.InvalidConfig;
-        const pools = try allocator.alloc(PoolNode, pool_capacity);
-        errdefer allocator.free(pools);
-        const buffers = try allocator.alloc(BufferNode, buffer_capacity);
-        errdefer allocator.free(buffers);
-        const pins = try allocator.alloc(PinNode, buffer_capacity);
-        for (pools, 0..) |*node, index| node.* = .{
-            .next_free = if (index + 1 < pools.len) @intCast(index + 1) else none,
-        };
-        for (buffers, 0..) |*node, index| node.* = .{
-            .next_free = if (index + 1 < buffers.len) @intCast(index + 1) else none,
-        };
-        for (pins, 0..) |*node, index| node.* = .{
-            .next_free = if (index + 1 < pins.len) @intCast(index + 1) else none,
-        };
-        return .{
+        var store: Store = .{
+            .allocator = allocator,
             .limits = limits,
-            .pools = pools,
-            .buffers = buffers,
-            .pins = pins,
-            .pool_free = 0,
-            .buffer_free = 0,
-            .pin_free = 0,
+            .pools = .empty,
+            .buffers = .empty,
+            .pins = .empty,
+            .pool_free = none,
+            .buffer_free = none,
+            .pin_free = none,
         };
+        errdefer store.deinitNodes();
+        for (0..pool_capacity) |_| try store.growPool();
+        for (0..buffer_capacity) |_| try store.growBuffer();
+        for (0..buffer_capacity) |_| try store.growPin();
+        return store;
     }
 
     pub fn deinit(store: *Store, allocator: std.mem.Allocator) void {
         std.debug.assert(store.active_pools == 0);
         std.debug.assert(store.active_buffers == 0);
         std.debug.assert(store.active_pins == 0);
-        allocator.free(store.pins);
-        allocator.free(store.buffers);
-        allocator.free(store.pools);
+        std.debug.assert(allocator.ptr == store.allocator.ptr);
+        store.deinitNodes();
         store.* = undefined;
     }
 
     /// Takes ownership of `fd` on success. The descriptor remains open for
     /// growth validation and closes with the final mapping reference.
     pub fn addPool(store: *Store, fd: linux.fd_t, requested_size: i32) StoreError!PoolToken {
-        if (store.pool_free == none) return error.Exhausted;
+        if (store.pool_free == none) try store.growPool();
         const size = try createPool(store.limits, requested_size);
         const mapping = try std.posix.mmap(
             null,
@@ -319,9 +312,10 @@ pub const Store = struct {
             0,
         );
         const index = store.pool_free;
-        const generation = store.pools[index].generation;
-        store.pool_free = store.pools[index].next_free;
-        store.pools[index] = .{
+        const node = store.pools.items[index];
+        const generation = node.generation;
+        store.pool_free = node.next_free;
+        node.* = .{
             .generation = generation,
             .active = true,
             .resource_alive = true,
@@ -368,7 +362,7 @@ pub const Store = struct {
     ) StoreError!BufferToken {
         const pool = try store.resolvePool(pool_token);
         if (!pool.resource_alive) return error.ResourceDestroyed;
-        if (store.buffer_free == none) return error.Exhausted;
+        if (store.buffer_free == none) try store.growBuffer();
         const metadata = try createBuffer(
             pool.declared_size,
             format,
@@ -378,9 +372,10 @@ pub const Store = struct {
             stride,
         );
         const index = store.buffer_free;
-        const generation = store.buffers[index].generation;
-        store.buffer_free = store.buffers[index].next_free;
-        store.buffers[index] = .{
+        const node = store.buffers.items[index];
+        const generation = node.generation;
+        store.buffer_free = node.next_free;
+        node.* = .{
             .generation = generation,
             .active = true,
             .pool = pool_token,
@@ -429,11 +424,12 @@ pub const Store = struct {
         const buffer = try store.resolveBuffer(token);
         const pool = try store.resolvePool(buffer.pool);
         if (pool.pending_size != 0) return error.ResizePending;
-        if (store.pin_free == none) return error.Exhausted;
+        if (store.pin_free == none) try store.growPin();
         const pin_index = store.pin_free;
-        const pin_generation = store.pins[pin_index].generation;
-        store.pin_free = store.pins[pin_index].next_free;
-        store.pins[pin_index] = .{
+        const pin_node = store.pins.items[pin_index];
+        const pin_generation = pin_node.generation;
+        store.pin_free = pin_node.next_free;
+        pin_node.* = .{
             .generation = pin_generation,
             .active = true,
             .pool = buffer.pool,
@@ -597,28 +593,28 @@ pub const Store = struct {
     }
 
     fn resolvePool(store: *Store, token: PoolToken) StoreError!*PoolNode {
-        if (token.index >= store.pools.len) return error.StalePool;
-        const node = &store.pools[token.index];
+        if (token.index >= store.pools.items.len) return error.StalePool;
+        const node = store.pools.items[token.index];
         if (!node.active or node.generation != token.generation) return error.StalePool;
         return node;
     }
 
     fn resolveBuffer(store: *Store, token: BufferToken) StoreError!*BufferNode {
-        if (token.index >= store.buffers.len) return error.StaleBuffer;
-        const node = &store.buffers[token.index];
+        if (token.index >= store.buffers.items.len) return error.StaleBuffer;
+        const node = store.buffers.items[token.index];
         if (!node.active or node.generation != token.generation) return error.StaleBuffer;
         return node;
     }
 
     fn resolvePin(store: *Store, token: PinToken) StoreError!*PinNode {
-        if (token.index >= store.pins.len) return error.StalePin;
-        const node = &store.pins[token.index];
+        if (token.index >= store.pins.items.len) return error.StalePin;
+        const node = store.pins.items[token.index];
         if (!node.active or node.generation != token.generation) return error.StalePin;
         return node;
     }
 
     fn releasePoolIfUnused(store: *Store, index: u32) void {
-        const node = &store.pools[index];
+        const node = store.pools.items[index];
         if (node.resource_alive or node.buffer_count != 0 or node.pin_count != 0) return;
         std.posix.munmap(node.mapping);
         _ = linux.close(node.fd);
@@ -627,6 +623,42 @@ pub const Store = struct {
         node.next_free = store.pool_free;
         store.pool_free = index;
         store.active_pools -= 1;
+    }
+
+    fn growPool(store: *Store) std.mem.Allocator.Error!void {
+        if (store.pools.items.len >= none) return error.OutOfMemory;
+        const node = try store.allocator.create(PoolNode);
+        errdefer store.allocator.destroy(node);
+        node.* = .{ .next_free = store.pool_free };
+        try store.pools.append(store.allocator, node);
+        store.pool_free = @intCast(store.pools.items.len - 1);
+    }
+
+    fn growBuffer(store: *Store) std.mem.Allocator.Error!void {
+        if (store.buffers.items.len >= none) return error.OutOfMemory;
+        const node = try store.allocator.create(BufferNode);
+        errdefer store.allocator.destroy(node);
+        node.* = .{ .next_free = store.buffer_free };
+        try store.buffers.append(store.allocator, node);
+        store.buffer_free = @intCast(store.buffers.items.len - 1);
+    }
+
+    fn growPin(store: *Store) std.mem.Allocator.Error!void {
+        if (store.pins.items.len >= none) return error.OutOfMemory;
+        const node = try store.allocator.create(PinNode);
+        errdefer store.allocator.destroy(node);
+        node.* = .{ .next_free = store.pin_free };
+        try store.pins.append(store.allocator, node);
+        store.pin_free = @intCast(store.pins.items.len - 1);
+    }
+
+    fn deinitNodes(store: *Store) void {
+        for (store.pins.items) |node| store.allocator.destroy(node);
+        for (store.buffers.items) |node| store.allocator.destroy(node);
+        for (store.pools.items) |node| store.allocator.destroy(node);
+        store.pins.deinit(store.allocator);
+        store.buffers.deinit(store.allocator);
+        store.pools.deinit(store.allocator);
     }
 };
 
@@ -656,6 +688,37 @@ fn fileCannotShrinkBelow(fd: linux.fd_t, size: usize) bool {
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
+}
+
+test "store grows pools buffers and pins beyond initial capacities" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .max_pool_bytes = 4096 },
+        1,
+        1,
+    );
+    defer store.deinit(std.testing.allocator);
+
+    const first_pool = try store.addPool(try testMemfd(4096, true), 4096);
+    const second_pool = try store.addPool(try testMemfd(4096, true), 4096);
+    const format: Format = .{ .value = 0, .bytes_per_pixel = 4 };
+    const first_buffer = try store.addBuffer(first_pool, format, 0, 2, 2, 8);
+    const second_buffer = try store.addBuffer(second_pool, format, 0, 2, 2, 8);
+    const first_pin = try store.pin(first_buffer);
+    const second_pin = try store.pin(second_buffer);
+
+    try std.testing.expectEqual(@as(usize, 2), store.pools.items.len);
+    try std.testing.expectEqual(@as(usize, 2), store.buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), store.pins.items.len);
+    try std.testing.expectEqual(@as(usize, 16), (try store.bytes(first_pin)).len);
+    try std.testing.expectEqual(@as(usize, 16), (try store.bytes(second_pin)).len);
+
+    try store.unpin(first_pin);
+    try store.unpin(second_pin);
+    try store.destroyBuffer(first_buffer);
+    try store.destroyBuffer(second_buffer);
+    try store.destroyPoolResource(first_pool);
+    try store.destroyPoolResource(second_pool);
 }
 
 test "shared mappings outlive resources and defer growth while pinned" {

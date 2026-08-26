@@ -1,4 +1,4 @@
-//! Bounded allocation-free transmit queue backed by reactor-wide blocks.
+//! Byte-budgeted transmit queue backed by growable reactor-wide blocks.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -95,9 +95,10 @@ pub const Queue = struct {
         for (descriptors) |fd| queue.descriptors.append(fd) catch unreachable;
     }
 
-    /// Validates aggregate queue and shared-pool capacity without mutation.
-    /// Synchronous callers may use this before committing several messages;
-    /// no other queue or reactor operation may interleave before they finish.
+    /// Reserves aggregate queue and shared-pool capacity without publishing
+    /// bytes. Synchronous callers may use this before committing several
+    /// messages; no other queue or reactor operation may interleave before
+    /// they finish.
     pub fn ensureCapacity(
         queue: *Queue,
         byte_count: usize,
@@ -118,7 +119,7 @@ pub const Queue = struct {
             bytes_needing_blocks,
             queue.blocks.block_size,
         ) catch unreachable;
-        if (blocks_needed > queue.blocks.available()) return error.Exhausted;
+        try queue.blocks.ensureAvailable(blocks_needed);
     }
 
     /// Reserves private shared blocks without making bytes visible to snapshots.
@@ -142,7 +143,7 @@ pub const Queue = struct {
             new_bytes,
             queue.blocks.block_size,
         ) catch unreachable;
-        if (blocks_needed > queue.blocks.available()) return error.Exhausted;
+        try queue.blocks.ensureAvailable(blocks_needed);
 
         var new_head: ?pools.Lease = null;
         var new_tail: ?pools.Lease = null;
@@ -450,12 +451,9 @@ test "reservation rejects overflow and incomplete commit" {
     try std.testing.expectEqual(@as(usize, 0), queue.queuedBytes());
 }
 
-test "descriptor failure aborts reservation without taking ownership" {
+test "descriptor backing grows when committing a reservation" {
     var sockets: [2]linux.fd_t = undefined;
     try expectSuccess(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));
-    defer _ = linux.close(sockets[0]);
-    defer _ = linux.close(sockets[1]);
-
     const allocator = std.testing.allocator;
     var blocks = try pools.SharedBlocks.init(allocator, 4, 2);
     defer blocks.deinit(allocator);
@@ -469,13 +467,12 @@ test "descriptor failure aborts reservation without taking ownership" {
 
     const available = blocks.available();
     var reservation = try second.reserve(1);
-    defer reservation.abort();
     try reservation.write("y");
-    try std.testing.expectError(error.Exhausted, reservation.commit(&.{sockets[1]}));
-    try std.testing.expectEqual(@as(usize, 0), second.queuedBytes());
+    try reservation.commit(&.{sockets[1]});
+    try std.testing.expectEqual(@as(usize, 1), second.queuedBytes());
+    try std.testing.expectEqual(@as(usize, 2), fds.capacity());
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[1], linux.F.GETFD, 0)));
-    reservation.abort();
-    try std.testing.expectEqual(available, blocks.available());
+    try std.testing.expectEqual(available - 1, blocks.available());
 }
 
 test "committed reservation coalesces behind active send" {
@@ -544,7 +541,7 @@ test "completion cannot consume bytes appended after submission" {
     try std.testing.expectEqual(@as(usize, 3), queue.queuedBytes());
 }
 
-test "pool pressure and logical budget provide atomic backpressure" {
+test "shared pool grows while logical budget provides atomic backpressure" {
     const allocator = std.testing.allocator;
     var blocks = try pools.SharedBlocks.init(allocator, 4, 1);
     defer blocks.deinit(allocator);
@@ -553,11 +550,10 @@ test "pool pressure and logical budget provide atomic backpressure" {
     var queue = Queue.init(&blocks, 8, &fds, 0);
     defer queue.deinit();
 
-    try std.testing.expectError(error.Exhausted, queue.enqueue("abcde", &.{}));
-    try std.testing.expectEqual(@as(usize, 0), queue.queuedBytes());
-    try queue.enqueue("abcd", &.{});
-    try std.testing.expectError(error.ByteBudgetExceeded, queue.enqueue("efghi", &.{}));
-    try std.testing.expectEqual(@as(usize, 4), queue.queuedBytes());
+    try queue.enqueue("abcde", &.{});
+    try std.testing.expectEqual(@as(usize, 2), blocks.capacity());
+    try std.testing.expectError(error.ByteBudgetExceeded, queue.enqueue("efgh", &.{}));
+    try std.testing.expectEqual(@as(usize, 5), queue.queuedBytes());
 }
 
 test "backpressure does not take descriptor ownership" {
@@ -577,7 +573,7 @@ test "backpressure does not take descriptor ownership" {
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[0], linux.F.GETFD, 0)));
 }
 
-test "descriptor pool pressure is shared and enqueue remains atomic" {
+test "descriptor backing grows across queues" {
     var sockets: [2]linux.fd_t = undefined;
     try expectSuccess(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));
 
@@ -590,14 +586,13 @@ test "descriptor pool pressure is shared and enqueue remains atomic" {
     var second = Queue.init(&blocks, 1, &fds, 1);
 
     try first.enqueue("x", &.{sockets[0]});
-    try std.testing.expectError(error.Exhausted, second.enqueue("y", &.{sockets[1]}));
-    try std.testing.expectEqual(@as(usize, 0), second.queuedBytes());
-    try std.testing.expectEqual(@as(usize, 1), blocks.available());
+    try second.enqueue("y", &.{sockets[1]});
+    try std.testing.expectEqual(@as(usize, 1), second.queuedBytes());
+    try std.testing.expectEqual(@as(usize, 2), fds.capacity());
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[1], linux.F.GETFD, 0)));
 
     first.deinit();
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], linux.F.GETFD, 0)));
-    try second.enqueue("y", &.{sockets[1]});
     second.deinit();
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[1], linux.F.GETFD, 0)));
 }

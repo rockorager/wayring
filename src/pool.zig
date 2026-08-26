@@ -24,15 +24,21 @@ pub const FdLease = struct {
     fd: linux.fd_t,
 };
 
-/// Fixed-size byte blocks allocated once for a reactor and leased by any of its
-/// connections. Acquire and release are O(1) and perform no allocator calls.
+/// Fixed-size byte blocks shared by every connection on a reactor. The initial
+/// count is a reserve rather than a ceiling; pointer-stable nodes grow on
+/// demand, while acquire and release remain O(1) whenever a free node exists.
 pub const SharedBlocks = struct {
+    const Node = struct {
+        bytes: []u8,
+        free_next: u32 = free_sentinel,
+        chain_next: u32 = free_sentinel,
+        generation: u32 = 0,
+        in_use: bool = false,
+    };
+
+    allocator: std.mem.Allocator,
     block_size: usize,
-    storage: []u8,
-    free_next: []u32,
-    chain_next: []u32,
-    generations: []u32,
-    in_use: []bool,
+    nodes: std.ArrayList(*Node),
     free_head: u32,
     active_count: usize = 0,
 
@@ -43,78 +49,54 @@ pub const SharedBlocks = struct {
     ) Error!SharedBlocks {
         if (block_size == 0 or block_count == 0 or block_count > free_sentinel)
             return error.InvalidConfig;
-        const byte_count = std.math.mul(usize, block_size, block_count) catch
+        _ = std.math.mul(usize, block_size, block_count) catch
             return error.CapacityOverflow;
-
-        const storage = try allocator.alloc(u8, byte_count);
-        errdefer allocator.free(storage);
-        const free_next = try allocator.alloc(u32, block_count);
-        errdefer allocator.free(free_next);
-        const chain_next = try allocator.alloc(u32, block_count);
-        errdefer allocator.free(chain_next);
-        const generations = try allocator.alloc(u32, block_count);
-        errdefer allocator.free(generations);
-        const in_use = try allocator.alloc(bool, block_count);
-        errdefer allocator.free(in_use);
-
-        @memset(generations, 0);
-        @memset(in_use, false);
-        @memset(chain_next, free_sentinel);
-        for (free_next, 0..) |*next, index| {
-            next.* = if (index + 1 < block_count)
-                @intCast(index + 1)
-            else
-                free_sentinel;
-        }
-
-        return .{
+        var blocks: SharedBlocks = .{
+            .allocator = allocator,
             .block_size = block_size,
-            .storage = storage,
-            .free_next = free_next,
-            .chain_next = chain_next,
-            .generations = generations,
-            .in_use = in_use,
-            .free_head = 0,
+            .nodes = .empty,
+            .free_head = free_sentinel,
         };
+        errdefer blocks.deinitNodes();
+        try blocks.ensureAvailable(block_count);
+        return blocks;
     }
 
     pub fn deinit(blocks: *SharedBlocks, allocator: std.mem.Allocator) void {
         std.debug.assert(blocks.active_count == 0);
-        allocator.free(blocks.in_use);
-        allocator.free(blocks.generations);
-        allocator.free(blocks.chain_next);
-        allocator.free(blocks.free_next);
-        allocator.free(blocks.storage);
+        std.debug.assert(allocator.ptr == blocks.allocator.ptr);
+        blocks.deinitNodes();
         blocks.* = undefined;
     }
 
     pub fn acquire(blocks: *SharedBlocks) Error!Lease {
-        if (blocks.free_head == free_sentinel) return error.Exhausted;
+        try blocks.ensureAvailable(1);
         const index = blocks.free_head;
-        blocks.free_head = blocks.free_next[index];
-        blocks.generations[index] = nextGeneration(blocks.generations[index]);
-        blocks.in_use[index] = true;
-        blocks.chain_next[index] = free_sentinel;
+        const node = blocks.nodes.items[index];
+        blocks.free_head = node.free_next;
+        node.generation = nextGeneration(node.generation);
+        node.in_use = true;
+        node.chain_next = free_sentinel;
         blocks.active_count += 1;
         return .{
             .index = index,
-            .generation = blocks.generations[index],
-            .bytes = blocks.bytes(index),
+            .generation = node.generation,
+            .bytes = node.bytes,
         };
     }
 
     pub fn release(blocks: *SharedBlocks, lease: Lease) Error!void {
         try blocks.validate(lease);
-
-        blocks.in_use[lease.index] = false;
-        blocks.chain_next[lease.index] = free_sentinel;
-        blocks.free_next[lease.index] = blocks.free_head;
+        const node = blocks.nodes.items[lease.index];
+        node.in_use = false;
+        node.chain_next = free_sentinel;
+        node.free_next = blocks.free_head;
         blocks.free_head = lease.index;
         blocks.active_count -= 1;
     }
 
     pub fn capacity(blocks: SharedBlocks) usize {
-        return blocks.free_next.len;
+        return blocks.nodes.items.len;
     }
 
     pub fn available(blocks: SharedBlocks) usize {
@@ -122,120 +104,120 @@ pub const SharedBlocks = struct {
     }
 
     pub fn allocatedBytes(blocks: SharedBlocks) usize {
-        return blocks.storage.len +
-            blocks.free_next.len * @sizeOf(u32) +
-            blocks.chain_next.len * @sizeOf(u32) +
-            blocks.generations.len * @sizeOf(u32) +
-            blocks.in_use.len * @sizeOf(bool);
+        return blocks.nodes.items.len * (blocks.block_size + @sizeOf(Node) + @sizeOf(*Node));
+    }
+
+    pub fn ensureAvailable(blocks: *SharedBlocks, count: usize) Error!void {
+        if (count > free_sentinel - blocks.active_count) return error.CapacityOverflow;
+        while (blocks.available() < count) try blocks.grow();
     }
 
     pub fn link(blocks: *SharedBlocks, from: Lease, to: Lease) Error!void {
         try blocks.validate(from);
         try blocks.validate(to);
-        if (blocks.chain_next[from.index] != free_sentinel) return error.InvalidConfig;
-        blocks.chain_next[from.index] = to.index;
+        const node = blocks.nodes.items[from.index];
+        if (node.chain_next != free_sentinel) return error.InvalidConfig;
+        node.chain_next = to.index;
     }
 
     pub fn nextLease(blocks: *SharedBlocks, lease: Lease) Error!?Lease {
         try blocks.validate(lease);
-        const index = blocks.chain_next[lease.index];
+        const index = blocks.nodes.items[lease.index].chain_next;
         if (index == free_sentinel) return null;
-        if (!blocks.in_use[index]) return error.StaleLease;
+        const node = blocks.nodes.items[index];
+        if (!node.in_use) return error.StaleLease;
         return .{
             .index = index,
-            .generation = blocks.generations[index],
-            .bytes = blocks.bytes(index),
+            .generation = node.generation,
+            .bytes = node.bytes,
         };
     }
 
     fn validate(blocks: SharedBlocks, lease: Lease) Error!void {
-        if (lease.index >= blocks.free_next.len or
-            !blocks.in_use[lease.index] or
-            blocks.generations[lease.index] != lease.generation)
-            return error.StaleLease;
-        const expected = blocks.bytes(lease.index);
-        if (lease.bytes.ptr != expected.ptr or lease.bytes.len != expected.len)
+        if (lease.index >= blocks.nodes.items.len) return error.StaleLease;
+        const node = blocks.nodes.items[lease.index];
+        if (!node.in_use or node.generation != lease.generation or
+            lease.bytes.ptr != node.bytes.ptr or lease.bytes.len != node.bytes.len)
             return error.StaleLease;
     }
 
-    fn bytes(blocks: SharedBlocks, index: u32) []u8 {
-        const start = @as(usize, index) * blocks.block_size;
-        return blocks.storage[start..][0..blocks.block_size];
+    fn grow(blocks: *SharedBlocks) Error!void {
+        if (blocks.nodes.items.len >= free_sentinel) return error.CapacityOverflow;
+        const node = try blocks.allocator.create(Node);
+        errdefer blocks.allocator.destroy(node);
+        const bytes = try blocks.allocator.alloc(u8, blocks.block_size);
+        errdefer blocks.allocator.free(bytes);
+        const index: u32 = @intCast(blocks.nodes.items.len);
+        node.* = .{ .bytes = bytes, .free_next = blocks.free_head };
+        try blocks.nodes.append(blocks.allocator, node);
+        blocks.free_head = index;
+    }
+
+    fn deinitNodes(blocks: *SharedBlocks) void {
+        for (blocks.nodes.items) |node| {
+            blocks.allocator.free(node.bytes);
+            blocks.allocator.destroy(node);
+        }
+        blocks.nodes.deinit(blocks.allocator);
     }
 };
 
 /// Descriptor entries shared by all receive and transmit queues on a reactor.
 /// The pool owns a descriptor from `acquire` until `take` returns it.
 pub const SharedFds = struct {
-    fds: []linux.fd_t,
-    free_next: []u32,
-    chain_next: []u32,
-    generations: []u32,
-    in_use: []bool,
+    const Node = struct {
+        fd: linux.fd_t = -1,
+        free_next: u32 = free_sentinel,
+        chain_next: u32 = free_sentinel,
+        generation: u32 = 0,
+        in_use: bool = false,
+    };
+
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayList(*Node),
     free_head: u32,
     active_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, capacity_value: usize) Error!SharedFds {
         if (capacity_value == 0 or capacity_value > free_sentinel)
             return error.InvalidConfig;
-        const fds = try allocator.alloc(linux.fd_t, capacity_value);
-        errdefer allocator.free(fds);
-        const free_next = try allocator.alloc(u32, capacity_value);
-        errdefer allocator.free(free_next);
-        const chain_next = try allocator.alloc(u32, capacity_value);
-        errdefer allocator.free(chain_next);
-        const generations = try allocator.alloc(u32, capacity_value);
-        errdefer allocator.free(generations);
-        const in_use = try allocator.alloc(bool, capacity_value);
-        errdefer allocator.free(in_use);
-
-        @memset(chain_next, free_sentinel);
-        @memset(generations, 0);
-        @memset(in_use, false);
-        for (free_next, 0..) |*next, index| {
-            next.* = if (index + 1 < capacity_value)
-                @intCast(index + 1)
-            else
-                free_sentinel;
-        }
-        return .{
-            .fds = fds,
-            .free_next = free_next,
-            .chain_next = chain_next,
-            .generations = generations,
-            .in_use = in_use,
-            .free_head = 0,
+        var fds: SharedFds = .{
+            .allocator = allocator,
+            .nodes = .empty,
+            .free_head = free_sentinel,
         };
+        errdefer fds.deinitNodes();
+        try fds.ensureAvailable(capacity_value);
+        return fds;
     }
 
     pub fn deinit(fds: *SharedFds, allocator: std.mem.Allocator) void {
         std.debug.assert(fds.active_count == 0);
-        allocator.free(fds.in_use);
-        allocator.free(fds.generations);
-        allocator.free(fds.chain_next);
-        allocator.free(fds.free_next);
-        allocator.free(fds.fds);
+        std.debug.assert(allocator.ptr == fds.allocator.ptr);
+        fds.deinitNodes();
         fds.* = undefined;
     }
 
     pub fn acquire(fds: *SharedFds, fd: linux.fd_t) Error!FdLease {
-        if (fds.free_head == free_sentinel) return error.Exhausted;
+        try fds.ensureAvailable(1);
         const index = fds.free_head;
-        fds.free_head = fds.free_next[index];
-        fds.generations[index] = nextGeneration(fds.generations[index]);
-        fds.fds[index] = fd;
-        fds.chain_next[index] = free_sentinel;
-        fds.in_use[index] = true;
+        const node = fds.nodes.items[index];
+        fds.free_head = node.free_next;
+        node.generation = nextGeneration(node.generation);
+        node.fd = fd;
+        node.chain_next = free_sentinel;
+        node.in_use = true;
         fds.active_count += 1;
-        return .{ .index = index, .generation = fds.generations[index], .fd = fd };
+        return .{ .index = index, .generation = node.generation, .fd = fd };
     }
 
     /// Releases an entry and transfers descriptor ownership to the caller.
     pub fn take(fds: *SharedFds, lease: FdLease) Error!linux.fd_t {
         try fds.validate(lease);
-        fds.in_use[lease.index] = false;
-        fds.chain_next[lease.index] = free_sentinel;
-        fds.free_next[lease.index] = fds.free_head;
+        const node = fds.nodes.items[lease.index];
+        node.in_use = false;
+        node.chain_next = free_sentinel;
+        node.free_next = fds.free_head;
         fds.free_head = lease.index;
         fds.active_count -= 1;
         return lease.fd;
@@ -244,36 +226,57 @@ pub const SharedFds = struct {
     pub fn link(fds: *SharedFds, from: FdLease, to: FdLease) Error!void {
         try fds.validate(from);
         try fds.validate(to);
-        if (fds.chain_next[from.index] != free_sentinel) return error.InvalidConfig;
-        fds.chain_next[from.index] = to.index;
+        const node = fds.nodes.items[from.index];
+        if (node.chain_next != free_sentinel) return error.InvalidConfig;
+        node.chain_next = to.index;
     }
 
     pub fn nextLease(fds: *SharedFds, lease: FdLease) Error!?FdLease {
         try fds.validate(lease);
-        const index = fds.chain_next[lease.index];
+        const index = fds.nodes.items[lease.index].chain_next;
         if (index == free_sentinel) return null;
-        if (!fds.in_use[index]) return error.StaleLease;
+        const node = fds.nodes.items[index];
+        if (!node.in_use) return error.StaleLease;
         return .{
             .index = index,
-            .generation = fds.generations[index],
-            .fd = fds.fds[index],
+            .generation = node.generation,
+            .fd = node.fd,
         };
     }
 
     pub fn capacity(fds: SharedFds) usize {
-        return fds.fds.len;
+        return fds.nodes.items.len;
     }
 
     pub fn available(fds: SharedFds) usize {
         return fds.capacity() - fds.active_count;
     }
 
+    pub fn ensureAvailable(fds: *SharedFds, count: usize) Error!void {
+        if (count > free_sentinel - fds.active_count) return error.CapacityOverflow;
+        while (fds.available() < count) try fds.grow();
+    }
+
     fn validate(fds: SharedFds, lease: FdLease) Error!void {
-        if (lease.index >= fds.fds.len or
-            !fds.in_use[lease.index] or
-            fds.generations[lease.index] != lease.generation or
-            fds.fds[lease.index] != lease.fd)
+        if (lease.index >= fds.nodes.items.len) return error.StaleLease;
+        const node = fds.nodes.items[lease.index];
+        if (!node.in_use or node.generation != lease.generation or node.fd != lease.fd)
             return error.StaleLease;
+    }
+
+    fn grow(fds: *SharedFds) Error!void {
+        if (fds.nodes.items.len >= free_sentinel) return error.CapacityOverflow;
+        const node = try fds.allocator.create(Node);
+        errdefer fds.allocator.destroy(node);
+        const index: u32 = @intCast(fds.nodes.items.len);
+        node.* = .{ .free_next = fds.free_head };
+        try fds.nodes.append(fds.allocator, node);
+        fds.free_head = index;
+    }
+
+    fn deinitNodes(fds: *SharedFds) void {
+        for (fds.nodes.items) |node| fds.allocator.destroy(node);
+        fds.nodes.deinit(fds.allocator);
     }
 };
 
@@ -282,7 +285,7 @@ fn nextGeneration(current: u32) u32 {
     return if (next == 0) 1 else next;
 }
 
-test "blocks are shared and recycled without allocation" {
+test "blocks grow and recycle with stable leases" {
     const allocator = std.testing.allocator;
     var blocks = try SharedBlocks.init(allocator, 4096, 2);
     defer blocks.deinit(allocator);
@@ -291,7 +294,9 @@ test "blocks are shared and recycled without allocation" {
     const second = try blocks.acquire();
     try std.testing.expect(first.bytes.ptr != second.bytes.ptr);
     try std.testing.expectEqual(@as(usize, 0), blocks.available());
-    try std.testing.expectError(error.Exhausted, blocks.acquire());
+    const grown = try blocks.acquire();
+    try std.testing.expectEqual(@as(usize, 3), blocks.capacity());
+    try std.testing.expectEqual(@as(usize, 0), blocks.available());
 
     try blocks.release(first);
     const reused = try blocks.acquire();
@@ -301,7 +306,8 @@ test "blocks are shared and recycled without allocation" {
 
     try blocks.release(reused);
     try blocks.release(second);
-    try std.testing.expectEqual(@as(usize, 2), blocks.available());
+    try blocks.release(grown);
+    try std.testing.expectEqual(@as(usize, 3), blocks.available());
 }
 
 test "rejects overflowing pool size" {
@@ -321,11 +327,13 @@ test "descriptor entries are shared, ordered, and generation safe" {
     const second = try fds.acquire(11);
     try fds.link(first, second);
     try std.testing.expectEqual(@as(linux.fd_t, 11), (try fds.nextLease(first)).?.fd);
-    try std.testing.expectError(error.Exhausted, fds.acquire(12));
+    const grown = try fds.acquire(12);
+    try std.testing.expectEqual(@as(usize, 3), fds.capacity());
     try std.testing.expectEqual(@as(linux.fd_t, 10), try fds.take(first));
-    const reused = try fds.acquire(12);
+    const reused = try fds.acquire(13);
     try std.testing.expectEqual(first.index, reused.index);
     try std.testing.expectError(error.StaleLease, fds.take(first));
-    try std.testing.expectEqual(@as(linux.fd_t, 12), try fds.take(reused));
+    try std.testing.expectEqual(@as(linux.fd_t, 13), try fds.take(reused));
     try std.testing.expectEqual(@as(linux.fd_t, 11), try fds.take(second));
+    try std.testing.expectEqual(@as(linux.fd_t, 12), try fds.take(grown));
 }

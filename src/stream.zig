@@ -159,7 +159,7 @@ test "leaves following messages in the input" {
     try std.testing.expectEqual(@as(usize, 0), input.len);
 }
 
-test "fragmented messages lease shared scratch only while borrowed" {
+test "fragmented messages grow shared scratch while concurrently borrowed" {
     const allocator = std.testing.allocator;
     var blocks = try pools.SharedBlocks.init(allocator, 128, 1);
     defer blocks.deinit(allocator);
@@ -177,7 +177,9 @@ test "fragmented messages lease shared scratch only while borrowed" {
     try std.testing.expectEqual(@as(usize, 0), blocks.available());
 
     var second_prefix: []const u8 = encoded[0..8];
-    try std.testing.expectError(error.Exhausted, second.next(&second_prefix));
+    try std.testing.expectEqual(null, try second.next(&second_prefix));
+    try std.testing.expectEqual(@as(usize, 2), blocks.capacity());
+    try std.testing.expectEqual(@as(usize, 0), blocks.available());
 
     var suffix: []const u8 = encoded[8..];
     const message = (try first.next(&suffix)).?;
@@ -187,6 +189,4 @@ test "fragmented messages lease shared scratch only while borrowed" {
     var empty: []const u8 = &.{};
     try std.testing.expectEqual(null, try first.next(&empty));
     try std.testing.expectEqual(@as(usize, 1), blocks.available());
-    second_prefix = encoded[0..8];
-    try std.testing.expectEqual(null, try second.next(&second_prefix));
 }
