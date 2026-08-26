@@ -770,11 +770,10 @@ const UnreachableServerHandler = struct {
     }
 };
 
-test "shared clients preserve admission capacity under object pressure" {
+test "clients keep independent bounded object namespaces" {
     const allocator = std.testing.allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 256,
@@ -810,9 +809,10 @@ test "shared clients preserve admission capacity under object pressure" {
     const first_objects = try clients.get(first);
     _ = try first_objects.insertClient(2, &protocol.wp_wayring_test_v1.info, 1, null);
     _ = try first_objects.insertClient(3, &protocol.wp_wayring_test_v1.info, 1, null);
+    _ = try first_objects.insertClient(4, &protocol.wp_wayring_test_v1.info, 1, null);
     try std.testing.expectError(
         error.Full,
-        first_objects.insertClient(4, &protocol.wp_wayring_test_v1.info, 1, null),
+        first_objects.insertClient(5, &protocol.wp_wayring_test_v1.info, 1, null),
     );
 
     var second_sockets: [2]linux.fd_t = undefined;
@@ -823,7 +823,6 @@ test "shared clients preserve admission capacity under object pressure" {
         actor_config,
         null,
     );
-    try std.testing.expectEqual(@as(usize, 0), clients.object_pool.available());
     _ = try reactor.ring.submit();
 
     try stopPeers(&reactor, &.{ first, second });
@@ -831,7 +830,54 @@ test "shared clients preserve admission capacity under object pressure" {
     try std.testing.expectError(error.SlotInactive, clients.get(first));
     try std.testing.expectError(error.SlotInactive, clients.getCredentials(first));
     try clients.destroy(second);
-    try std.testing.expectEqual(@as(usize, 4), clients.object_pool.available());
+}
+
+test "client admission grows beyond initial object reserve" {
+    const allocator = std.testing.allocator;
+    const client_count = 16;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 64 }, .{
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 4,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 2,
+        .transmit_block_size = 64,
+        .transmit_block_count = 2,
+        .descriptor_count = 2,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(allocator);
+    const SharedClients = wayring.server.SharedClients(protocol);
+    var clients = try SharedClients.init(allocator, &reactor, 1, 4, 4);
+    defer clients.deinit(allocator);
+    const actor_config: wayring.io_uring.ActorConfig = .{
+        .received_fd_budget = 1,
+        .transmit_byte_budget = 64,
+        .transmit_fd_budget = 1,
+    };
+    var peers: [client_count]wayring.io_uring.Peer = undefined;
+    var remotes = [_]linux.fd_t{-1} ** client_count;
+    defer {
+        for (remotes) |remote| {
+            if (remote >= 0) _ = linux.close(remote);
+        }
+    }
+    for (&peers, &remotes) |*peer, *remote| {
+        var sockets: [2]linux.fd_t = undefined;
+        try expectSocketPair(&sockets);
+        peer.* = try clients.admit(
+            .{ .fd = sockets[0], .more = true },
+            actor_config,
+            null,
+        );
+        remote.* = sockets[1];
+    }
+    try std.testing.expectEqual(@as(usize, client_count), reactor.slots.active_count);
+    try std.testing.expectEqual(@as(usize, client_count), clients.object_pool.nodes.items.len);
+    _ = try reactor.ring.submit();
+    try stopPeers(&reactor, &peers);
+    for (peers) |peer| try clients.destroy(peer);
 }
 
 test "server endpoint owns filesystem listener and multishot shutdown" {
@@ -845,7 +891,6 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     defer wayring.unix_socket.unlink(path) catch {};
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 16 }, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 64,
@@ -1264,7 +1309,6 @@ test "server driver recovers SQ pressure and drains protocol errors" {
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,

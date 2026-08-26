@@ -372,13 +372,22 @@ test "fuzz reactor slot generations against a free-list model" {
 }
 
 fn fuzzReactorSlots(_: void, smith: *std.testing.Smith) !void {
-    var storage: [8]wayring.reactor.Slot = undefined;
-    const capacity = smith.valueRangeAtMost(u8, 1, storage.len);
-    var slots = wayring.reactor.Slots.init(storage[0..capacity]);
-    var active = [_]bool{false} ** storage.len;
-    var generations = [_]u32{0} ** storage.len;
+    const capacity = smith.valueRangeAtMost(u8, 1, 8);
+    var slots: wayring.reactor.Slots = .{};
+    defer slots.deinit(std.testing.allocator);
+    var active = [_]bool{false} ** 8;
+    var generations = [_]u32{1} ** 8;
     var free: [8]u8 = undefined;
-    for (0..capacity) |index| free[index] = capacity - 1 - @as(u8, @intCast(index));
+    for (0..capacity) |index| {
+        const acquired = try slots.acquire(std.testing.allocator);
+        try std.testing.expectEqual(@as(u24, @intCast(index)), acquired.index);
+        free[index] = capacity - 1 - @as(u8, @intCast(index));
+    }
+    var initial_index = capacity;
+    while (initial_index > 0) {
+        initial_index -= 1;
+        try slots.deactivate(@intCast(initial_index), generations[initial_index]);
+    }
     var free_len: usize = capacity;
 
     var steps: usize = 0;
@@ -387,7 +396,7 @@ fn fuzzReactorSlots(_: void, smith: *std.testing.Smith) !void {
         switch (smith.valueRangeAtMost(u8, 0, 3)) {
             0 => {
                 if (free_len == 0) {
-                    try std.testing.expectError(error.Exhausted, slots.acquire());
+                    continue;
                 } else {
                     const expected_index = free[free_len - 1];
                     free_len -= 1;
@@ -395,7 +404,7 @@ fn fuzzReactorSlots(_: void, smith: *std.testing.Smith) !void {
                         generations[expected_index],
                     );
                     active[expected_index] = true;
-                    const acquired = try slots.acquire();
+                    const acquired = try slots.acquire(std.testing.allocator);
                     try std.testing.expectEqual(@as(u24, expected_index), acquired.index);
                     try std.testing.expectEqual(generations[expected_index], acquired.generation);
                 }

@@ -26,7 +26,6 @@ test "client and server complete a core round trip on one reactor" {
     defer ring.deinit();
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initBorrowed(std.testing.allocator, &ring, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 256,
@@ -181,7 +180,6 @@ test "client closes after a transported terminal display error" {
     )));
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 16 }, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 64,
@@ -313,7 +311,6 @@ test "client connection rolls back failed object initialization" {
     defer _ = linux.close(sockets[1]);
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,

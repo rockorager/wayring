@@ -24,7 +24,6 @@ test "randomized real io_uring connection soak" {
     const random = prng.random();
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 64 }, .{
-        .max_connections = max_connections,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 16,
         .receive_control_capacity = 256,
@@ -356,7 +355,6 @@ const BackpressureState = struct {
 test "real io_uring sends resume after forced kernel backpressure" {
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 32 }, .{
-        .max_connections = backpressure_connections + 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,
@@ -508,7 +506,6 @@ test "real io_uring sends resume after forced kernel backpressure" {
 test "close cancels a send blocked by kernel backpressure" {
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,
@@ -604,7 +601,6 @@ const HeldReceive = struct {
 test "real io_uring receives recover from shared buffer exhaustion" {
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 16 }, .{
-        .max_connections = receive_pressure_connections,
         .receive_buffer_size = 256,
         .receive_buffer_count = receive_pressure_buffers,
         .receive_control_capacity = 64,
@@ -811,7 +807,6 @@ test "non-incremental recvmsg cycles provided buffers with payloads and descript
     const completion_count = 33;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = buffer_count,
         .receive_control_capacity = 512,

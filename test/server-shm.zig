@@ -31,7 +31,6 @@ test "SHM service validates mandatory formats" {
 test "SHM service installs a format-advertising global" {
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 1,
         .receive_control_capacity = 64,

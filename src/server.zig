@@ -1119,16 +1119,18 @@ pub fn Core(comptime protocol: type) type {
     };
 }
 
-/// Couples transport slots to server object namespaces while sharing physical
-/// object nodes across every client on the reactor.
+/// Couples transport slots to independently allocated server object namespaces.
+/// The pointer directory may grow, while each live record remains stable.
 pub fn SharedClients(comptime protocol: type) type {
     return struct {
         const Self = @This();
         const ProtocolCore = Core(protocol);
 
-        const ClientSlot = struct {
-            generation: u32 = 0,
-            credentials: Credentials = undefined,
+        const ClientRecord = struct {
+            peer: io_uring.Peer,
+            credentials: Credentials,
+            objects: objects.SharedServerObjects,
+            buckets: []objects.SharedObjectBucket,
         };
 
         pub const Iterator = struct {
@@ -1136,26 +1138,21 @@ pub fn SharedClients(comptime protocol: type) type {
             index: usize = 0,
 
             pub fn next(self: *Iterator) ?io_uring.Peer {
-                while (self.index < self.clients.slot_storage.len) {
+                while (self.index < self.clients.records.items.len) {
                     const slot = self.index;
                     self.index += 1;
-                    const generation = self.clients.slot_storage[slot].generation;
-                    if (generation != 0) return .{
-                        .slot = @intCast(slot),
-                        .generation = generation,
-                    };
+                    if (self.clients.records.items[slot]) |record| return record.peer;
                 }
                 return null;
             }
         };
 
+        allocator: std.mem.Allocator,
         reactor: *io_uring.Reactor,
         object_pool: objects.SharedObjectPool,
-        client_storage: []objects.SharedServerObjects,
-        bucket_storage: []objects.SharedObjectBucket,
-        slot_storage: []ClientSlot,
-        buckets_per_client: usize,
+        records: std.ArrayListUnmanaged(?*ClientRecord) = .empty,
         object_quota: usize,
+        buckets_per_client: usize,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -1164,53 +1161,24 @@ pub fn SharedClients(comptime protocol: type) type {
             object_quota: usize,
             buckets_per_client: usize,
         ) !Self {
-            const max_connections = reactor.actor_storage.len;
-            if (max_connections == 0 or object_capacity < max_connections or
-                object_quota == 0 or object_quota > object_capacity or
+            if (object_capacity == 0 or object_quota == 0 or
                 buckets_per_client < 2 or !std.math.isPowerOfTwo(buckets_per_client))
                 return error.InvalidConfig;
-            const bucket_count = std.math.mul(
-                usize,
-                max_connections,
-                buckets_per_client,
-            ) catch return error.CapacityOverflow;
-
             var object_pool = try objects.SharedObjectPool.init(allocator, object_capacity);
             errdefer object_pool.deinit(allocator);
-            try object_pool.reserve(max_connections);
-            const client_storage = try allocator.alloc(
-                objects.SharedServerObjects,
-                max_connections,
-            );
-            errdefer allocator.free(client_storage);
-            const bucket_storage = try allocator.alloc(
-                objects.SharedObjectBucket,
-                bucket_count,
-            );
-            errdefer allocator.free(bucket_storage);
-            @memset(bucket_storage, .{});
-            const slot_storage = try allocator.alloc(ClientSlot, max_connections);
-            errdefer allocator.free(slot_storage);
-            @memset(slot_storage, .{});
             return .{
+                .allocator = allocator,
                 .reactor = reactor,
                 .object_pool = object_pool,
-                .client_storage = client_storage,
-                .bucket_storage = bucket_storage,
-                .slot_storage = slot_storage,
-                .buckets_per_client = buckets_per_client,
                 .object_quota = object_quota,
+                .buckets_per_client = buckets_per_client,
             };
         }
 
         pub fn deinit(clients: *Self, allocator: std.mem.Allocator) void {
-            for (clients.slot_storage) |slot| std.debug.assert(slot.generation == 0);
-            std.debug.assert(
-                clients.object_pool.reserved_count == clients.slot_storage.len,
-            );
-            allocator.free(clients.slot_storage);
-            allocator.free(clients.bucket_storage);
-            allocator.free(clients.client_storage);
+            std.debug.assert(allocator.ptr == clients.allocator.ptr);
+            for (clients.records.items) |record| std.debug.assert(record == null);
+            clients.records.deinit(allocator);
             clients.object_pool.deinit(allocator);
             clients.* = undefined;
         }
@@ -1230,10 +1198,23 @@ pub fn SharedClients(comptime protocol: type) type {
             const peer = try clients.reactor.admit(accepted, actor_config);
             errdefer clients.reactor.destroyPeer(peer) catch unreachable;
             const slot: usize = peer.slot;
-            std.debug.assert(clients.slot_storage[slot].generation == 0);
-            clients.client_storage[slot] = try objects.SharedServerObjects.initReserved(
+            if (slot >= clients.records.items.len) {
+                const previous_len = clients.records.items.len;
+                try clients.records.resize(clients.allocator, slot + 1);
+                @memset(clients.records.items[previous_len..], null);
+            }
+            std.debug.assert(clients.records.items[slot] == null);
+            const record = try clients.allocator.create(ClientRecord);
+            errdefer clients.allocator.destroy(record);
+            const buckets = try clients.allocator.alloc(
+                objects.SharedObjectBucket,
+                clients.buckets_per_client,
+            );
+            errdefer clients.allocator.free(buckets);
+            @memset(buckets, .{});
+            var server_objects = try objects.SharedServerObjects.init(
                 &clients.object_pool,
-                clients.buckets(slot),
+                buckets,
                 peer.generation,
                 clients.object_quota,
                 &ProtocolCore.Display.info,
@@ -1241,14 +1222,16 @@ pub fn SharedClients(comptime protocol: type) type {
             );
             var objects_live = true;
             errdefer if (objects_live) {
-                clients.client_storage[slot].deinit();
-                clients.object_pool.restoreReservation();
+                server_objects.deinit();
             };
             try clients.reactor.prepareReceive(peer);
-            clients.slot_storage[slot] = .{
-                .generation = peer.generation,
+            record.* = .{
+                .peer = peer,
                 .credentials = identity,
+                .objects = server_objects,
+                .buckets = buckets,
             };
+            clients.records.items[slot] = record;
             objects_live = false;
             return peer;
         }
@@ -1259,14 +1242,16 @@ pub fn SharedClients(comptime protocol: type) type {
         ) !*objects.SharedServerObjects {
             _ = try clients.reactor.getActor(peer);
             const slot: usize = peer.slot;
-            if (clients.slot_storage[slot].generation != peer.generation)
+            if (slot >= clients.records.items.len) return error.StaleHandle;
+            const record = clients.records.items[slot] orelse return error.StaleHandle;
+            if (record.peer.generation != peer.generation)
                 return error.StaleHandle;
-            return &clients.client_storage[slot];
+            return &record.objects;
         }
 
         pub fn getCredentials(clients: *Self, peer: io_uring.Peer) !Credentials {
             _ = try clients.get(peer);
-            return clients.slot_storage[peer.slot].credentials;
+            return clients.records.items[peer.slot].?.credentials;
         }
 
         pub fn iterator(clients: *const Self) Iterator {
@@ -1279,21 +1264,18 @@ pub fn SharedClients(comptime protocol: type) type {
             return clients.reactor.prepareClose(peer);
         }
 
-        /// Releases all client objects in O(1), restores its admission reserve,
-        /// closes the socket, and recycles the reactor slot.
+        /// Releases the client's bounded namespace, closes the socket, and
+        /// recycles the reactor slot.
         pub fn destroy(clients: *Self, peer: io_uring.Peer) !void {
             const actor = try clients.reactor.getActor(peer);
             if (!actor.canDeinit()) return error.ActorBusy;
-            const server_objects = try clients.get(peer);
-            server_objects.deinit();
-            clients.slot_storage[peer.slot].generation = 0;
-            clients.object_pool.restoreReservation();
+            _ = try clients.get(peer);
+            const record = clients.records.items[peer.slot].?;
+            record.objects.deinit();
+            clients.allocator.free(record.buckets);
+            clients.records.items[peer.slot] = null;
+            clients.allocator.destroy(record);
             clients.reactor.destroyPeer(peer) catch unreachable;
-        }
-
-        fn buckets(clients: *Self, slot: usize) []objects.SharedObjectBucket {
-            const start = slot * clients.buckets_per_client;
-            return clients.bucket_storage[start..][0..clients.buckets_per_client];
         }
     };
 }
@@ -1358,8 +1340,9 @@ const RegistrySubscriptions = struct {
         node: u32,
     };
 
-    nodes: []Node,
-    slots: []Slot,
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayListUnmanaged(Node) = .empty,
+    slots: std.ArrayListUnmanaged(Slot) = .empty,
     free_head: u32,
     available_count: usize,
     initial_count: usize = 0,
@@ -1368,33 +1351,24 @@ const RegistrySubscriptions = struct {
 
     fn init(
         allocator: std.mem.Allocator,
-        max_connections: usize,
         capacity: usize,
     ) !RegistrySubscriptions {
-        if (max_connections == 0 or capacity == 0 or capacity > end)
-            return error.InvalidConfig;
-        const nodes = try allocator.alloc(Node, capacity);
-        errdefer allocator.free(nodes);
-        for (nodes, 0..) |*node, index| {
-            node.next = if (index + 1 < nodes.len) @intCast(index + 1) else end;
-        }
-        const slots = try allocator.alloc(Slot, max_connections);
-        errdefer allocator.free(slots);
-        @memset(slots, .{});
-        return .{
-            .nodes = nodes,
-            .slots = slots,
-            .free_head = 0,
-            .available_count = capacity,
+        if (capacity == 0 or capacity > end) return error.InvalidConfig;
+        var subscriptions: RegistrySubscriptions = .{
+            .allocator = allocator,
+            .free_head = end,
+            .available_count = 0,
         };
+        try subscriptions.nodes.ensureTotalCapacity(allocator, capacity);
+        return subscriptions;
     }
 
     fn deinit(subscriptions: *RegistrySubscriptions, allocator: std.mem.Allocator) void {
-        std.debug.assert(subscriptions.available_count == subscriptions.nodes.len);
+        std.debug.assert(subscriptions.available_count == subscriptions.nodes.items.len);
         std.debug.assert(subscriptions.initial_count == 0);
-        for (subscriptions.slots) |slot| std.debug.assert(slot.generation == 0);
-        allocator.free(subscriptions.slots);
-        allocator.free(subscriptions.nodes);
+        for (subscriptions.slots.items) |slot| std.debug.assert(slot.generation == 0);
+        subscriptions.slots.deinit(allocator);
+        subscriptions.nodes.deinit(allocator);
         subscriptions.* = undefined;
     }
 
@@ -1404,23 +1378,35 @@ const RegistrySubscriptions = struct {
         registry: objects.Handle,
         initial: ?GlobalCursor,
     ) !void {
-        const slot = &subscriptions.slots[peer.slot];
+        if (peer.slot >= subscriptions.slots.items.len) {
+            const previous_len = subscriptions.slots.items.len;
+            try subscriptions.slots.resize(subscriptions.allocator, peer.slot + 1);
+            @memset(subscriptions.slots.items[previous_len..], .{});
+        }
+        const slot = &subscriptions.slots.items[peer.slot];
         if (slot.generation == 0) slot.generation = peer.generation;
         if (slot.generation != peer.generation) return error.StaleHandle;
         var current = slot.head;
-        while (current != end) : (current = subscriptions.nodes[current].next) {
-            const existing = subscriptions.nodes[current].handle;
+        while (current != end) : (current = subscriptions.nodes.items[current].next) {
+            const existing = subscriptions.nodes.items[current].handle;
             if (existing.id == registry.id and existing.generation == registry.generation)
                 return error.DuplicateId;
         }
-        if (subscriptions.free_head == end) return error.Full;
-        const index = subscriptions.free_head;
-        subscriptions.free_head = subscriptions.nodes[index].next;
-        subscriptions.available_count -= 1;
+        const index = if (subscriptions.free_head == end) index: {
+            if (subscriptions.nodes.items.len >= end) return error.Full;
+            const appended: u32 = @intCast(subscriptions.nodes.items.len);
+            try subscriptions.nodes.append(subscriptions.allocator, .{});
+            break :index appended;
+        } else index: {
+            const recycled = subscriptions.free_head;
+            subscriptions.free_head = subscriptions.nodes.items[recycled].next;
+            subscriptions.available_count -= 1;
+            break :index recycled;
+        };
         const sequence = subscriptions.next_sequence;
         subscriptions.next_sequence +%= 1;
         if (subscriptions.next_sequence == 0) subscriptions.next_sequence = 1;
-        subscriptions.nodes[index] = .{
+        subscriptions.nodes.items[index] = .{
             .handle = registry,
             .sequence = sequence,
             .initial = initial,
@@ -1428,7 +1414,7 @@ const RegistrySubscriptions = struct {
         if (slot.tail == end)
             slot.head = index
         else
-            subscriptions.nodes[slot.tail].next = index;
+            subscriptions.nodes.items[slot.tail].next = index;
         slot.tail = index;
         slot.count += 1;
         if (initial != null) {
@@ -1439,10 +1425,11 @@ const RegistrySubscriptions = struct {
     }
 
     fn removePeer(subscriptions: *RegistrySubscriptions, peer: io_uring.Peer) void {
-        const slot = &subscriptions.slots[peer.slot];
+        if (peer.slot >= subscriptions.slots.items.len) return;
+        const slot = &subscriptions.slots.items[peer.slot];
         if (slot.generation != peer.generation) return;
         if (slot.head != end) {
-            subscriptions.nodes[slot.tail].next = subscriptions.free_head;
+            subscriptions.nodes.items[slot.tail].next = subscriptions.free_head;
             subscriptions.free_head = slot.head;
             subscriptions.available_count += @intCast(slot.count);
             subscriptions.initial_count -= @intCast(slot.initial_count);
@@ -1452,8 +1439,8 @@ const RegistrySubscriptions = struct {
 
     fn nextInitial(subscriptions: *RegistrySubscriptions) ?Candidate {
         const update = &subscriptions.initial_update;
-        while (update.slot_index < subscriptions.slots.len) {
-            const slot = &subscriptions.slots[update.slot_index];
+        while (update.slot_index < subscriptions.slots.items.len) {
+            const slot = &subscriptions.slots.items[update.slot_index];
             if (!update.slot_started) {
                 update.slot_started = true;
                 update.slot_generation = slot.generation;
@@ -1468,7 +1455,7 @@ const RegistrySubscriptions = struct {
                 continue;
             }
             const index = update.node;
-            const node = &subscriptions.nodes[index];
+            const node = &subscriptions.nodes.items[index];
             if (node.initial == null) {
                 update.node = node.next;
                 continue;
@@ -1487,10 +1474,10 @@ const RegistrySubscriptions = struct {
     }
 
     fn completeInitial(subscriptions: *RegistrySubscriptions, candidate: Candidate) void {
-        const node = &subscriptions.nodes[candidate.node];
+        const node = &subscriptions.nodes.items[candidate.node];
         std.debug.assert(node.initial != null);
         node.initial = null;
-        const slot = &subscriptions.slots[candidate.peer.slot];
+        const slot = &subscriptions.slots.items[candidate.peer.slot];
         slot.initial_count -= 1;
         subscriptions.initial_count -= 1;
         subscriptions.initial_update.node = node.next;
@@ -1524,8 +1511,8 @@ const RegistrySubscriptions = struct {
         subscriptions: *RegistrySubscriptions,
         update: *Update,
     ) ?Candidate {
-        while (update.slot_index < subscriptions.slots.len) {
-            const slot = &subscriptions.slots[update.slot_index];
+        while (update.slot_index < subscriptions.slots.items.len) {
+            const slot = &subscriptions.slots.items[update.slot_index];
             if (!update.slot_started) {
                 update.slot_started = true;
                 update.slot_generation = slot.generation;
@@ -1540,7 +1527,7 @@ const RegistrySubscriptions = struct {
                 continue;
             }
             const index = update.node;
-            const node = &subscriptions.nodes[index];
+            const node = &subscriptions.nodes.items[index];
             if (node.sequence > update.sequence_limit) {
                 update.node = node.next;
                 continue;
@@ -1559,7 +1546,7 @@ const RegistrySubscriptions = struct {
 
     fn advance(subscriptions: RegistrySubscriptions, update: *Update, node: u32) void {
         std.debug.assert(update.node == node);
-        update.node = subscriptions.nodes[node].next;
+        update.node = subscriptions.nodes.items[node].next;
     }
 };
 
@@ -1588,10 +1575,13 @@ pub fn Runtime(comptime protocol: type) type {
 
         pub const Config = struct {
             actor: io_uring.ActorConfig,
+            /// Initial shared object-node reserve. The pool grows on demand;
+            /// `object_quota` remains the hard per-client bound.
             object_capacity: usize,
             object_quota: usize,
             buckets_per_client: usize,
             max_globals: usize,
+            /// Initial registry-subscription reserve, not a client limit.
             registry_capacity: usize,
             /// Applied to initial listings, later add/remove events, and binds.
             global_filter: ?GlobalFilter = null,
@@ -1618,7 +1608,6 @@ pub fn Runtime(comptime protocol: type) type {
             errdefer globals.deinit(allocator);
             var registries = try RegistrySubscriptions.init(
                 allocator,
-                reactor.actor_storage.len,
                 config.registry_capacity,
             );
             errdefer registries.deinit(allocator);
@@ -1886,7 +1875,7 @@ pub fn Runtime(comptime protocol: type) type {
                     runtime.registries.completeInitial(candidate);
                     continue;
                 }
-                const cursor = &runtime.registries.nodes[candidate.node].initial.?;
+                const cursor = &runtime.registries.nodes.items[candidate.node].initial.?;
                 var sent = false;
                 while (!sent) {
                     if (cursor.pending == null)
@@ -1958,8 +1947,9 @@ pub fn Driver(comptime protocol: type) type {
             next: u32 = queue_none,
         };
 
+        allocator: std.mem.Allocator,
         runtime: *ServerRuntime,
-        pending_storage: []Pending,
+        pending_storage: std.ArrayListUnmanaged(Pending) = .empty,
         pending_head: u32 = queue_end,
         pending_tail: u32 = queue_end,
         display_context: ?*anyopaque,
@@ -1994,11 +1984,9 @@ pub fn Driver(comptime protocol: type) type {
             runtime: *ServerRuntime,
             display_context: ?*anyopaque,
         ) !Self {
-            const storage = try allocator.alloc(Pending, runtime.clients.reactor.actor_storage.len);
-            @memset(storage, .{});
             return .{
+                .allocator = allocator,
                 .runtime = runtime,
-                .pending_storage = storage,
                 .display_context = display_context,
             };
         }
@@ -2006,7 +1994,7 @@ pub fn Driver(comptime protocol: type) type {
         pub fn deinit(driver: *Self, allocator: std.mem.Allocator) void {
             std.debug.assert(driver.pending_head == queue_end);
             std.debug.assert(driver.pending_tail == queue_end);
-            allocator.free(driver.pending_storage);
+            driver.pending_storage.deinit(allocator);
             driver.* = undefined;
         }
 
@@ -2014,7 +2002,12 @@ pub fn Driver(comptime protocol: type) type {
         /// during the next batch. Repeated scheduling occupies one FIFO node.
         pub fn schedule(driver: *Self, peer: io_uring.Peer) !bool {
             _ = try driver.runtime.clients.get(peer);
-            const node = &driver.pending_storage[peer.slot];
+            if (peer.slot >= driver.pending_storage.items.len) {
+                const previous_len = driver.pending_storage.items.len;
+                try driver.pending_storage.resize(driver.allocator, peer.slot + 1);
+                @memset(driver.pending_storage.items[previous_len..], .{});
+            }
+            const node = &driver.pending_storage.items[peer.slot];
             if (node.next != queue_none) {
                 if (node.generation != peer.generation) return error.StaleHandle;
                 return false;
@@ -2023,7 +2016,7 @@ pub fn Driver(comptime protocol: type) type {
             if (driver.pending_tail == queue_end) {
                 driver.pending_head = peer.slot;
             } else {
-                driver.pending_storage[driver.pending_tail].next = peer.slot;
+                driver.pending_storage.items[driver.pending_tail].next = peer.slot;
             }
             driver.pending_tail = peer.slot;
             return true;
@@ -2091,7 +2084,7 @@ pub fn Driver(comptime protocol: type) type {
                 };
             while (driver.pending_head != queue_end) {
                 const slot = driver.pending_head;
-                const node = &driver.pending_storage[slot];
+                const node = &driver.pending_storage.items[slot];
                 const peer: io_uring.Peer = .{
                     .slot = @intCast(slot),
                     .generation = node.generation,
@@ -2219,7 +2212,7 @@ pub fn Driver(comptime protocol: type) type {
 
         fn popPending(driver: *Self) void {
             const slot = driver.pending_head;
-            const node = &driver.pending_storage[slot];
+            const node = &driver.pending_storage.items[slot];
             driver.pending_head = node.next;
             if (driver.pending_head == queue_end) driver.pending_tail = queue_end;
             node.* = .{};

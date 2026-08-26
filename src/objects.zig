@@ -503,7 +503,8 @@ const SharedObjectNode = struct {
 /// Physical object entries shared by every server-side connection on a
 /// reactor. Per-connection namespaces enforce logical quotas independently.
 pub const SharedObjectPool = struct {
-    nodes: []SharedObjectNode,
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayListUnmanaged(*SharedObjectNode) = .empty,
     free_head: u32,
     available_count: usize,
     reserved_count: usize = 0,
@@ -512,14 +513,27 @@ pub const SharedObjectPool = struct {
     pub fn init(allocator: std.mem.Allocator, capacity: usize) Error!SharedObjectPool {
         const server_id_space = @as(usize, std.math.maxInt(u32)) - server_id_start + 1;
         if (capacity == 0 or capacity > server_id_space) return error.InvalidConfig;
-        const nodes = try allocator.alloc(SharedObjectNode, capacity);
-        for (nodes, 0..) |*node, index| {
-            node.owner_next = if (index + 1 < nodes.len)
+        var nodes: std.ArrayListUnmanaged(*SharedObjectNode) = .empty;
+        try nodes.ensureTotalCapacity(allocator, capacity);
+        errdefer {
+            for (nodes.items) |node| allocator.destroy(node);
+            nodes.deinit(allocator);
+        }
+        for (0..capacity) |_| {
+            const node = try allocator.create(SharedObjectNode);
+            nodes.append(allocator, node) catch |err| {
+                allocator.destroy(node);
+                return err;
+            };
+        }
+        for (nodes.items, 0..) |*node, index| {
+            node.*.owner_next = if (index + 1 < nodes.items.len)
                 @intCast(index + 1)
             else
                 shared_end;
         }
         return .{
+            .allocator = allocator,
             .nodes = nodes,
             .free_head = 0,
             .available_count = capacity,
@@ -527,8 +541,9 @@ pub const SharedObjectPool = struct {
     }
 
     pub fn deinit(pool: *SharedObjectPool, allocator: std.mem.Allocator) void {
-        std.debug.assert(pool.available_count == pool.nodes.len);
-        allocator.free(pool.nodes);
+        std.debug.assert(pool.available_count == pool.nodes.items.len);
+        for (pool.nodes.items) |node| allocator.destroy(node);
+        pool.nodes.deinit(allocator);
         pool.* = undefined;
     }
 
@@ -547,7 +562,14 @@ pub const SharedObjectPool = struct {
     }
 
     fn acquire(pool: *SharedObjectPool) Error!u32 {
-        if (pool.available_count == pool.reserved_count) return error.Full;
+        if (pool.available_count == pool.reserved_count) {
+            if (pool.nodes.items.len >= shared_end) return error.Full;
+            const index: u32 = @intCast(pool.nodes.items.len);
+            const node = try pool.allocator.create(SharedObjectNode);
+            errdefer pool.allocator.destroy(node);
+            try pool.nodes.append(pool.allocator, node);
+            return index;
+        }
         return pool.acquirePhysical();
     }
 
@@ -563,20 +585,20 @@ pub const SharedObjectPool = struct {
     fn acquirePhysical(pool: *SharedObjectPool) Error!u32 {
         if (pool.free_head == shared_end) return error.Full;
         const index = pool.free_head;
-        pool.free_head = pool.nodes[index].owner_next;
+        pool.free_head = pool.nodes.items[index].owner_next;
         pool.available_count -= 1;
         return index;
     }
 
     fn release(pool: *SharedObjectPool, index: u32) void {
-        pool.nodes[index].owner_next = pool.free_head;
+        pool.nodes.items[index].owner_next = pool.free_head;
         pool.free_head = index;
         pool.available_count += 1;
     }
 
     fn releaseChain(pool: *SharedObjectPool, head: u32, tail: u32, count: usize) void {
         if (head == shared_end) return;
-        pool.nodes[tail].owner_next = pool.free_head;
+        pool.nodes.items[tail].owner_next = pool.free_head;
         pool.free_head = head;
         pool.available_count += count;
     }
@@ -604,7 +626,7 @@ pub const SharedNamespace = struct {
 
         pub fn next(self: *Iterator) ?Entry {
             if (self.current == shared_end) return null;
-            const node = &self.namespace.pool.nodes[self.current];
+            const node = self.namespace.pool.nodes.items[self.current];
             self.current = node.owner_next;
             return .{
                 .handle = .{ .id = node.id, .generation = node.generation },
@@ -630,7 +652,7 @@ pub const SharedNamespace = struct {
         quota: usize,
     ) Error!SharedNamespace {
         if (buckets.len < 2 or !std.math.isPowerOfTwo(buckets.len) or
-            connection_generation == 0 or quota == 0 or quota > pool.nodes.len)
+            connection_generation == 0 or quota == 0)
             return error.InvalidConfig;
         return .{
             .pool = pool,
@@ -734,25 +756,25 @@ pub const SharedNamespace = struct {
 
     pub fn get(namespace: *SharedNamespace, id: u32) ?*Object {
         const location = namespace.find(id) orelse return null;
-        return &namespace.pool.nodes[location.index].object;
+        return &namespace.pool.nodes.items[location.index].object;
     }
 
     pub fn resolve(namespace: *SharedNamespace, handle: Handle) ?*Object {
         const location = namespace.find(handle.id) orelse return null;
-        const node = &namespace.pool.nodes[location.index];
+        const node = namespace.pool.nodes.items[location.index];
         if (node.generation != handle.generation) return null;
         return &node.object;
     }
 
     pub fn lookupHandle(namespace: *SharedNamespace, id: u32) ?Handle {
         const location = namespace.find(id) orelse return null;
-        const node = &namespace.pool.nodes[location.index];
+        const node = namespace.pool.nodes.items[location.index];
         return .{ .id = id, .generation = node.generation };
     }
 
     pub fn remove(namespace: *SharedNamespace, handle: Handle) ?Object {
         const location = namespace.findUncached(handle.id) orelse return null;
-        const node = &namespace.pool.nodes[location.index];
+        const node = namespace.pool.nodes.items[location.index];
         if (node.generation != handle.generation) return null;
         const object = node.object;
         if (namespace.cached_index == location.index) {
@@ -763,15 +785,15 @@ pub const SharedNamespace = struct {
         if (location.previous == shared_end)
             namespace.activeBucket(handle.id).head = node.bucket_next
         else
-            namespace.pool.nodes[location.previous].bucket_next = node.bucket_next;
+            namespace.pool.nodes.items[location.previous].bucket_next = node.bucket_next;
         if (node.owner_previous == shared_end)
             namespace.owner_head = node.owner_next
         else
-            namespace.pool.nodes[node.owner_previous].owner_next = node.owner_next;
+            namespace.pool.nodes.items[node.owner_previous].owner_next = node.owner_next;
         if (node.owner_next == shared_end)
             namespace.owner_tail = node.owner_previous
         else
-            namespace.pool.nodes[node.owner_next].owner_previous = node.owner_previous;
+            namespace.pool.nodes.items[node.owner_next].owner_previous = node.owner_previous;
         namespace.count -= 1;
         namespace.pool.release(location.index);
         return object;
@@ -802,7 +824,7 @@ pub const SharedNamespace = struct {
         var previous: u32 = shared_end;
         var current = bucket.head;
         while (current != shared_end) {
-            const node = &namespace.pool.nodes[current];
+            const node = namespace.pool.nodes.items[current];
             if (node.id == id) return .{ .index = current, .previous = previous };
             previous = current;
             current = node.bucket_next;
@@ -820,7 +842,7 @@ pub const SharedNamespace = struct {
     ) Handle {
         const bucket = namespace.activeBucket(id);
         const generation = namespace.pool.takeGeneration();
-        namespace.pool.nodes[index] = .{
+        namespace.pool.nodes.items[index].* = .{
             .object = .{
                 .interface = interface,
                 .version = version,
@@ -836,7 +858,7 @@ pub const SharedNamespace = struct {
         if (namespace.owner_tail == shared_end)
             namespace.owner_head = index
         else
-            namespace.pool.nodes[namespace.owner_tail].owner_next = index;
+            namespace.pool.nodes.items[namespace.owner_tail].owner_next = index;
         namespace.owner_tail = index;
         namespace.count += 1;
         return .{ .id = id, .generation = generation };
@@ -1536,6 +1558,43 @@ test "server namespaces share physical objects with isolated quotas" {
     try std.testing.expect(second.namespace.resolve(second_child) != null);
     _ = try second.removeClient(second_child);
     try std.testing.expect(second.namespace.resolve(colliding) != null);
+}
+
+test "shared object pool grows without relocating live objects" {
+    const display_info: metadata.Interface = .{
+        .name = "wl_display",
+        .version = 1,
+        .requests = &.{},
+        .events = &.{},
+    };
+    var pool = try SharedObjectPool.init(std.testing.allocator, 1);
+    defer pool.deinit(std.testing.allocator);
+    var first_buckets = [_]SharedObjectBucket{.{}} ** 2;
+    var first = try SharedServerObjects.init(
+        &pool,
+        &first_buckets,
+        1,
+        1,
+        &display_info,
+        null,
+    );
+    defer first.deinit();
+    const first_display = first.namespace.get(display_id).?;
+
+    var second_buckets = [_]SharedObjectBucket{.{}} ** 2;
+    var second = try SharedServerObjects.init(
+        &pool,
+        &second_buckets,
+        1,
+        1,
+        &display_info,
+        null,
+    );
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 2), pool.nodes.items.len);
+    try std.testing.expect(first_display == first.namespace.get(display_id).?);
+    try std.testing.expect(first.namespace.lookupHandle(display_id).?.generation !=
+        second.namespace.lookupHandle(display_id).?.generation);
 }
 
 fn initAndDeinit(allocator: std.mem.Allocator, capacity: usize) !void {

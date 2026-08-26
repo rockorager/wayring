@@ -9,7 +9,6 @@ const pools = @import("pool.zig");
 const reactor = @import("reactor.zig");
 
 pub const Config = struct {
-    max_connections: usize,
     buffer_group_id: u16 = 1,
     receive_buffer_size: u32,
     receive_buffer_count: u16,
@@ -146,25 +145,29 @@ pub const SendState = struct {
     }
 };
 
+const ConnectionRecord = struct {
+    actor: connection.Actor,
+    deferred_receive: DeferredReceive = .{},
+    receiver: Receiver,
+    fd: linux.fd_t,
+    sender: SendState,
+    send_descriptor_storage: []linux.fd_t,
+    send_control_storage: []align(@alignOf(linux.cmsghdr)) u8,
+};
+
 /// Owns all reactor-wide kernel and userspace storage. Connections borrow from
 /// these pools and perform no allocator calls during message processing.
 pub const Reactor = struct {
+    allocator: std.mem.Allocator,
     ring: *linux.IoUring,
     owned_ring: linux.IoUring,
     owns_ring: bool,
     receive_buffers: linux.IoUring.BufferGroup,
-    slot_storage: []reactor.Slot,
-    slots: reactor.Slots,
-    actor_storage: []connection.Actor,
-    deferred_receive_storage: []DeferredReceive,
+    slots: reactor.Slots = .{},
+    records: std.ArrayListUnmanaged(?*ConnectionRecord) = .empty,
     deferred_receive_head: u32,
     deferred_receive_tail: u32,
     receive_rearm_pending: bool,
-    receiver_storage: []Receiver,
-    fd_storage: []linux.fd_t,
-    sender_storage: []SendState,
-    send_descriptor_storage: []linux.fd_t,
-    send_control_storage: []align(@alignOf(linux.cmsghdr)) u8,
     send_descriptor_capacity: usize,
     send_control_stride: usize,
     fragment_blocks: pools.SharedBlocks,
@@ -210,6 +213,7 @@ pub const Reactor = struct {
         allocator: std.mem.Allocator,
         config: Config,
     ) !void {
+        owner.allocator = allocator;
         owner.receive_buffers = try initReceiveBufferGroup(
             owner.ring,
             allocator,
@@ -218,59 +222,15 @@ pub const Reactor = struct {
             config.receive_buffer_count,
         );
         errdefer owner.receive_buffers.deinit(allocator);
-        owner.slot_storage = try allocator.alloc(reactor.Slot, config.max_connections);
-        errdefer allocator.free(owner.slot_storage);
-        owner.slots = reactor.Slots.init(owner.slot_storage);
-        owner.actor_storage = try allocator.alloc(connection.Actor, config.max_connections);
-        errdefer allocator.free(owner.actor_storage);
-        owner.deferred_receive_storage = try allocator.alloc(
-            DeferredReceive,
-            config.max_connections,
-        );
-        errdefer allocator.free(owner.deferred_receive_storage);
-        @memset(owner.deferred_receive_storage, .{});
+        owner.slots = .{};
+        owner.records = .empty;
         owner.deferred_receive_head = deferred_end;
         owner.deferred_receive_tail = deferred_end;
         owner.receive_rearm_pending = false;
-        owner.receiver_storage = try allocator.alloc(Receiver, config.max_connections);
-        errdefer allocator.free(owner.receiver_storage);
-        owner.fd_storage = try allocator.alloc(linux.fd_t, config.max_connections);
-        errdefer allocator.free(owner.fd_storage);
-        owner.sender_storage = try allocator.alloc(SendState, config.max_connections);
-        errdefer allocator.free(owner.sender_storage);
-        const send_descriptor_count = std.math.mul(
-            usize,
-            config.max_connections,
-            config.send_descriptor_capacity,
-        ) catch return error.CapacityOverflow;
-        owner.send_descriptor_storage = try allocator.alloc(
-            linux.fd_t,
-            send_descriptor_count,
-        );
-        errdefer allocator.free(owner.send_descriptor_storage);
         owner.send_control_stride = try ancillary.rightsControlSize(
             config.send_descriptor_capacity,
         );
-        const send_control_size = std.math.mul(
-            usize,
-            config.max_connections,
-            owner.send_control_stride,
-        ) catch return error.CapacityOverflow;
-        owner.send_control_storage = try allocator.alignedAlloc(
-            u8,
-            .of(linux.cmsghdr),
-            send_control_size,
-        );
-        errdefer allocator.free(owner.send_control_storage);
         owner.send_descriptor_capacity = config.send_descriptor_capacity;
-        for (owner.sender_storage, 0..) |*sender, index| {
-            const descriptor_start = index * owner.send_descriptor_capacity;
-            const control_start = index * owner.send_control_stride;
-            sender.* = .{
-                .descriptor_scratch = owner.send_descriptor_storage[descriptor_start..][0..owner.send_descriptor_capacity],
-                .control_storage = owner.send_control_storage[control_start..][0..owner.send_control_stride],
-            };
-        }
         owner.fragment_blocks = try pools.SharedBlocks.init(
             allocator,
             config.fragment_block_size,
@@ -295,20 +255,15 @@ pub const Reactor = struct {
         owner.descriptors.deinit(allocator);
         owner.transmit_blocks.deinit(allocator);
         owner.fragment_blocks.deinit(allocator);
-        allocator.free(owner.send_control_storage);
-        allocator.free(owner.send_descriptor_storage);
-        allocator.free(owner.sender_storage);
-        allocator.free(owner.fd_storage);
-        allocator.free(owner.receiver_storage);
-        allocator.free(owner.deferred_receive_storage);
-        allocator.free(owner.actor_storage);
-        allocator.free(owner.slot_storage);
+        for (owner.records.items) |record| std.debug.assert(record == null);
+        owner.records.deinit(allocator);
+        owner.slots.deinit(allocator);
         owner.receive_buffers.deinit(allocator);
         if (owner.owns_ring) owner.ring.deinit();
         owner.* = undefined;
     }
 
-    /// Consumes `fd`, including when connection capacity is exhausted.
+    /// Consumes `fd`, including when connection admission allocation fails.
     pub fn attach(
         owner: *Reactor,
         socket_fd: linux.fd_t,
@@ -318,27 +273,68 @@ pub const Reactor = struct {
             _ = linux.close(socket_fd);
             return error.SendDescriptorCapacityExceeded;
         }
-        const acquired = owner.slots.acquire() catch |err| {
+        const acquired = owner.slots.acquire(owner.allocator) catch |err| {
             _ = linux.close(socket_fd);
             return err;
         };
+        errdefer owner.slots.deactivate(acquired.index, acquired.generation) catch unreachable;
         const index: usize = acquired.index;
-        owner.actor_storage[index] = connection.Actor.initSharedFragments(
-            acquired.index,
-            acquired.generation,
-            &owner.fragment_blocks,
-            &owner.descriptors,
-            config.received_fd_budget,
-            &owner.transmit_blocks,
-            config.transmit_byte_budget,
-            config.transmit_fd_budget,
-        );
-        owner.receiver_storage[index] = Receiver.init(
-            &owner.receive_buffers,
-            owner.buffer_group_id,
-            owner.receive_control_capacity,
-        );
-        owner.fd_storage[index] = socket_fd;
+        if (index >= owner.records.items.len) {
+            const previous_len = owner.records.items.len;
+            owner.records.resize(owner.allocator, index + 1) catch |err| {
+                _ = linux.close(socket_fd);
+                return err;
+            };
+            @memset(owner.records.items[previous_len..], null);
+        }
+        std.debug.assert(owner.records.items[index] == null);
+        const record = owner.allocator.create(ConnectionRecord) catch |err| {
+            _ = linux.close(socket_fd);
+            return err;
+        };
+        errdefer owner.allocator.destroy(record);
+        const descriptor_storage = owner.allocator.alloc(
+            linux.fd_t,
+            owner.send_descriptor_capacity,
+        ) catch |err| {
+            _ = linux.close(socket_fd);
+            return err;
+        };
+        errdefer owner.allocator.free(descriptor_storage);
+        const control_storage = owner.allocator.alignedAlloc(
+            u8,
+            .of(linux.cmsghdr),
+            owner.send_control_stride,
+        ) catch |err| {
+            _ = linux.close(socket_fd);
+            return err;
+        };
+        errdefer owner.allocator.free(control_storage);
+        record.* = .{
+            .actor = connection.Actor.initSharedFragments(
+                acquired.index,
+                acquired.generation,
+                &owner.fragment_blocks,
+                &owner.descriptors,
+                config.received_fd_budget,
+                &owner.transmit_blocks,
+                config.transmit_byte_budget,
+                config.transmit_fd_budget,
+            ),
+            .receiver = Receiver.init(
+                &owner.receive_buffers,
+                owner.buffer_group_id,
+                owner.receive_control_capacity,
+            ),
+            .fd = socket_fd,
+            .sender = .{
+                .descriptor_scratch = descriptor_storage,
+                .control_storage = control_storage,
+            },
+            .send_descriptor_storage = descriptor_storage,
+            .send_control_storage = control_storage,
+        };
+        owner.records.items[index] = record;
         return .{ .slot = acquired.index, .generation = acquired.generation };
     }
 
@@ -375,17 +371,15 @@ pub const Reactor = struct {
     }
 
     pub inline fn prepareReceive(owner: *Reactor, peer: Peer) !void {
-        const actor = try owner.getActor(peer);
-        const receiver = &owner.receiver_storage[peer.slot];
-        try receiver.prepare(owner.ring, owner.fd_storage[peer.slot], actor);
+        const record = try owner.getRecord(peer);
+        try record.receiver.prepare(owner.ring, record.fd, &record.actor);
     }
 
     /// Prepares against `peer.slot` in a file table already registered by the
     /// caller on this ring. The reactor does not own registered-file lifetime.
     pub inline fn prepareReceiveFixed(owner: *Reactor, peer: Peer) !void {
-        const actor = try owner.getActor(peer);
-        const receiver = &owner.receiver_storage[peer.slot];
-        try receiver.prepareFixed(owner.ring, peer.slot, actor);
+        const record = try owner.getRecord(peer);
+        try record.receiver.prepareFixed(owner.ring, peer.slot, &record.actor);
     }
 
     pub inline fn armReceive(owner: *Reactor, peer: Peer) !void {
@@ -399,7 +393,7 @@ pub const Reactor = struct {
         const actor = try owner.getActor(peer);
         if (actor.lifecycle != .open) return error.Closing;
         if (actor.receive_active) return error.ReceiveAlreadyActive;
-        const node = &owner.deferred_receive_storage[peer.slot];
+        const node = &(try owner.getRecord(peer)).deferred_receive;
         if (node.next != deferred_none) {
             if (node.generation != peer.generation) return error.StaleHandle;
             return false;
@@ -412,7 +406,7 @@ pub const Reactor = struct {
         if (owner.deferred_receive_tail == deferred_end) {
             owner.deferred_receive_head = peer.slot;
         } else {
-            owner.deferred_receive_storage[owner.deferred_receive_tail].next = peer.slot;
+            owner.recordAt(owner.deferred_receive_tail).deferred_receive.next = peer.slot;
         }
         owner.deferred_receive_tail = peer.slot;
         return true;
@@ -453,7 +447,7 @@ pub const Reactor = struct {
         var prepared: usize = 0;
         while (owner.deferred_receive_head != deferred_end) {
             const slot = owner.deferred_receive_head;
-            const node = &owner.deferred_receive_storage[slot];
+            const node = &owner.recordAt(slot).deferred_receive;
             const peer: Peer = .{ .slot = @intCast(slot), .generation = node.generation };
             const actor = owner.getActor(peer) catch {
                 owner.removeDeferredReceive(slot);
@@ -500,7 +494,7 @@ pub const Reactor = struct {
         }
         const submission = try owner.ring.get_sqe();
         submission.prep_cancel_fd(
-            owner.fd_storage[peer.slot],
+            (try owner.getRecord(peer)).fd,
             linux.IORING_ASYNC_CANCEL_ALL,
         );
         submission.user_data = actor.cancelToken();
@@ -516,50 +510,46 @@ pub const Reactor = struct {
     /// Releases an idle peer and closes its socket. Active receive or send
     /// operations must first complete their asynchronous teardown.
     pub fn destroyPeer(owner: *Reactor, peer: Peer) !void {
-        const peer_actor = try owner.getActor(peer);
-        if (!peer_actor.canDeinit()) return error.ActorBusy;
-        const deferred = &owner.deferred_receive_storage[peer.slot];
+        const record = try owner.getRecord(peer);
+        if (!record.actor.canDeinit()) return error.ActorBusy;
+        const deferred = &record.deferred_receive;
         if (deferred.next != deferred_none and deferred.generation == peer.generation)
             owner.removeDeferredReceive(peer.slot);
         try owner.slots.deactivate(peer.slot, peer.generation);
-        peer_actor.deinit();
-        _ = linux.close(owner.fd_storage[peer.slot]);
+        record.actor.deinit();
+        _ = linux.close(record.fd);
+        owner.allocator.free(record.send_control_storage);
+        owner.allocator.free(record.send_descriptor_storage);
+        owner.records.items[peer.slot] = null;
+        owner.allocator.destroy(record);
     }
 
     pub fn getActor(owner: *Reactor, peer: Peer) !*connection.Actor {
-        _ = try owner.slots.token(peer.slot, peer.generation, .receive);
-        return &owner.actor_storage[peer.slot];
+        return &(try owner.getRecord(peer)).actor;
     }
 
     pub fn getReceiver(owner: *Reactor, peer: Peer) !*Receiver {
-        _ = try owner.slots.token(peer.slot, peer.generation, .receive);
-        return &owner.receiver_storage[peer.slot];
+        return &(try owner.getRecord(peer)).receiver;
     }
 
     pub fn getFd(owner: *Reactor, peer: Peer) !linux.fd_t {
-        _ = try owner.slots.token(peer.slot, peer.generation, .receive);
-        return owner.fd_storage[peer.slot];
+        return (try owner.getRecord(peer)).fd;
     }
 
     pub fn getSender(owner: *Reactor, peer: Peer) !*SendState {
-        _ = try owner.slots.token(peer.slot, peer.generation, .send);
-        return &owner.sender_storage[peer.slot];
+        return &(try owner.getRecord(peer)).sender;
     }
 
     pub inline fn prepareSend(owner: *Reactor, peer: Peer) !void {
-        const actor = try owner.getActor(peer);
-        try owner.sender_storage[peer.slot].prepare(
-            owner.ring,
-            owner.fd_storage[peer.slot],
-            actor,
-        );
+        const record = try owner.getRecord(peer);
+        try record.sender.prepare(owner.ring, record.fd, &record.actor);
     }
 
     /// Prepares against `peer.slot` in a file table already registered by the
     /// caller on this ring. The reactor does not own registered-file lifetime.
     pub inline fn prepareSendFixed(owner: *Reactor, peer: Peer) !void {
-        const actor = try owner.getActor(peer);
-        try owner.sender_storage[peer.slot].prepareFixed(owner.ring, peer.slot, actor);
+        const record = try owner.getRecord(peer);
+        try record.sender.prepareFixed(owner.ring, peer.slot, &record.actor);
     }
 
     pub inline fn armSend(owner: *Reactor, peer: Peer) !void {
@@ -570,7 +560,7 @@ pub const Reactor = struct {
     pub inline fn routedPeer(owner: *const Reactor, routed: reactor.Routed) Peer {
         return .{
             .slot = routed.slot,
-            .generation = owner.actor_storage[routed.slot].generation,
+            .generation = owner.recordAt(routed.slot).actor.generation,
         };
     }
 
@@ -602,27 +592,34 @@ pub const Reactor = struct {
     }
 
     fn removeDeferredReceive(owner: *Reactor, slot: u32) void {
-        const node = &owner.deferred_receive_storage[slot];
+        const node = &owner.recordAt(slot).deferred_receive;
         std.debug.assert(node.next != deferred_none);
         if (node.previous == deferred_end) {
             owner.deferred_receive_head = node.next;
         } else {
-            owner.deferred_receive_storage[node.previous].next = node.next;
+            owner.recordAt(node.previous).deferred_receive.next = node.next;
         }
         if (node.next == deferred_end) {
             owner.deferred_receive_tail = node.previous;
         } else {
-            owner.deferred_receive_storage[node.next].previous = node.previous;
+            owner.recordAt(node.next).deferred_receive.previous = node.previous;
         }
         node.* = .{};
+    }
+
+    fn getRecord(owner: *Reactor, peer: Peer) !*ConnectionRecord {
+        _ = try owner.slots.token(peer.slot, peer.generation, .receive);
+        return owner.records.items[peer.slot] orelse unreachable;
+    }
+
+    fn recordAt(owner: *const Reactor, slot: u32) *ConnectionRecord {
+        return owner.records.items[slot] orelse unreachable;
     }
 
     fn validConfig(config: Config) bool {
         const receive_overhead = @sizeOf(linux.io_uring_recvmsg_out) +
             @import("wire.zig").header_len;
-        return config.max_connections > 0 and
-            config.max_connections <= @as(usize, std.math.maxInt(u24)) + 1 and
-            config.receive_buffer_size > 0 and
+        return config.receive_buffer_size > 0 and
             config.receive_buffer_size >= receive_overhead and
             config.receive_control_capacity <= config.receive_buffer_size - receive_overhead and
             config.receive_buffer_count > 0 and
@@ -642,7 +639,6 @@ pub const Reactor = struct {
 test "reactor rejects invalid shared storage before creating a ring" {
     var owner: Reactor = undefined;
     const config: Config = .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 3,
         .receive_control_capacity = 256,
@@ -676,7 +672,6 @@ test "borrowed reactor unregisters resources without closing caller ring" {
 
     var owner: Reactor = undefined;
     try owner.initBorrowed(allocator, &ring, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 256,
@@ -706,7 +701,6 @@ test "SQE preparation failures preserve ring and operation state" {
     const allocator = std.testing.allocator;
     var owner: Reactor = undefined;
     try owner.initOwned(allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 64,
@@ -826,11 +820,10 @@ test "SQE preparation failures preserve ring and operation state" {
     );
 }
 
-test "reactor admits peers and closes descriptors rejected by capacity" {
+test "reactor admits dynamically allocated peers" {
     const allocator = std.testing.allocator;
     var owner: Reactor = undefined;
     try owner.initOwned(allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 256,
@@ -945,14 +938,12 @@ test "reactor admits peers and closes descriptors rejected by capacity" {
         &second_pair,
     )));
     defer _ = linux.close(second_pair[1]);
-    try std.testing.expectError(error.Exhausted, owner.admit(
+    const second_peer = try owner.admit(
         .{ .fd = second_pair[0], .more = true },
         actor_config,
-    ));
-    try std.testing.expectEqual(
-        linux.E.BADF,
-        linux.errno(linux.fcntl(second_pair[0], linux.F.GETFD, 0)),
     );
+    try std.testing.expectEqual(@as(u24, 1), second_peer.slot);
+    try owner.destroyPeer(second_peer);
 
     try owner.destroyPeer(peer);
     peer_live = false;
@@ -967,7 +958,6 @@ test "selected recvmsg detects stream EOF behind its metadata prefix" {
     const allocator = std.testing.allocator;
     var owner: Reactor = undefined;
     try owner.initOwned(allocator, .{ .entries = 8 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
         .receive_control_capacity = 256,
@@ -1218,10 +1208,10 @@ test "listener waits for both sides of cancellation" {
 }
 
 test "reactor routes listener tokens before colliding connection slots" {
-    var slot_storage: [1]reactor.Slot = undefined;
     var owner: Reactor = undefined;
-    owner.slots = reactor.Slots.init(&slot_storage);
-    const acquired = try owner.slots.acquire();
+    owner.slots = .{};
+    defer owner.slots.deinit(std.testing.allocator);
+    const acquired = try owner.slots.acquire(std.testing.allocator);
     const listener: Listener = .{
         .generation = acquired.generation,
         .accept_tag = Listener.token(acquired.generation, .accept),
@@ -1263,6 +1253,7 @@ test "reactor routes listener tokens before colliding connection slots" {
         linux.E.BADF,
         linux.errno(linux.fcntl(sockets[0], linux.F.GETFD, 0)),
     );
+    try owner.slots.deactivate(acquired.index, acquired.generation);
 }
 
 test "listener accepts a real nonblocking close-on-exec socket" {
