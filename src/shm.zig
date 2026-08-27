@@ -451,46 +451,67 @@ pub const Store = struct {
         return pool.mapping[pin_node.metadata.offset..pin_node.metadata.end()];
     }
 
-    pub const Access = struct {
-        store: *Store,
-        pin: Pin,
-        pool: *PoolNode,
-        guarded: bool,
-        active: bool = true,
-        bytes: []const u8,
+    fn AccessType(comptime writable: bool) type {
+        return struct {
+            const Self = @This();
 
-        /// Ends access and invalidates `bytes`. If backing truncation faulted
-        /// during the guarded scope, the mapping has already been replaced by
-        /// zero pages and this reports the client-owned backing as invalid.
-        pub fn end(self: *Access) StoreError!void {
-            if (!self.active) return error.StalePin;
-            _ = try self.store.resolvePin(self.pin.token);
-            if (self.guarded) {
-                std.debug.assert(
-                    active_pool_address.load(.acquire) == @intFromPtr(self.pool) and
-                        access_depth > 0,
-                );
-                access_depth -= 1;
-                if (access_depth == 0) {
-                    _ = active_pool_address.swap(0, .seq_cst);
-                    if (backing_faulted.swap(false, .seq_cst)) {
-                        self.pool.invalid_backing = true;
-                        self.active = false;
-                        self.bytes = &.{};
-                        return error.InvalidBacking;
+            store: *Store,
+            pin: Pin,
+            pool: *PoolNode,
+            guarded: bool,
+            active: bool = true,
+            bytes: if (writable) []u8 else []const u8,
+
+            /// Ends access and invalidates `bytes`. If backing truncation faulted
+            /// during the guarded scope, the mapping has already been replaced by
+            /// zero pages and this reports the client-owned backing as invalid.
+            pub fn end(self: *Self) StoreError!void {
+                if (!self.active) return error.StalePin;
+                _ = try self.store.resolvePin(self.pin.token);
+                if (self.guarded) {
+                    std.debug.assert(
+                        active_pool_address.load(.acquire) == @intFromPtr(self.pool) and
+                            access_depth > 0,
+                    );
+                    access_depth -= 1;
+                    if (access_depth == 0) {
+                        _ = active_pool_address.swap(0, .seq_cst);
+                        if (backing_faulted.swap(false, .seq_cst)) {
+                            self.pool.invalid_backing = true;
+                            self.active = false;
+                            self.bytes = &.{};
+                            return error.InvalidBacking;
+                        }
                     }
                 }
+                self.active = false;
+                self.bytes = &.{};
             }
-            self.active = false;
-            self.bytes = &.{};
-        }
-    };
+        };
+    }
+
+    pub const Access = AccessType(false);
+    pub const WriteAccess = AccessType(true);
 
     /// Begins scoped direct access to a pinned buffer. Ordinary unsealed pools
     /// are protected against concurrent truncation by a process-wide SIGBUS
     /// guard; shrink-sealed pools need no signal scope. Nested access on one
     /// thread is allowed only for the same pool.
     pub fn access(store: *Store, pin_value: Pin) StoreError!Access {
+        return store.beginAccess(pin_value, false);
+    }
+
+    /// Begins scoped writable access to a pinned destination buffer. This has
+    /// the same truncation guard and same-pool nesting rules as read access.
+    pub fn writeAccess(store: *Store, pin_value: Pin) StoreError!WriteAccess {
+        return store.beginAccess(pin_value, true);
+    }
+
+    fn beginAccess(
+        store: *Store,
+        pin_value: Pin,
+        comptime writable: bool,
+    ) StoreError!AccessType(writable) {
         const pin_node = try store.resolvePin(pin_value.token);
         const pool = try store.resolvePool(pin_node.pool);
         if (pool.invalid_backing) return error.InvalidBacking;
@@ -852,6 +873,56 @@ test "pins retain destroyed unsealed pools without exposing raw bytes" {
     try std.testing.expectError(error.StalePin, store.unpin(retained));
 }
 
+test "writable access mutates sealed and guarded mappings without leaking ownership" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .max_pool_bytes = 4096 },
+        2,
+        2,
+    );
+    defer store.deinit(std.testing.allocator);
+    const format: Format = .{ .value = 0, .bytes_per_pixel = 4 };
+
+    const sealed_pool = try store.addPool(try testMemfd(4096, true), 4096);
+    const sealed_buffer = try store.addBuffer(sealed_pool, format, 0, 1, 1, 4);
+    const sealed_pin = try store.pin(sealed_buffer);
+    var sealed_write = try store.writeAccess(sealed_pin);
+    sealed_write.bytes[0..4].* = .{ 1, 2, 3, 4 };
+    try sealed_write.end();
+    var sealed_read = try store.access(sealed_pin);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, sealed_read.bytes);
+    try sealed_read.end();
+
+    const guarded_pool = try store.addPool(try testMemfd(4096, false), 4096);
+    const guarded_buffer = try store.addBuffer(guarded_pool, format, 0, 1, 1, 4);
+    const guarded_pin = try store.pin(guarded_buffer);
+    var guarded_write = try store.writeAccess(guarded_pin);
+    guarded_write.bytes[0..4].* = .{ 5, 6, 7, 8 };
+    var nested_read = try store.access(guarded_pin);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, nested_read.bytes);
+    try nested_read.end();
+    try guarded_write.end();
+
+    try std.testing.expectEqual(@as(usize, 0), access_depth);
+    try std.testing.expectEqual(@as(usize, 0), active_pool_address.load(.acquire));
+    try std.testing.expect(!backing_faulted.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), store.active_pins);
+    try std.testing.expectEqual(@as(usize, 1), (try store.poolInfo(sealed_pool)).pin_count);
+    try std.testing.expectEqual(@as(usize, 1), (try store.poolInfo(guarded_pool)).pin_count);
+
+    try store.unpin(guarded_pin);
+    try std.testing.expectError(error.StalePin, store.writeAccess(guarded_pin));
+    try std.testing.expectEqual(@as(usize, 1), store.active_pins);
+    try std.testing.expectEqual(@as(usize, 0), (try store.poolInfo(guarded_pool)).pin_count);
+    try store.unpin(sealed_pin);
+    try std.testing.expectEqual(@as(usize, 0), store.active_pins);
+
+    try store.destroyBuffer(guarded_buffer);
+    try store.destroyPoolResource(guarded_pool);
+    try store.destroyBuffer(sealed_buffer);
+    try store.destroyPoolResource(sealed_pool);
+}
+
 test "guarded access converts unsealed backing truncation into an error" {
     var store = try Store.init(
         std.testing.allocator,
@@ -881,12 +952,16 @@ test "guarded access converts unsealed backing truncation into an error" {
     try std.testing.expectEqualSlices(u8, &payload, readable.bytes[0..payload.len]);
     try readable.end();
 
-    var truncated = try store.access(pin_value);
+    var truncated = try store.writeAccess(pin_value);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 0)));
-    const first: *const volatile u8 = @ptrCast(truncated.bytes.ptr);
-    try std.testing.expectEqual(@as(u8, 0), first.*);
+    const first: *volatile u8 = @ptrCast(truncated.bytes.ptr);
+    first.* = 9;
+    try std.testing.expectEqual(@as(u8, 9), first.*);
     try std.testing.expectError(error.InvalidBacking, truncated.end());
     try std.testing.expectError(error.InvalidBacking, store.access(pin_value));
+    try std.testing.expectError(error.InvalidBacking, store.writeAccess(pin_value));
+    try std.testing.expectEqual(@as(usize, 0), access_depth);
+    try std.testing.expectEqual(@as(usize, 0), active_pool_address.load(.acquire));
 
     try store.unpin(pin_value);
     try store.destroyBuffer(buffer);
