@@ -1435,17 +1435,78 @@ const RegistrySubscriptions = struct {
         }
     }
 
-    fn removePeer(subscriptions: *RegistrySubscriptions, peer: io_uring.Peer) void {
+    fn removePeer(
+        subscriptions: *RegistrySubscriptions,
+        peer: io_uring.Peer,
+        update: ?*Update,
+    ) void {
         if (peer.slot >= subscriptions.slots.items.len) return;
         const slot = &subscriptions.slots.items[peer.slot];
         if (slot.generation != peer.generation) return;
-        if (slot.head != end) {
-            subscriptions.nodes.items[slot.tail].next = subscriptions.free_head;
-            subscriptions.free_head = slot.head;
-            subscriptions.available_count += @intCast(slot.count);
-            subscriptions.initial_count -= @intCast(slot.initial_count);
+        while (slot.head != end) subscriptions.removeNode(peer, end, slot.head, update);
+    }
+
+    fn remove(
+        subscriptions: *RegistrySubscriptions,
+        peer: io_uring.Peer,
+        registry: objects.Handle,
+        update: ?*Update,
+    ) !void {
+        if (peer.slot >= subscriptions.slots.items.len or
+            subscriptions.slots.items[peer.slot].generation != peer.generation)
+            return error.StaleHandle;
+        const slot = &subscriptions.slots.items[peer.slot];
+        var previous: u32 = end;
+        var current = slot.head;
+        while (current != end) : (current = subscriptions.nodes.items[current].next) {
+            const handle = subscriptions.nodes.items[current].handle;
+            if (handle.id == registry.id and handle.generation == registry.generation) {
+                subscriptions.removeNode(peer, previous, current, update);
+                return;
+            }
+            previous = current;
         }
-        slot.* = .{};
+        return error.StaleHandle;
+    }
+
+    /// Unlinks before recycling so resumable cursors can never observe a node
+    /// after its storage has been returned to the free list.
+    fn removeNode(
+        subscriptions: *RegistrySubscriptions,
+        peer: io_uring.Peer,
+        previous: u32,
+        current: u32,
+        update: ?*Update,
+    ) void {
+        const slot = &subscriptions.slots.items[peer.slot];
+        const node = &subscriptions.nodes.items[current];
+        const next_node = node.next;
+        if (subscriptions.initial_update.slot_started and
+            subscriptions.initial_update.slot_index == peer.slot and
+            subscriptions.initial_update.slot_generation == peer.generation and
+            subscriptions.initial_update.node == current)
+            subscriptions.initial_update.node = next_node;
+        if (update) |active| {
+            if (active.slot_started and
+                active.slot_index == peer.slot and
+                active.slot_generation == peer.generation and
+                active.node == current)
+                active.node = next_node;
+        }
+        if (node.initial != null) {
+            slot.initial_count -= 1;
+            subscriptions.initial_count -= 1;
+        }
+        if (previous == end)
+            slot.head = next_node
+        else
+            subscriptions.nodes.items[previous].next = next_node;
+        if (slot.tail == current) slot.tail = previous;
+        slot.count -= 1;
+        if (slot.count == 0) slot.* = .{};
+        node.next = subscriptions.free_head;
+        subscriptions.free_head = current;
+        subscriptions.available_count += 1;
     }
 
     fn nextInitial(subscriptions: *RegistrySubscriptions) ?Candidate {
@@ -1790,6 +1851,34 @@ pub fn Runtime(comptime protocol: type) type {
             server_objects.setRemovalHook(hook);
         }
 
+        /// Removes one live wl_registry subscription and resource. Capacity is
+        /// preflighted before the subscription is unlinked, after which
+        /// wl_display.delete_id and the normal object removal hook are applied
+        /// without an intervening fallible operation.
+        pub fn removeRegistry(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            registry: objects.Handle,
+        ) !objects.Object {
+            const server_objects = try runtime.clients.get(peer);
+            const object = server_objects.namespace.resolve(registry) orelse
+                return error.StaleHandle;
+            if (object.interface != &ProtocolCore.Registry.info)
+                return error.WrongInterface;
+            const actor = try runtime.clients.reactor.getActor(peer);
+            const delete_id_size = try ProtocolCore.Display.eventSize(.{
+                .delete_id = .{ .id = registry.id },
+            });
+            try actor.transmit.ensureCapacity(delete_id_size, 0);
+            const active_update = if (runtime.global_update) |*update| update else null;
+            try runtime.registries.remove(peer, registry, active_update);
+            return ProtocolCore.deleteClient(
+                server_objects,
+                &actor.transmit,
+                registry,
+            ) catch unreachable;
+        }
+
         /// Removes a global immediately and snapshots existing registries for
         /// resumable global_remove publication.
         pub fn removeGlobal(runtime: *Self, handle: objects.Handle) !void {
@@ -1920,8 +2009,12 @@ pub fn Runtime(comptime protocol: type) type {
 
         /// Releases registry subscriptions and then the fully quiesced client.
         pub fn destroyClient(runtime: *Self, peer: io_uring.Peer) !void {
-            try runtime.clients.destroy(peer);
-            runtime.registries.removePeer(peer);
+            const actor = try runtime.clients.reactor.getActor(peer);
+            if (!actor.canDeinit()) return error.ActorBusy;
+            _ = try runtime.clients.get(peer);
+            const active_update = if (runtime.global_update) |*update| update else null;
+            runtime.registries.removePeer(peer, active_update);
+            runtime.clients.destroy(peer) catch unreachable;
         }
 
         pub inline fn prepareEndpointClose(runtime: *Self) !bool {
@@ -2245,4 +2338,52 @@ pub fn Driver(comptime protocol: type) type {
             };
         }
     };
+}
+
+test "registry removal retires active cursors and reuses capacity generation-safely" {
+    const allocator = std.testing.allocator;
+    var subscriptions = try RegistrySubscriptions.init(allocator, 1);
+    defer subscriptions.deinit(allocator);
+
+    const first_peer: io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    const next_peer: io_uring.Peer = .{ .slot = 0, .generation = 2 };
+    const other_peer: io_uring.Peer = .{ .slot = 1, .generation = 1 };
+    const first: objects.Handle = .{ .id = 2, .generation = 11 };
+    const second: objects.Handle = .{ .id = 3, .generation = 12 };
+    const replacement: objects.Handle = .{ .id = 2, .generation = 13 };
+
+    try subscriptions.add(first_peer, first, @as(GlobalCursor, undefined));
+    const initial = subscriptions.nextInitial().?;
+    try std.testing.expectEqual(first, initial.registry);
+    try subscriptions.remove(first_peer, first, null);
+    try std.testing.expectEqual(@as(usize, 0), subscriptions.initial_count);
+    try std.testing.expectEqual(@as(?RegistrySubscriptions.Candidate, null), subscriptions.nextInitial());
+    try std.testing.expectEqual(@as(usize, 1), subscriptions.available_count);
+
+    // The same physical node is safe to reuse after the initial cursor was on it.
+    try subscriptions.add(first_peer, second, null);
+    try std.testing.expectEqual(@as(usize, 1), subscriptions.nodes.items.len);
+    var update = subscriptions.updateAdded(.{ .id = 1, .generation = 1 }, undefined);
+    const current = subscriptions.next(&update).?;
+    try std.testing.expectEqual(second, current.registry);
+    try subscriptions.remove(first_peer, second, &update);
+    try subscriptions.add(first_peer, first, null);
+    try std.testing.expectEqual(@as(?RegistrySubscriptions.Candidate, null), subscriptions.next(&update));
+    try subscriptions.remove(first_peer, first, null);
+
+    try subscriptions.add(next_peer, replacement, null);
+    try std.testing.expectError(
+        error.StaleHandle,
+        subscriptions.remove(first_peer, replacement, null),
+    );
+    try std.testing.expectError(
+        error.StaleHandle,
+        subscriptions.remove(other_peer, replacement, null),
+    );
+    try std.testing.expectError(
+        error.StaleHandle,
+        subscriptions.remove(next_peer, first, null),
+    );
+    try std.testing.expectEqual(@as(u32, 1), subscriptions.slots.items[0].count);
+    try subscriptions.remove(next_peer, replacement, null);
 }

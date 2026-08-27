@@ -1260,6 +1260,68 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         try runtime.publishNext(),
     );
 
+    try std.testing.expectError(
+        error.WrongInterface,
+        runtime.removeRegistry(accepted_peers[1], second_bound),
+    );
+    try std.testing.expectError(
+        error.StaleHandle,
+        runtime.removeRegistry(accepted_peers[1], late_registry),
+    );
+    try std.testing.expectError(error.StaleHandle, runtime.removeRegistry(
+        accepted_peers[0],
+        .{ .id = late_registry.id, .generation = late_registry.generation + 1 },
+    ));
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(late_registry) != null,
+    );
+    try first_actor.transmit.enqueue(&full, &.{});
+    try std.testing.expectError(
+        error.ByteBudgetExceeded,
+        runtime.removeRegistry(accepted_peers[0], late_registry),
+    );
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(late_registry) != null,
+    );
+    try consume(&first_actor.transmit);
+    _ = try runtime.removeRegistry(accepted_peers[0], late_registry);
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(late_registry) == null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), removal_states[0].total);
+    const first_delete = try Core.Display.decodeEvent(
+        try firstMessage(&first_actor.transmit),
+        &first_actor.received_fds,
+    );
+    try std.testing.expectEqual(late_registry.id, switch (first_delete) {
+        .delete_id => |value| value.id,
+        else => unreachable,
+    });
+    try consume(&first_actor.transmit);
+
+    // The removed subscription node and object capacity are both reusable.
+    _ = try (try runtime.clients.get(accepted_peers[1])).removeClient(second_bound);
+    const replacement_registry = switch (try runtime.decodeDisplayRequest(
+        accepted_peers[1],
+        (try wayring.wire.Message.decode(&get_registry_bytes)).?,
+        &(try reactor.getActor(accepted_peers[1])).received_fds,
+        null,
+    )) {
+        .get_registry => |value| value,
+        else => unreachable,
+    };
+    _ = try runtime.removeRegistry(accepted_peers[1], replacement_registry);
+    const replacement_actor = try reactor.getActor(accepted_peers[1]);
+    const replacement_delete = try Core.Display.decodeEvent(
+        try firstMessage(&replacement_actor.transmit),
+        &replacement_actor.received_fds,
+    );
+    try std.testing.expectEqual(replacement_registry.id, switch (replacement_delete) {
+        .delete_id => |value| value.id,
+        else => unreachable,
+    });
+    try consume(&replacement_actor.transmit);
+
     _ = try runtime.prepareEndpointClose();
     for (accepted_peers) |peer| _ = try runtime.clients.prepareClose(peer);
     _ = try reactor.ring.submit();
@@ -1287,7 +1349,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     for (accepted_peers) |peer| try runtime.destroyClient(peer);
     try std.testing.expectEqual(@as(usize, 4), removal_states[0].total);
     try std.testing.expectEqual(@as(usize, 1), removal_states[0].resources);
-    try std.testing.expectEqual(@as(usize, 3), removal_states[1].total);
+    try std.testing.expectEqual(@as(usize, 4), removal_states[1].total);
     try std.testing.expectEqual(@as(usize, 1), removal_states[1].resources);
     try runtime.deinit(std.testing.allocator);
     try std.testing.expectEqual(
