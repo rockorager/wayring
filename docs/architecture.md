@@ -371,6 +371,11 @@ do not retain per-registry iteration state. Global-table mutation remains
 serialized until all live initial listings finish, keeping their iterators valid
 and ensuring older globals are queued before later changes. Disconnect releases
 pending listings with the subscription chain in O(1).
+Runtime-owned `wl_display.sync` barriers snapshot the calling peer's registry
+sequence. Their `done` and `delete_id` events are published only after every
+earlier initial listing for that peer. Both the barrier and callback ownership
+survive TX backpressure, so a roundtrip cannot observe `done` ahead of the
+globals requested before it.
 Adding or removing a global snapshots the subscriptions that existed at that
 point into one runtime-owned resumable publication cursor. A second mutation is
 rejected until the first completes, preserving registry event order. Publication

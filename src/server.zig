@@ -1620,6 +1620,159 @@ const RegistrySubscriptions = struct {
         std.debug.assert(update.node == node);
         update.node = subscriptions.nodes.items[node].next;
     }
+
+    fn sequenceLimit(subscriptions: RegistrySubscriptions) u64 {
+        return subscriptions.next_sequence -% 1;
+    }
+
+    fn initialPendingThrough(
+        subscriptions: RegistrySubscriptions,
+        peer: io_uring.Peer,
+        sequence_limit: u64,
+    ) bool {
+        if (peer.slot >= subscriptions.slots.items.len) return false;
+        const slot = subscriptions.slots.items[peer.slot];
+        if (slot.generation != peer.generation) return false;
+        var current = slot.head;
+        while (current != end) : (current = subscriptions.nodes.items[current].next) {
+            const node = subscriptions.nodes.items[current];
+            if (node.sequence > sequence_limit) break;
+            if (node.initial != null) return true;
+        }
+        return false;
+    }
+};
+
+const SyncBarriers = struct {
+    const end = std.math.maxInt(u32);
+
+    const Node = struct {
+        callback: objects.Handle = undefined,
+        callback_data: u32 = 0,
+        sequence_limit: u64 = 0,
+        next: u32 = end,
+    };
+
+    const Slot = struct {
+        generation: u32 = 0,
+        head: u32 = end,
+        tail: u32 = end,
+    };
+
+    const Candidate = struct {
+        peer: io_uring.Peer,
+        node: u32,
+        callback: objects.Handle,
+        callback_data: u32,
+    };
+
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayListUnmanaged(Node) = .empty,
+    slots: std.ArrayListUnmanaged(Slot) = .empty,
+    free_head: u32 = end,
+    available_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) !SyncBarriers {
+        if (capacity == 0 or capacity > end) return error.InvalidConfig;
+        var barriers: SyncBarriers = .{ .allocator = allocator };
+        try barriers.nodes.ensureTotalCapacity(allocator, capacity);
+        return barriers;
+    }
+
+    fn deinit(barriers: *SyncBarriers, allocator: std.mem.Allocator) void {
+        std.debug.assert(barriers.available_count == barriers.nodes.items.len);
+        for (barriers.slots.items) |slot| std.debug.assert(slot.generation == 0);
+        barriers.slots.deinit(allocator);
+        barriers.nodes.deinit(allocator);
+        barriers.* = undefined;
+    }
+
+    fn add(
+        barriers: *SyncBarriers,
+        peer: io_uring.Peer,
+        callback: objects.Handle,
+        callback_data: u32,
+        sequence_limit: u64,
+    ) !void {
+        if (peer.slot >= barriers.slots.items.len) {
+            const previous_len = barriers.slots.items.len;
+            try barriers.slots.resize(barriers.allocator, peer.slot + 1);
+            @memset(barriers.slots.items[previous_len..], .{});
+        }
+        const slot = &barriers.slots.items[peer.slot];
+        if (slot.generation == 0) slot.generation = peer.generation;
+        if (slot.generation != peer.generation) return error.StaleHandle;
+        const index = if (barriers.free_head == end) index: {
+            if (barriers.nodes.items.len >= end) return error.Full;
+            const appended: u32 = @intCast(barriers.nodes.items.len);
+            try barriers.nodes.append(barriers.allocator, .{});
+            break :index appended;
+        } else index: {
+            const recycled = barriers.free_head;
+            barriers.free_head = barriers.nodes.items[recycled].next;
+            barriers.available_count -= 1;
+            break :index recycled;
+        };
+        barriers.nodes.items[index] = .{
+            .callback = callback,
+            .callback_data = callback_data,
+            .sequence_limit = sequence_limit,
+        };
+        if (slot.tail == end)
+            slot.head = index
+        else
+            barriers.nodes.items[slot.tail].next = index;
+        slot.tail = index;
+    }
+
+    fn nextReady(
+        barriers: SyncBarriers,
+        registries: RegistrySubscriptions,
+    ) ?Candidate {
+        for (barriers.slots.items, 0..) |slot, slot_index| {
+            if (slot.generation == 0 or slot.head == end) continue;
+            const node = barriers.nodes.items[slot.head];
+            const peer: io_uring.Peer = .{
+                .slot = @intCast(slot_index),
+                .generation = slot.generation,
+            };
+            if (registries.initialPendingThrough(peer, node.sequence_limit)) continue;
+            return .{
+                .peer = peer,
+                .node = slot.head,
+                .callback = node.callback,
+                .callback_data = node.callback_data,
+            };
+        }
+        return null;
+    }
+
+    fn complete(barriers: *SyncBarriers, candidate: Candidate) void {
+        const slot = &barriers.slots.items[candidate.peer.slot];
+        std.debug.assert(slot.generation == candidate.peer.generation);
+        std.debug.assert(slot.head == candidate.node);
+        const node = &barriers.nodes.items[candidate.node];
+        slot.head = node.next;
+        if (slot.head == end) slot.tail = end;
+        node.* = .{ .next = barriers.free_head };
+        barriers.free_head = candidate.node;
+        barriers.available_count += 1;
+    }
+
+    fn removePeer(barriers: *SyncBarriers, peer: io_uring.Peer) void {
+        if (peer.slot >= barriers.slots.items.len) return;
+        const slot = &barriers.slots.items[peer.slot];
+        if (slot.generation != peer.generation) return;
+        var current = slot.head;
+        while (current != end) {
+            const next = barriers.nodes.items[current].next;
+            barriers.nodes.items[current] = .{ .next = barriers.free_head };
+            barriers.free_head = current;
+            barriers.available_count += 1;
+            current = next;
+        }
+        slot.* = .{};
+    }
 };
 
 /// Owns the server's cold-path listener, global table, and shared per-client
@@ -1635,6 +1788,7 @@ pub fn Runtime(comptime protocol: type) type {
         clients: Clients,
         globals: Globals,
         registries: RegistrySubscriptions,
+        sync_barriers: SyncBarriers,
         global_update: ?RegistrySubscriptions.Update = null,
         actor_config: io_uring.ActorConfig,
         global_filter: ?GlobalFilter,
@@ -1683,11 +1837,17 @@ pub fn Runtime(comptime protocol: type) type {
                 config.registry_capacity,
             );
             errdefer registries.deinit(allocator);
+            var sync_barriers = try SyncBarriers.init(
+                allocator,
+                config.registry_capacity,
+            );
+            errdefer sync_barriers.deinit(allocator);
             return .{
                 .endpoint = endpoint,
                 .clients = clients,
                 .globals = globals,
                 .registries = registries,
+                .sync_barriers = sync_barriers,
                 .actor_config = config.actor,
                 .global_filter = config.global_filter,
             };
@@ -1851,6 +2011,28 @@ pub fn Runtime(comptime protocol: type) type {
             server_objects.setRemovalHook(hook);
         }
 
+        /// Defers a wl_display.sync completion behind every initial registry
+        /// entry created by earlier requests on the same connection. The
+        /// callback remains runtime-owned across transmit backpressure.
+        pub fn completeSync(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            callback: objects.Handle,
+            callback_data: u32,
+        ) !void {
+            const server_objects = try runtime.clients.get(peer);
+            const object = server_objects.namespace.resolve(callback) orelse
+                return error.StaleHandle;
+            if (object.interface != &ProtocolCore.Callback.info)
+                return error.WrongInterface;
+            try runtime.sync_barriers.add(
+                peer,
+                callback,
+                callback_data,
+                runtime.registries.sequenceLimit(),
+            );
+        }
+
         /// Removes one live wl_registry subscription and resource. Capacity is
         /// preflighted before the subscription is unlinked, after which
         /// wl_display.delete_id and the normal object removal hook are applied
@@ -1954,6 +2136,8 @@ pub fn Runtime(comptime protocol: type) type {
                 runtime.global_update = null;
             }
 
+            if (try runtime.publishReadySync()) |result| return result;
+
             while (runtime.registries.nextInitial()) |candidate| {
                 const actor = runtime.clients.reactor.getActor(candidate.peer) catch {
                     runtime.registries.completeInitial(candidate);
@@ -2000,11 +2184,45 @@ pub fn Runtime(comptime protocol: type) type {
                 }
                 if (!sent) {
                     runtime.registries.completeInitial(candidate);
+                    if (try runtime.publishReadySync()) |result| return result;
                     continue;
                 }
                 return .{ .sent = candidate.peer };
             }
             return .complete;
+        }
+
+        fn publishReadySync(runtime: *Self) !?PublishResult {
+            while (runtime.sync_barriers.nextReady(runtime.registries)) |candidate| {
+                const actor = runtime.clients.reactor.getActor(candidate.peer) catch {
+                    runtime.sync_barriers.complete(candidate);
+                    continue;
+                };
+                if (!actor.canDispatch()) {
+                    runtime.sync_barriers.complete(candidate);
+                    continue;
+                }
+                const server_objects = runtime.clients.get(candidate.peer) catch {
+                    runtime.sync_barriers.complete(candidate);
+                    continue;
+                };
+                if (server_objects.namespace.resolve(candidate.callback) == null) {
+                    runtime.sync_barriers.complete(candidate);
+                    continue;
+                }
+                ProtocolCore.completeSync(
+                    server_objects,
+                    &actor.transmit,
+                    candidate.callback,
+                    candidate.callback_data,
+                ) catch |err| switch (err) {
+                    error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
+                    else => return err,
+                };
+                runtime.sync_barriers.complete(candidate);
+                return .{ .sent = candidate.peer };
+            }
+            return null;
         }
 
         /// Releases registry subscriptions and then the fully quiesced client.
@@ -2014,6 +2232,7 @@ pub fn Runtime(comptime protocol: type) type {
             _ = try runtime.clients.get(peer);
             const active_update = if (runtime.global_update) |*update| update else null;
             runtime.registries.removePeer(peer, active_update);
+            runtime.sync_barriers.removePeer(peer);
             runtime.clients.destroy(peer) catch unreachable;
         }
 
@@ -2025,6 +2244,7 @@ pub fn Runtime(comptime protocol: type) type {
             if (!runtime.endpoint.listener.canDeinit()) return error.ListenerBusy;
             var peers = runtime.clients.iterator();
             if (peers.next() != null) return error.ClientsActive;
+            runtime.sync_barriers.deinit(allocator);
             runtime.registries.deinit(allocator);
             runtime.globals.deinit(allocator);
             runtime.clients.deinit(allocator);

@@ -1028,6 +1028,29 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     const second_bound = try runtime.bindGlobal(accepted_peers[1], first_binding);
     try std.testing.expectEqual(@as(u32, 4), second_bound.id);
 
+    var sync_bytes: [12]u8 = undefined;
+    try (wayring.wire.Header{
+        .object_id = wayring.objects.display_id,
+        .opcode = 0,
+        .size = sync_bytes.len,
+    }).encode(sync_bytes[0..wayring.wire.header_len]);
+    std.mem.writeInt(
+        u32,
+        sync_bytes[wayring.wire.header_len..],
+        5,
+        @import("builtin").cpu.arch.endian(),
+    );
+    const first_sync = switch (try runtime.decodeDisplayRequest(
+        accepted_peers[0],
+        (try wayring.wire.Message.decode(&sync_bytes)).?,
+        &(try reactor.getActor(accepted_peers[0])).received_fds,
+        null,
+    )) {
+        .sync => |value| value,
+        else => unreachable,
+    };
+    try runtime.completeSync(accepted_peers[0], first_sync, 91);
+
     const full = [_]u8{0} ** 64;
     try (try reactor.getActor(accepted_peers[0])).transmit.enqueue(&full, &.{});
     try std.testing.expectError(
@@ -1057,6 +1080,31 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     }
     try std.testing.expect(saw_public);
     try std.testing.expect(saw_restricted);
+
+    try (try reactor.getActor(accepted_peers[0])).transmit.enqueue(&full, &.{});
+    try std.testing.expectEqual(
+        accepted_peers[0],
+        (try runtime.publishNext()).blocked,
+    );
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(first_sync) != null,
+    );
+    try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
+    try std.testing.expectEqual(accepted_peers[0], (try runtime.publishNext()).sent);
+    const first_sync_message = try firstMessage(&(try reactor.getActor(accepted_peers[0])).transmit);
+    try std.testing.expectEqual(first_sync.id, first_sync_message.header.object_id);
+    const first_sync_done = try Core.Callback.decodeEvent(
+        first_sync_message,
+        &(try reactor.getActor(accepted_peers[0])).received_fds,
+    );
+    try std.testing.expectEqual(@as(u32, 91), switch (first_sync_done) {
+        .done => |value| value.callback_data,
+    });
+    try std.testing.expect(
+        (try runtime.clients.get(accepted_peers[0])).namespace.resolve(first_sync) == null,
+    );
+    try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
+
     try std.testing.expectEqual(accepted_peers[1], (try runtime.publishNext()).sent);
     const second_initial_actor = try reactor.getActor(accepted_peers[1]);
     const second_initial = try Core.Registry.decodeEvent(
@@ -1288,7 +1336,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
     try std.testing.expect(
         (try runtime.clients.get(accepted_peers[0])).namespace.resolve(late_registry) == null,
     );
-    try std.testing.expectEqual(@as(usize, 2), removal_states[0].total);
+    try std.testing.expectEqual(@as(usize, 3), removal_states[0].total);
     const first_delete = try Core.Display.decodeEvent(
         try firstMessage(&first_actor.transmit),
         &first_actor.received_fds,
@@ -1347,7 +1395,7 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         }
     }
     for (accepted_peers) |peer| try runtime.destroyClient(peer);
-    try std.testing.expectEqual(@as(usize, 4), removal_states[0].total);
+    try std.testing.expectEqual(@as(usize, 5), removal_states[0].total);
     try std.testing.expectEqual(@as(usize, 1), removal_states[0].resources);
     try std.testing.expectEqual(@as(usize, 4), removal_states[1].total);
     try std.testing.expectEqual(@as(usize, 1), removal_states[1].resources);
@@ -1558,13 +1606,7 @@ const DriverHandler = struct {
             .sync => |value| value,
             .get_registry => return error.UnexpectedRequest,
         };
-        const objects = try handler.runtime.clients.get(peer);
-        try Core.completeSync(
-            objects,
-            &(try handler.runtime.clients.reactor.getActor(peer)).transmit,
-            callback,
-            77,
-        );
+        try handler.runtime.completeSync(peer, callback, 77);
         if (handler.saturate_submission_queue) {
             handler.saturate_submission_queue = false;
             while (true) {
