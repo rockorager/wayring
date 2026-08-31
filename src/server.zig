@@ -2290,7 +2290,7 @@ pub fn Driver(comptime protocol: type) type {
             pending: bool = false,
             shutdown_complete: bool = false,
 
-            fn merge(progress: *Progress, other: Progress) void {
+            pub fn merge(progress: *Progress, other: Progress) void {
                 progress.completions += other.completions;
                 progress.accepted += other.accepted;
                 progress.requests += other.requests;
@@ -2301,6 +2301,14 @@ pub fn Driver(comptime protocol: type) type {
                 progress.pending = other.pending;
                 progress.shutdown_complete = other.shutdown_complete;
             }
+        };
+
+        /// A completion classified by the reactor which owns this driver.
+        /// Borrowed-ring event loops can retain the result of their routing
+        /// pass and dispatch it without decoding the completion a second time.
+        pub const RoutedCompletion = struct {
+            completion: std.os.linux.io_uring_cqe,
+            target: io_uring.CompletionTarget,
         };
 
         pub fn init(
@@ -2368,12 +2376,49 @@ pub fn Driver(comptime protocol: type) type {
             completions: []const std.os.linux.io_uring_cqe,
             handler: anytype,
         ) !Progress {
+            var progress = try driver.dispatchOnly(completions, handler);
+            progress.merge(try driver.prepare(handler));
+            return progress;
+        }
+
+        /// Processes raw Wayring CQEs without preparing resulting socket work.
+        /// Use this when application convergence must run between dispatch and
+        /// the batch's single preparation pass.
+        pub fn dispatchOnly(
+            driver: *Self,
+            completions: []const std.os.linux.io_uring_cqe,
+            handler: anytype,
+        ) !Progress {
             var progress: Progress = .{};
+            const reactor = driver.runtime.clients.reactor;
             for (completions) |completion| {
-                try driver.complete(completion, handler, &progress);
+                const target = reactor.route(
+                    &driver.runtime.endpoint.listener,
+                    completion,
+                ) orelse return error.InvalidCompletion;
+                try driver.completeRouted(completion, target, handler, &progress);
                 progress.completions += 1;
             }
-            progress.merge(try driver.prepare(handler));
+            return progress;
+        }
+
+        /// Processes completions already classified by this driver's reactor
+        /// without routing or preparing them again.
+        pub fn dispatchRouted(
+            driver: *Self,
+            completions: []const RoutedCompletion,
+            handler: anytype,
+        ) !Progress {
+            var progress: Progress = .{};
+            for (completions) |completion| {
+                try driver.completeRouted(
+                    completion.completion,
+                    completion.target,
+                    handler,
+                    &progress,
+                );
+                progress.completions += 1;
+            }
             return progress;
         }
 
@@ -2460,15 +2505,15 @@ pub fn Driver(comptime protocol: type) type {
             return progress;
         }
 
-        fn complete(
+        fn completeRouted(
             driver: *Self,
             completion: std.os.linux.io_uring_cqe,
+            target: io_uring.CompletionTarget,
             handler: anytype,
             progress: *Progress,
         ) !void {
             const reactor = driver.runtime.clients.reactor;
-            switch (reactor.route(&driver.runtime.endpoint.listener, completion) orelse
-                return error.InvalidCompletion) {
+            switch (target) {
                 .listener => {
                     if (try driver.runtime.completeListener(
                         completion,
