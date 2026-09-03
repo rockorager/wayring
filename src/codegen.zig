@@ -995,16 +995,14 @@ fn emitDirection(
         if (argument.type == .fd) has_fds = true;
     };
     if (!has_fds) try add(output, allocator, "        _ = fds;\n");
-    try add(output, allocator, "        return switch (message.header.opcode) {\n");
+    try add(output, allocator, "        const value: " ++ direction ++ " = switch (message.header.opcode) {\n");
     for (messages) |message| try emitDecoderCase(output, allocator, message, has_objects);
-    try add(output, allocator,
-        \\            else => error.UnknownOpcode,
-        \\        };
-        \\    }
-        \\
-    );
+    try add(output, allocator, "            else => return error.UnknownOpcode,\n        };\n        debug" ++ direction ++ "(.");
+    try add(output, allocator, if (std.mem.eql(u8, direction, "Request")) "server" else "client");
+    try add(output, allocator, ", false, message.header.object_id, value);\n        return value;\n    }\n\n");
     if (has_objects) try emitObjectValidator(output, allocator, direction, messages);
     try emitEncoder(output, allocator, direction, messages);
+    try emitDebugger(output, allocator, direction, messages);
 }
 
 fn emitDecoderSignature(
@@ -1127,7 +1125,6 @@ fn emitMessageEncoder(
     try add(output, allocator, "(queue: *tx.Queue, object_id: u32, payload: " ++ direction ++ "_");
     try add(output, allocator, message.name);
     try add(output, allocator, ") EncodeError!void {\n        if (object_id == 0) return error.NullSender;\n");
-    if (message.arguments.len == 0) try add(output, allocator, "        _ = payload;\n");
     try add(
         output,
         allocator,
@@ -1163,7 +1160,123 @@ fn emitMessageEncoder(
         try add(output, allocator, "payload.");
         try identifier(output, allocator, argument.name);
     }
-    try add(output, allocator, "});\n    }\n\n");
+    try add(output, allocator, "});\n        debug" ++ direction ++ "(.");
+    try add(output, allocator, if (std.mem.eql(u8, direction, "Request")) "client" else "server");
+    try add(output, allocator, ", true, object_id, .{ .");
+    try identifier(output, allocator, message.name);
+    try add(output, allocator, " = payload });\n    }\n\n");
+}
+
+fn emitDebugger(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime direction: []const u8,
+    messages: []const protocol_ir.Message,
+) Error!void {
+    try add(output, allocator, "    inline fn debug" ++ direction ++ "(side: wayring.debug.Side, sent: bool, object_id: u32, value: " ++ direction ++ ") void {\n        if (!wayring.debug.enabled(side)) return;\n");
+    if (messages.len == 0) {
+        try add(output, allocator, "        _ = sent;\n        _ = object_id;\n");
+    }
+    try add(output, allocator, "        switch (value) {\n");
+    if (messages.len == 0) {
+        try add(output, allocator, "            ._none => {},\n");
+    } else for (messages) |message| {
+        try add(output, allocator, "            .");
+        try identifier(output, allocator, message.name);
+        try add(output, allocator, " => |payload| {\n                var line = wayring.debug.Line.begin(sent, info.name, object_id, \"");
+        try add(output, allocator, message.name);
+        try add(output, allocator, "\");\n");
+        if (message.arguments.len == 0) try add(output, allocator, "                _ = payload;\n");
+        for (message.arguments) |argument|
+            try emitDebugArgument(output, allocator, argument);
+        try add(output, allocator, "                line.finish();\n            },\n");
+    }
+    try add(output, allocator, "        }\n    }\n\n");
+}
+
+fn emitDebugArgument(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    argument: protocol_ir.Argument,
+) Error!void {
+    try add(output, allocator, "                ");
+    if (argument.type == .new_id and argument.allow_null) {
+        try add(output, allocator, "if (payload.");
+        try identifier(output, allocator, argument.name);
+        try add(output, allocator, ") |item| ");
+    }
+    switch (argument.type) {
+        .int => {
+            try add(output, allocator, "line.int(");
+            if (argument.enum_name != null) try add(output, allocator, "@bitCast(");
+            try add(output, allocator, "payload.");
+            try identifier(output, allocator, argument.name);
+            if (argument.enum_name != null) try add(output, allocator, ".toWire())");
+            try add(output, allocator, ");\n");
+        },
+        .uint => {
+            try add(output, allocator, "line.uint(payload.");
+            try identifier(output, allocator, argument.name);
+            if (argument.enum_name != null) try add(output, allocator, ".toWire()");
+            try add(output, allocator, ");\n");
+        },
+        .fixed => {
+            try add(output, allocator, "line.fixed(payload.");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ");\n");
+        },
+        .string => {
+            try add(output, allocator, "line.string(payload.");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ");\n");
+        },
+        .object => {
+            try add(output, allocator, "line.object(");
+            if (argument.interface) |interface| {
+                try add(output, allocator, "\"");
+                try add(output, allocator, interface);
+                try add(output, allocator, "\"");
+            } else try add(output, allocator, "null");
+            try add(output, allocator, ", payload.");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ");\n");
+        },
+        .new_id => {
+            try add(output, allocator, "line.newId(");
+            if (argument.interface) |interface| {
+                try add(output, allocator, "\"");
+                try add(output, allocator, interface);
+                try add(output, allocator, "\", ");
+                if (argument.allow_null) {
+                    try add(output, allocator, "item");
+                } else {
+                    try add(output, allocator, "payload.");
+                    try identifier(output, allocator, argument.name);
+                }
+            } else if (argument.allow_null) {
+                try add(output, allocator, "item.interface, item.id");
+            } else {
+                try add(output, allocator, "payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".interface, payload.");
+                try identifier(output, allocator, argument.name);
+                try add(output, allocator, ".id");
+            }
+            try add(output, allocator, ")");
+            if (argument.allow_null) try add(output, allocator, " else line.object(null, null)");
+            try add(output, allocator, ";\n");
+        },
+        .array => {
+            try add(output, allocator, "line.array(payload.");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ");\n");
+        },
+        .fd => {
+            try add(output, allocator, "line.fd(payload.");
+            try identifier(output, allocator, argument.name);
+            try add(output, allocator, ");\n");
+        },
+    }
 }
 
 fn emitSizeValidation(
@@ -1576,6 +1689,8 @@ test "generates direct typed request and event decoders" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "const decoded_fd = try fds.pop()") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn encodeRequest") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "queue.reserve(size)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "debugRequest(.client, true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "debugEvent(.client, false") != null);
 }
 
 test "expands an untyped new id into its dynamic wire arguments" {

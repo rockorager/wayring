@@ -20,6 +20,7 @@ pub const protocol = @import("protocol.zig");
 pub const codegen = @import("codegen.zig");
 pub const objects = @import("objects.zig");
 pub const metadata = @import("metadata.zig");
+pub const debug = @import("debug.zig");
 pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 pub const dispatch = @import("dispatch.zig");
@@ -40,6 +41,7 @@ test {
     _ = codegen;
     _ = objects;
     _ = metadata;
+    _ = debug;
     _ = client;
     _ = server;
     _ = dispatch;

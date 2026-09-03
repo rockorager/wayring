@@ -23,6 +23,11 @@ Wayring itself has no libwayland dependency. Optional compatibility checks and
 benchmarks use upstream Wayland XML and system libwayland in an isolated build
 package; normal consumers fetch and link neither.
 
+Set `WAYLAND_DEBUG=1` to trace generated client and server protocol traffic to
+standard error. `WAYLAND_DEBUG=client` and `WAYLAND_DEBUG=server` select one
+side. Tracing remains available in release builds; when disabled, each message
+pays only one atomic load and a predictable branch.
+
 ## Use as a Zig dependency
 
 Add a published Wayring package to your manifest:
