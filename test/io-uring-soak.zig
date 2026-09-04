@@ -405,7 +405,25 @@ test "real io_uring sends resume after forced kernel backpressure" {
     ));
     const pressure_peer = try reactor.attach(pressure_sockets[0], actor_config);
     const pressure_actor = try reactor.getActor(pressure_peer);
-    try std.testing.expectError(error.Exhausted, pressure_actor.enqueue("x", &.{}));
+    try pressure_actor.enqueue("x", &.{});
+    try std.testing.expectEqual(
+        @as(usize, backpressure_connections * 4 + 1),
+        reactor.transmit_blocks.capacity(),
+    );
+    try std.testing.expectError(
+        error.ByteBudgetExceeded,
+        pressure_actor.enqueue(&([_]u8{0} ** backpressure_bytes), &.{}),
+    );
+    const rejected_descriptor = try createDescriptor();
+    defer _ = linux.close(rejected_descriptor);
+    try std.testing.expectError(
+        error.DescriptorBudgetExceeded,
+        pressure_actor.enqueue("fd budget", &.{ rejected_descriptor, rejected_descriptor }),
+    );
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fcntl(rejected_descriptor, linux.F.GETFD, 0)),
+    );
 
     for (&states) |*state| try prepareBackpressureSend(&reactor, state);
     _ = try reactor.ring.submit();
@@ -455,10 +473,6 @@ test "real io_uring sends resume after forced kernel backpressure" {
         try std.testing.expectEqual(backpressure_bytes, state.received);
         try std.testing.expectEqual(@as(usize, 1), state.received_fds);
     }
-    try std.testing.expectEqual(
-        @as(usize, backpressure_connections * 4),
-        reactor.transmit_blocks.available(),
-    );
     try pressure_actor.enqueue("recovered", &.{});
     var pressure_state: BackpressureState = .{
         .peer = pressure_peer,
@@ -478,13 +492,13 @@ test "real io_uring sends resume after forced kernel backpressure" {
         pressure_routed.operation,
         pressure_completion,
     );
-    try std.testing.expectEqual(@as(usize, "recovered".len), pressure_event.sent.length);
-    var recovered: ["recovered".len]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, "xrecovered".len), pressure_event.sent.length);
+    var recovered: ["xrecovered".len]u8 = undefined;
     try std.testing.expectEqual(
         recovered.len,
         try syscallLength(linux.read(pressure_sockets[1], &recovered, recovered.len)),
     );
-    try std.testing.expectEqualSlices(u8, "recovered", &recovered);
+    try std.testing.expectEqualSlices(u8, "xrecovered", &recovered);
 
     for (states) |state| {
         try reactor.destroyPeer(state.peer);
@@ -494,7 +508,7 @@ test "real io_uring sends resume after forced kernel backpressure" {
     _ = linux.close(pressure_sockets[1]);
     try std.testing.expectEqual(@as(usize, 0), reactor.slots.active_count);
     try std.testing.expectEqual(
-        @as(usize, backpressure_connections * 4),
+        @as(usize, backpressure_connections * 4 + 1),
         reactor.transmit_blocks.available(),
     );
     try std.testing.expectEqual(

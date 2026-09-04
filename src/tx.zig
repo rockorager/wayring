@@ -556,6 +556,37 @@ test "shared pool grows while logical budget provides atomic backpressure" {
     try std.testing.expectEqual(@as(usize, 5), queue.queuedBytes());
 }
 
+test "block growth allocation failure preserves queue and descriptor ownership" {
+    var sockets: [2]linux.fd_t = undefined;
+    try expectSuccess(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));
+    defer _ = linux.close(sockets[1]);
+
+    const allocator = std.testing.allocator;
+    var blocks = try pools.SharedBlocks.init(allocator, 4, 1);
+    defer blocks.deinit(allocator);
+    var fds = try pools.SharedFds.init(allocator, 2);
+    defer fds.deinit(allocator);
+    var queue = Queue.init(&blocks, 8, &fds, 2);
+    defer queue.deinit();
+    try queue.enqueue("keep", &.{sockets[0]});
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    blocks.allocator = failing_allocator.allocator();
+    const result = queue.enqueue("more", &.{sockets[1]});
+    blocks.allocator = allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    try std.testing.expectEqual(@as(usize, 4), queue.queuedBytes());
+    try std.testing.expectEqual(@as(usize, 1), queue.queuedDescriptors());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[0], linux.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(sockets[1], linux.F.GETFD, 0)));
+    var descriptor_scratch: [2]linux.fd_t = undefined;
+    var control_storage: [64]u8 = undefined;
+    const queued = try queue.snapshot(&descriptor_scratch, &control_storage);
+    try std.testing.expectEqualStrings("keep", queued.first);
+    try std.testing.expectEqual(sockets[0], descriptor_scratch[0]);
+}
+
 test "backpressure does not take descriptor ownership" {
     var sockets: [2]linux.fd_t = undefined;
     try expectSuccess(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));

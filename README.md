@@ -67,13 +67,16 @@ The primary entry points are:
 - `wayring.client`: generated request/event dispatch and client drivers
 - `wayring.server`: globals, resources, generated dispatch, server drivers, and
   the optional `wl_shm` protocol service
-- `wayring.objects`: bounded generation-checked object namespaces
+- `wayring.objects`: generation-checked object namespaces with logical quotas
 - `wayring.shm`: validated SHM metadata, mapping lifetime, and safe import paths
 - `wayring.unix_socket`: Wayland display socket setup and connection helpers
 
 Initialization APIs take an allocator and pair it with an explicit `deinit`.
-Steady-state receive, dispatch, and transmit paths use bounded shared pools and
-do not allocate per message.
+Shared fragment, transmit, descriptor, and server-object pools start with
+configured reserves and grow on demand, including on the message path.
+Per-connection logical budgets still provide backpressure. Returned pool
+capacity is retained for reuse until teardown.
+`deinit` releases all grown capacity and closes runtime-owned descriptors.
 
 ## Generate protocol bindings
 

@@ -1539,6 +1539,7 @@ pub const Receiver = struct {
             receiver.message.namelen;
         if (output.controllen > receiver.message.controllen) return error.InvalidMessage;
         const control = bytes[control_offset .. control_offset + output.controllen];
+        errdefer ancillary.closeRights(control) catch {};
         const payload = bytes[prefix_size..];
         if (output.namelen != 0 or
             output.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC) != 0 or
@@ -1590,8 +1591,14 @@ pub const Receiver = struct {
             const event = try actor.completeRouted(routed.operation, cqe);
             switch (routed.operation) {
                 .receive => {
-                    if (cqe.res > 0 and cqe.flags & linux.IORING_CQE_F_BUFFER != 0)
-                        try receiver.buffers.put(cqe);
+                    if (cqe.res > 0 and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        const received = receiver.decodeCompletion(cqe) catch |err| switch (err) {
+                            error.InvalidMessage, error.Disconnected => continue,
+                            else => return err,
+                        };
+                        defer receiver.release(received) catch {};
+                        try ancillary.closeRights(received.control);
+                    }
                     switch (event) {
                         .received, .receive_stopped, .buffers_exhausted, .disconnected => {},
                         else => return error.InvalidCompletion,
@@ -1607,3 +1614,83 @@ pub const Receiver = struct {
         }
     }
 };
+
+test "rejected and shutdown receives close delivered SCM_RIGHTS" {
+    const Mode = enum { truncated, stop, stop_truncated };
+    for ([_]Mode{ .truncated, .stop, .stop_truncated }) |mode| {
+        var owner: Reactor = undefined;
+        try owner.initOwned(std.testing.allocator, .{ .entries = 8 }, .{
+            .receive_buffer_size = 4096,
+            .receive_buffer_count = 2,
+            // Exactly one descriptor fits in the truncated control layout.
+            .receive_control_capacity = if (mode == .stop) 64 else @sizeOf(linux.cmsghdr) + @sizeOf(linux.fd_t),
+            .fragment_block_size = 64,
+            .fragment_block_count = 1,
+            .transmit_block_size = 64,
+            .transmit_block_count = 1,
+            .descriptor_count = 2,
+            .send_descriptor_capacity = 2,
+        });
+        defer owner.deinit(std.testing.allocator);
+        var sockets: [2]linux.fd_t = undefined;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+            0,
+            &sockets,
+        )));
+        defer _ = linux.close(sockets[1]);
+        const peer = try owner.attachReceiving(sockets[0], .{
+            .received_fd_budget = 2,
+            .transmit_byte_budget = 64,
+            .transmit_fd_budget = 2,
+        });
+        const actor = try owner.getActor(peer);
+        const receiver = try owner.getReceiver(peer);
+        defer {
+            receiver.stop(owner.ring, owner.slots, actor) catch unreachable;
+            owner.destroyPeer(peer) catch unreachable;
+        }
+        _ = try owner.ring.submit();
+
+        var pipe: [2]linux.fd_t = undefined;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        })));
+        defer _ = linux.close(pipe[0]);
+        var writer_open = true;
+        defer if (writer_open) {
+            _ = linux.close(pipe[1]);
+        };
+        var control_storage: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const control = try ancillary.encodeRights(&control_storage, &.{ pipe[1], pipe[1] });
+        const payload = "12345678";
+        const iov: std.posix.iovec_const = .{ .base = payload.ptr, .len = payload.len };
+        const message: linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = control.ptr,
+            .controllen = control.len,
+            .flags = 0,
+        };
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sendmsg(sockets[1], &message, 0)));
+        _ = linux.close(pipe[1]);
+        writer_open = false;
+        // Leave the receive CQE queued so stop must discard already-delivered rights.
+        _ = try owner.ring.submit_and_wait(1);
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(linux.E.AGAIN, linux.errno(linux.read(pipe[0], &byte, 1)));
+        if (mode == .truncated) {
+            const cqe = try owner.ring.copy_cqe();
+            _ = try actor.complete(cqe);
+            try std.testing.expectError(error.InvalidMessage, receiver.decodeCompletion(cqe));
+        } else {
+            try receiver.stop(owner.ring, owner.slots, actor);
+        }
+        // EOF proves every duplicate writer was closed, not just removed from a queue.
+        try std.testing.expectEqual(@as(usize, 0), linux.read(pipe[0], &byte, 1));
+    }
+}

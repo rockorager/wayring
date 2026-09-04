@@ -144,22 +144,23 @@ dispatching later frames from the same receive batch. Client-side framing,
 object lookup, decoding, and handler failures follow the same terminal close
 path.
 
-The descriptor stream is represented by a bounded FIFO with explicit
+The descriptor stream is represented by a logically budgeted FIFO with explicit
 ownership transfer. Receiving SCM_RIGHTS enqueues descriptors in kernel
 delivery order; generated decoders pop them only when their message signature
 contains an `fd` argument. Teardown and budget failures close every descriptor
 still owned by the runtime.
 
 The transmit side stores bytes in reactor-wide fixed-size block chains while
-each connection retains a logical byte budget. Enqueue is atomic with respect
-to that budget and shared-pool availability. Direct-encoding reservations keep
-new blocks private until commit; abort returns them without exposing partial
-bytes or taking FD ownership. A send snapshot gathers at most the first two
-blocks, only one snapshot may be in flight, and partial completions release
-only fully consumed blocks. All descriptors attached to a send are consumed
-after its first successful byte. Events generated while that send is active
-append to its chain and are coalesced into the next `sendmsg` SQE; a connection
-never has two send SQEs active at once.
+each connection retains a logical byte budget. The shared block and descriptor
+pools treat configured counts as initial reserves and grow on demand. Enqueue
+is atomic with respect to logical budgets and allocation failure. Direct-encoding
+reservations keep new blocks private until commit; abort returns them without
+exposing partial bytes or taking FD ownership. A send snapshot gathers at most
+the first two blocks, only one snapshot may be in flight, and partial
+completions release only fully consumed blocks. All descriptors attached to a
+send are consumed after its first successful byte. Events generated while
+that send is active append to its chain and are coalesced into the next
+`sendmsg` SQE; a connection never has two send SQEs active at once.
 The connection lifecycle is explicit: `open` accepts dispatch and ordinary
 output, `protocol_error` reserves the terminal transition, `draining` permits
 only already-queued output and the final error event to send, and `closing`
@@ -168,8 +169,9 @@ permits only asynchronous operation teardown. EOF and transport failures enter
 immediately rather than leaving a half-terminal connection.
 Connections occupy generation-tagged reactor slots, so completions from a
 closed or reused slot are discarded before actor storage is accessed. Inactive
-eight-byte slots are their own intrusive free list, giving connection admission
-and recycling O(1) cost without a second allocation or caller-managed indices.
+eight-byte slots are their own intrusive free list, giving slot recycling O(1)
+cost without caller-managed indices. Admission allocates a pointer-stable
+connection record and grows the slot directory when no free slot remains.
 After validation, the hot routed value carries only the four-byte slot/operation
 pair; copying the already-validated generation enlarged its return ABI and cost
 about two percent in the multi-connection benchmark.
@@ -177,16 +179,21 @@ about two percent in the multi-connection benchmark.
 ## Allocation policy
 
 Libraries accept a caller-selected `std.mem.Allocator`; they do not select a
-hidden global allocator. Each reactor allocates shared pools at initialization,
-then message processing performs no allocator calls. Connections retain only
-pool indices, queue heads, counters, and logical per-connection budgets.
+hidden global allocator. Each reactor allocates initial shared-pool reserves;
+fragment, transmit, descriptor, and server object pools may use that allocator
+to grow on demand. Growth can allocate on the message path; returned nodes are
+retained for reuse until teardown. Only the provided receive-buffer ring is
+fixed at initialization. Pool counts are not aggregate memory limits.
+Connections retain only pool indices, queue heads, counters, and logical
+per-connection budgets.
 
 The provided-buffer ring, receive-fragment blocks, transmit blocks, and
 descriptor entries are shared across every connection assigned to a reactor.
 Blocks are leased only while a connection has an incomplete frame or queued
 output; no connection permanently reserves worst-case backing storage. Slot
 release returns all blocks and closes runtime-owned descriptors before the slot
-is reused with a new generation.
+is reused with a new generation. Reactor teardown frees both initial and grown
+pool storage after active connections and operations have been drained.
 
 Receive ancillary-control capacity is configured once per reactor rather than
 per peer. Initialization rejects layouts that would leave a provided buffer
@@ -225,8 +232,8 @@ callers can provision toward their expected simultaneous receive fan-out.
 
 The reusable io_uring backend owns persistent per-connection recvmsg and
 sendmsg operation state while borrowing one reactor-wide provided-buffer group.
-Send states point into contiguous reactor-owned descriptor and aligned ancillary
-control slabs sized at initialization. Admission rejects a connection whose
+Send states point into descriptor and aligned ancillary-control storage
+allocated per connection at admission. Admission rejects a connection whose
 logical transmit-FD budget exceeds one state's descriptor capacity, so preparing
 a `sendmsg` never allocates and all kernel-visible iovec, control, and message
 pointers remain stable until its CQE arrives. This per-slot operation metadata
@@ -256,15 +263,14 @@ addresses while registered operations can reference them.
 Client object lookup uses fixed-capacity open addressing with a 75% maximum load
 and backshift deletion, avoiding allocator traffic and long-lived tombstones on
 the dispatch path. Server clients instead lease nodes from one reactor-wide
-physical object pool, so idle clients do not reserve their entire logical object
-quota. Each connection retains a small power-of-two bucket slab stamped with
-its reactor generation. Reusing a slot therefore invalidates old bucket heads
-without clearing the slab. Nodes also form an intrusive per-client ownership
-chain, allowing disconnect teardown to return all objects to the shared free
-list in O(1). Handles pair the wire ID with a pool-wide insertion generation so
-an ID reused later cannot validate stale application state. Each namespace
-caches its most recently resolved ID and node index; repeated dispatch to one
-object avoids hashing and the bucket-chain walk, while removal always
+growable physical object pool, so idle clients do not reserve their entire
+logical object quota. Admission allocates a small power-of-two bucket slab for
+each connection, with heads stamped with its reactor generation. Nodes also
+form an intrusive per-client ownership chain, allowing disconnect teardown to
+return all objects to the shared free list in O(1). Handles pair the wire ID
+with a pool-wide insertion generation to reject stale state after ID reuse.
+Each namespace caches its most recently resolved ID and node index; repeated
+dispatch to one object avoids hashing and the bucket-chain walk. Removal always
 walks the bucket chain to preserve collision unlinking. Allocation-free object
 iterators expose generation-tagged handles and context-bearing object metadata
 when applications need O(n) disconnect cleanup; callers that do not need hooks
@@ -272,14 +278,14 @@ retain the O(1) chain release path.
 Server-created wire IDs are selected from the lowest free high-range value in
 each client namespace rather than derived from shared physical node indices.
 This keeps their externally visible sequence dense as required by libwayland,
-while preserving reactor-wide object pooling and adding no per-client storage.
+while preserving reactor-wide object pooling. A per-namespace cursor skips the
+occupied prefix during consecutive allocations and rewinds when a lower ID is
+removed, preserving lowest-free reuse without rescanning from the range start.
 
-Logical per-client quotas prevent one connection from monopolizing the shared
-pool. One physical node per inactive reactor slot is reserved for `wl_display`;
-ordinary object creation cannot consume that reserve, so pool pressure cannot
-prevent transport-capable clients from being admitted. Admission consumes its
-reserved node, initializes the display namespace, and queues the first receive
-transactionally. Teardown restores the reservation before recycling the slot.
+Logical per-client quotas bound live objects independently of shared pool
+growth. Admission obtains a node for `wl_display`, initializes the namespace,
+and queues the first receive transactionally. Allocation failure rolls back
+the namespace and peer rather than publishing a partially initialized client.
 Client-created IDs have a separate bounded lifecycle tracker: destructor
 publication moves an ID into an awaiting-delete state, and only
 `wl_display.delete_id` makes it reusable.
@@ -476,10 +482,11 @@ The optional generated-protocol `server.Shm` service owns the reusable
 `wl_shm`, `wl_shm_pool`, and SHM-backed `wl_buffer` mechanics. It installs a
 format-advertising global, validates and admits pool and buffer resources,
 selects standard SHM protocol errors, and maps their destruction onto the safe
-store. Consumers configure formats and hard capacities, forward externally
-initiated resource removals through their central removal hook, and can recover
-a store token from a live owned buffer. Surface attachment, backing pins,
-import, presentation, and release policy remain outside the service.
+store. Consumers configure formats, maximum pool bytes, and initial slot
+reserves, forward externally initiated resource removals through their central
+removal hook, and can recover a store token from a live owned buffer.
+Surface attachment, backing pins, import, presentation, and release policy
+remain outside the service.
 
 SHM import begins with protocol-independent, format-aware metadata validation.
 Applications configure a hard maximum pool size and supply bytes per pixel for
@@ -487,19 +494,21 @@ every advertised core or custom format. Pool creation and growth, positive
 dimensions, minimum row stride, conservative `stride * height` extent, and
 final offset are checked before publication with overflow-safe arithmetic. This
 bounded metadata layer is the prerequisite for shared mapping lifetime and
-SIGBUS-safe pixel access. One server-wide bounded store allocates pool,
-buffer, and importer-pin slots at initialization. Pool resources, every child
-buffer, and active pins independently retain the mapping, so either protocol
-resource may be destroyed first. Generation-checked tokens reject stale slot
-reuse. Growth uses `mremap` immediately when idle and is deferred while pinned,
-preventing address movement beneath an importer. Shrink-sealed files whose
-length covers the complete mapping expose an unguarded zero-copy read-only
-slice. Scoped access to ordinary unsealed files installs a process-wide SIGBUS
-guard modeled on the MIT-licensed Wayland reference server. If a client
-truncates active backing, the handler replaces the complete mapping at its
-existing address with zero-filled anonymous pages so the faulting instruction
-can finish; the outer access then reports `InvalidBacking` for a protocol owner
-to disconnect that client. Unrelated SIGBUS retains the action captured at
+SIGBUS-safe pixel access. One server-wide store reserves pool, buffer, and
+importer-pin slots at initialization and grows them on demand. Pool resources,
+every child buffer, and active pins independently retain the mapping, so either
+protocol resource may be destroyed first. Generation-checked tokens reject
+stale slot reuse. Growth uses `mremap` immediately when idle and is deferred
+while pinned, preventing address movement beneath an importer. Failed deferred
+growth consumes the last pin but remains retryable by a later pin or resize.
+Shrink-sealed files whose length covers the complete mapping expose an
+unguarded zero-copy read-only slice. Scoped access to ordinary unsealed files
+installs a process-wide SIGBUS guard modeled on the MIT-licensed Wayland
+reference server. If a client truncates active backing, the handler replaces
+the complete mapping with zero-filled anonymous pages at its existing address.
+The faulting instruction can finish; the outer access reports `InvalidBacking`
+for a protocol owner to disconnect that client. Unrelated SIGBUS retains the
+action captured at
 handler installation, and a later competing handler makes guarded access fail
 rather than silently running unprotected. The positional io_uring copy API
 remains available to consumers which cannot own the process signal policy.
@@ -553,14 +562,14 @@ before resolving `WAYLAND_DISPLAY` (defaulting to `wayland-0`) under
 `XDG_RUNTIME_DIR`, and returns a configured nonblocking close-on-exec descriptor
 without allocating.
 
-Admission consumes an accepted descriptor and acquires the next free generation
-slot in O(1), producing a compact generation-tagged peer handle. Sockets, actors,
-and persistent receive states live in reactor-owned structure-of-arrays storage
-indexed directly by that slot; CQE routing therefore needs no hash lookup or
-consumer-maintained side table. If connection capacity is exhausted, admission
-closes the descriptor instead of leaving ownership ambiguous. Peer destruction
-is allowed only after receive and send teardown have completed, then recycles
-the slot and closes the socket.
+Admission consumes an accepted descriptor and acquires a recycled or newly
+allocated generation slot, producing a compact generation-tagged peer handle.
+Sockets, actors, and persistent receive states live in separately allocated
+records indexed by that slot; CQE routing therefore needs no hash lookup or
+consumer-maintained side table. If admission allocation or slot-space limits
+fail, it closes the descriptor instead of leaving ownership ambiguous. Peer
+destruction is allowed only after receive and send teardown have completed,
+then recycles the slot and closes the socket.
 
 Admission can also queue the peer's initial multishot receive without submitting
 the ring. A burst of accepted clients can therefore initialize their slot,

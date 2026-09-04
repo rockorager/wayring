@@ -339,7 +339,10 @@ pub const Store = struct {
         const node = try store.resolvePool(token);
         if (!node.resource_alive) return error.ResourceDestroyed;
         const size = try resizePool(store.limits, node.declared_size, requested_size);
-        if (size == node.declared_size) return;
+        if (size == node.declared_size) {
+            if (node.pin_count == 0) try applyPendingResize(node);
+            return;
+        }
         if (node.pin_count != 0) {
             node.declared_size = size;
             node.pending_size = size;
@@ -348,6 +351,7 @@ pub const Store = struct {
         const mapping = try remap(node.mapping, size);
         node.mapping = mapping;
         node.declared_size = size;
+        node.pending_size = 0;
         node.sealed_direct = fileCannotShrinkBelow(node.fd, size);
     }
 
@@ -423,7 +427,10 @@ pub const Store = struct {
     pub fn pin(store: *Store, token: BufferToken) StoreError!Pin {
         const buffer = try store.resolveBuffer(token);
         const pool = try store.resolvePool(buffer.pool);
-        if (pool.pending_size != 0) return error.ResizePending;
+        if (pool.pending_size != 0) {
+            if (pool.pin_count != 0) return error.ResizePending;
+            try applyPendingResize(pool);
+        }
         if (store.pin_free == none) try store.growPin();
         const pin_index = store.pin_free;
         const pin_node = store.pins.items[pin_index];
@@ -536,6 +543,9 @@ pub const Store = struct {
         };
     }
 
+    /// Consumes the pin before applying deferred growth. A remap failure is
+    /// returned with the growth still pending, but the completed copy pin is
+    /// not retained and must not be unpinned again.
     pub fn unpin(store: *Store, pin_value: Pin) StoreError!void {
         const pin_node = try store.resolvePin(pin_value.token);
         const pool_token = pin_node.pool;
@@ -548,14 +558,10 @@ pub const Store = struct {
         store.active_pins -= 1;
         pool.pin_count -= 1;
         if (pool.pin_count == 0 and pool.pending_size != 0) {
-            const size = pool.pending_size;
-            const mapping = remap(pool.mapping, size) catch |err| {
+            applyPendingResize(pool) catch |err| {
                 store.releasePoolIfUnused(pool_index);
                 return err;
             };
-            pool.mapping = mapping;
-            pool.pending_size = 0;
-            pool.sealed_direct = fileCannotShrinkBelow(pool.fd, size);
         }
         store.releasePoolIfUnused(pool_index);
     }
@@ -682,6 +688,15 @@ pub const Store = struct {
         store.pools.deinit(store.allocator);
     }
 };
+
+fn applyPendingResize(node: *PoolNode) std.posix.MRemapError!void {
+    const size = node.pending_size;
+    if (size == 0) return;
+    const mapping = try remap(node.mapping, size);
+    node.mapping = mapping;
+    node.pending_size = 0;
+    node.sealed_direct = fileCannotShrinkBelow(node.fd, size);
+}
 
 fn remap(
     mapping: []align(std.heap.page_size_min) u8,
@@ -813,6 +828,63 @@ test "shared mappings outlive resources and defer growth while pinned" {
     try std.testing.expect(second.generation != replacement_buffer.generation);
     try store.destroyBuffer(replacement_buffer);
     try store.destroyPoolResource(replacement_pool);
+}
+
+test "failed deferred growth remains retryable without retaining the last pin" {
+    const Retry = enum { same_size, larger_size, pin_after_destroy };
+    for ([_]Retry{ .same_size, .larger_size, .pin_after_destroy }) |retry| {
+        var store = try Store.init(
+            std.testing.allocator,
+            .{ .max_pool_bytes = 12288 },
+            1,
+            1,
+        );
+        defer store.deinit(std.testing.allocator);
+        const pool = try store.addPool(try testMemfd(12288, true), 4096);
+        defer store.destroyPoolResource(pool) catch {};
+        const buffer = try store.addBuffer(
+            pool,
+            .{ .value = 0, .bytes_per_pixel = 4 },
+            0,
+            1,
+            1,
+            4,
+        );
+        defer store.destroyBuffer(buffer) catch {};
+
+        const original_limit = try std.posix.getrlimit(.AS);
+        var limit_lowered = false;
+        defer if (limit_lowered) std.posix.setrlimit(.AS, original_limit) catch unreachable;
+
+        const first_pin = try store.pin(buffer);
+        try store.resize(pool, 8192);
+        try std.testing.expectError(error.ResizePending, store.pin(buffer));
+        try std.posix.setrlimit(.AS, .{ .cur = 1, .max = original_limit.max });
+        limit_lowered = true;
+        const failure = store.unpin(first_pin);
+        try std.posix.setrlimit(.AS, original_limit);
+        limit_lowered = false;
+
+        try std.testing.expectError(error.OutOfMemory, failure);
+        try std.testing.expectError(error.StalePin, store.unpin(first_pin));
+        var info = try store.poolInfo(pool);
+        try std.testing.expectEqual(@as(usize, 0), info.pin_count);
+        try std.testing.expectEqual(@as(usize, 4096), info.mapped_size);
+        try std.testing.expectEqual(@as(?usize, 8192), info.pending_size);
+
+        switch (retry) {
+            .same_size => try store.resize(pool, 8192),
+            .larger_size => try store.resize(pool, 12288),
+            .pin_after_destroy => try store.destroyPoolResource(pool),
+        }
+        const retry_pin = try store.pin(buffer);
+        defer store.unpin(retry_pin) catch unreachable;
+        info = try store.poolInfo(pool);
+        try std.testing.expectEqual(@as(usize, if (retry == .larger_size) 12288 else 8192), info.mapped_size);
+        try std.testing.expectEqual(info.declared_size, info.mapped_size);
+        try std.testing.expectEqual(@as(?usize, null), info.pending_size);
+        try std.testing.expectEqual(retry != .pin_after_destroy, info.resource_alive);
+    }
 }
 
 test "pins retain destroyed unsealed pools without exposing raw bytes" {

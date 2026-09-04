@@ -644,6 +644,8 @@ pub const SharedNamespace = struct {
     owner_tail: u32 = shared_end,
     cached_id: u32 = 0,
     cached_index: u32 = shared_end,
+    // IDs below this cursor are occupied. u64 also represents exhausted u32 IDs.
+    next_server_id: u64 = server_id_start,
 
     pub fn init(
         pool: *SharedObjectPool,
@@ -706,13 +708,15 @@ pub const SharedNamespace = struct {
         if (namespace.count == namespace.quota) return error.Full;
         // libwayland clients store server-created objects in a dense high-ID map.
         // Keep wire IDs independent of reactor-wide physical pool indices.
-        var id = server_id_start;
-        while (namespace.findUncached(id) != null) {
-            if (id == std.math.maxInt(u32)) return error.Full;
+        var id = namespace.next_server_id;
+        while (id <= std.math.maxInt(u32) and namespace.findUncached(@intCast(id)) != null) {
             id += 1;
         }
+        if (id > std.math.maxInt(u32)) return error.Full;
         const index = try namespace.pool.acquire();
-        return namespace.insertAcquired(index, id, interface, version, context);
+        const handle = namespace.insertAcquired(index, @intCast(id), interface, version, context);
+        namespace.next_server_id = id + 1;
+        return handle;
     }
 
     pub fn insertReserved(
@@ -795,6 +799,8 @@ pub const SharedNamespace = struct {
         else
             namespace.pool.nodes.items[node.owner_next].owner_previous = node.owner_previous;
         namespace.count -= 1;
+        if (handle.id >= server_id_start)
+            namespace.next_server_id = @min(namespace.next_server_id, handle.id);
         namespace.pool.release(location.index);
         return object;
     }
@@ -1558,6 +1564,41 @@ test "server namespaces share physical objects with isolated quotas" {
     try std.testing.expect(second.namespace.resolve(second_child) != null);
     _ = try second.removeClient(second_child);
     try std.testing.expect(second.namespace.resolve(colliding) != null);
+}
+
+test "server ID cursor advances and reuses the lowest removed ID" {
+    const info: metadata.Interface = .{
+        .name = "test_v1",
+        .version = 1,
+        .requests = &.{},
+        .events = &.{},
+    };
+    var pool = try SharedObjectPool.init(std.testing.allocator, 1024);
+    defer pool.deinit(std.testing.allocator);
+    var buckets = [_]SharedObjectBucket{.{}} ** 2048;
+    var namespace = try SharedNamespace.init(&pool, &buckets, 1, 1024);
+    defer namespace.deinit();
+    var handles: [1024]Handle = undefined;
+    for (&handles, 0..) |*handle, index| {
+        handle.* = try namespace.insertServer(&info, 1, null);
+        try std.testing.expectEqual(server_id_start + index, handle.id);
+        try std.testing.expectEqual(@as(u64, handle.id) + 1, namespace.next_server_id);
+    }
+    try std.testing.expectError(error.Full, namespace.insertServer(&info, 1, null));
+    _ = namespace.remove(handles[700]).?;
+    _ = namespace.remove(handles[2]).?;
+    try std.testing.expectEqual(@as(u64, handles[2].id), namespace.next_server_id);
+    const reused = try namespace.insertServer(&info, 1, null);
+    try std.testing.expectEqual(handles[2].id, reused.id);
+    try std.testing.expect(namespace.resolve(handles[2]) == null);
+    try std.testing.expect(namespace.remove(handles[2]) == null);
+    try std.testing.expectEqual(handles[700].id, (try namespace.insertServer(&info, 1, null)).id);
+
+    // Explicit high-ID insertion must also be skipped when the cursor reaches it.
+    _ = namespace.remove(reused).?;
+    _ = try namespace.insert(reused.id, &info, 1, null);
+    _ = namespace.remove(handles[3]).?;
+    try std.testing.expectEqual(handles[3].id, (try namespace.insertServer(&info, 1, null)).id);
 }
 
 test "shared object pool grows without relocating live objects" {

@@ -83,20 +83,24 @@ pub const FdQueue = struct {
 /// Transfers every SCM_RIGHTS descriptor in `control` into `queue`, preserving
 /// kernel delivery order. Unknown ancillary records are ignored.
 pub fn enqueueRights(control: []const u8, queue: *FdQueue) Error!usize {
+    errdefer closeRights(control) catch {};
     var count: usize = 0;
     var first_pass: RightsIterator = .{ .control = control };
     while (try first_pass.next() != null) count += 1;
     if (count == 0) return 0;
 
-    queue.ensureCapacity(count) catch |err| {
-        var close_pass: RightsIterator = .{ .control = control };
-        while (try close_pass.next()) |fd| _ = linux.close(fd);
-        return err;
-    };
+    try queue.ensureCapacity(count);
 
     var enqueue_pass: RightsIterator = .{ .control = control };
     while (try enqueue_pass.next()) |fd| queue.append(fd) catch unreachable;
     return count;
+}
+
+/// Closes received rights without queueing them. On malformed control, closes
+/// the valid prefix before returning an error.
+pub fn closeRights(control: []const u8) Error!void {
+    var rights: RightsIterator = .{ .control = control };
+    while (try rights.next()) |fd| _ = linux.close(fd);
 }
 
 /// Encodes one SCM_RIGHTS record. Sending duplicates the descriptors into the
@@ -214,6 +218,23 @@ test "rejects malformed rights records" {
     header.len -= 1;
 
     try std.testing.expectError(error.MalformedControl, enqueueRights(bytes, &queue));
+}
+
+test "malformed control closes rights from earlier records" {
+    var sockets: [2]linux.fd_t = undefined;
+    try expectSuccess(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));
+    defer _ = linux.close(sockets[1]);
+    var pool = try pools.SharedFds.init(std.testing.allocator, 1);
+    defer pool.deinit(std.testing.allocator);
+    var queue = FdQueue.init(&pool, 1);
+    defer queue.deinit();
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const valid = try encodeRights(&control, &.{sockets[0]});
+    const end = valid.len + @sizeOf(linux.cmsghdr);
+    @memset(control[valid.len..end], 0);
+    try std.testing.expectError(error.MalformedControl, enqueueRights(control[0..end], &queue));
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(sockets[0], linux.F.GETFD, 0)));
 }
 
 test "receives real SCM_RIGHTS descriptors with close-on-exec" {
