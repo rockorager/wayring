@@ -1470,6 +1470,73 @@ test "server driver recovers SQ pressure and drains protocol errors" {
     try std.testing.expectEqual(@as(usize, 2), handler.connected_count);
     _ = try reactor.ring.submit();
 
+    // A later CQE can fail after the actor has consumed it. Preserve that
+    // ownership boundary and leave the untouched suffix with the caller.
+    var send_completions: [3]wayring.server.Driver(protocol).RoutedCompletion = undefined;
+    var peers: [2]wayring.io_uring.Peer = undefined;
+    var peer_iterator = runtime.clients.iterator();
+    for (&peers) |*peer| peer.* = peer_iterator.next().?;
+    for (peers, 0..) |peer, index| {
+        const actor = try reactor.getActor(peer);
+        try actor.enqueue("x", &.{});
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control_storage: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try actor.transmit.snapshot(&descriptor_scratch, &control_storage);
+        const token = try actor.beginSend(snapshot);
+        const cqe: linux.io_uring_cqe = .{
+            .user_data = token,
+            .res = 1,
+            .flags = 0,
+        };
+        send_completions[index] = .{
+            .completion = cqe,
+            .target = reactor.route(null, cqe).?,
+        };
+    }
+    send_completions[2] = .{
+        .completion = .{ .user_data = 0, .res = 1, .flags = 0 },
+        .target = .{ .connection = .{
+            .slot = peers[1].slot,
+            .operation = .send,
+        } },
+    };
+
+    driver.pending_storage.shrinkAndFree(allocator, 1);
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = 0,
+    });
+    driver.allocator = failing_allocator.allocator();
+    const failed_batch = driver.dispatchRouted(&send_completions, &handler);
+    const transferred = switch (failed_batch) {
+        .complete => return error.ExpectedDispatchFailure,
+        .failed => |failure| failure,
+    };
+    try std.testing.expectEqual(error.OutOfMemory, transferred.cause);
+    try std.testing.expectEqual(
+        wayring.server.Driver(protocol).CompletionOwnership.driver,
+        transferred.ownership,
+    );
+    try std.testing.expectEqual(@as(usize, 2), transferred.progress.completions);
+    try std.testing.expect(!(try reactor.getActor(peers[1])).transmit.sendActive());
+
+    driver.allocator = allocator;
+    const suffix = driver.dispatchRouted(
+        send_completions[transferred.progress.completions..],
+        &handler,
+    );
+    const retained = switch (suffix) {
+        .complete => return error.ExpectedDispatchFailure,
+        .failed => |failure| failure,
+    };
+    try std.testing.expectEqual(error.NoSendActive, retained.cause);
+    try std.testing.expectEqual(
+        wayring.server.Driver(protocol).CompletionOwnership.caller,
+        retained.ownership,
+    );
+    try std.testing.expectEqual(@as(usize, 0), retained.progress.completions);
+    _ = try driver.schedule(peers[1]);
+    _ = try driver.prepare(&handler);
+
     var request: [12]u8 = undefined;
     try (wayring.wire.Header{
         .object_id = wayring.objects.display_id,

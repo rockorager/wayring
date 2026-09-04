@@ -2311,6 +2311,34 @@ pub fn Driver(comptime protocol: type) type {
             target: io_uring.CompletionTarget,
         };
 
+        pub const CompletionOwnership = enum {
+            /// The driver did not apply the failing CQE; the caller may retry it.
+            caller,
+            /// The CQE changed driver-owned state and must not be replayed.
+            driver,
+        };
+
+        pub const DispatchFailure = struct {
+            cause: anyerror,
+            ownership: CompletionOwnership,
+            /// Includes the failing CQE when `ownership` is `.driver`. The
+            /// unprocessed suffix therefore always begins at `completions`.
+            progress: Progress,
+        };
+
+        pub const DispatchResult = union(enum) {
+            complete: Progress,
+            failed: DispatchFailure,
+        };
+
+        const CompletionResult = union(enum) {
+            complete,
+            failed: struct {
+                cause: anyerror,
+                ownership: CompletionOwnership,
+            },
+        };
+
         pub fn init(
             allocator: std.mem.Allocator,
             runtime: *ServerRuntime,
@@ -2396,30 +2424,51 @@ pub fn Driver(comptime protocol: type) type {
                     &driver.runtime.endpoint.listener,
                     completion,
                 ) orelse return error.InvalidCompletion;
-                try driver.completeRouted(completion, target, handler, &progress);
+                var ownership: CompletionOwnership = .caller;
+                try driver.completeRouted(
+                    completion,
+                    target,
+                    handler,
+                    &progress,
+                    &ownership,
+                );
                 progress.completions += 1;
             }
             return progress;
         }
 
         /// Processes completions already classified by this driver's reactor
-        /// without routing or preparing them again.
+        /// without routing or preparing them again. On failure, `progress`
+        /// identifies the consumed prefix and `ownership` says whether the
+        /// failing CQE is part of that prefix. Resume with
+        /// `completions[result.failed.progress.completions..]`; never replay a
+        /// `.driver`-owned completion.
         pub fn dispatchRouted(
             driver: *Self,
             completions: []const RoutedCompletion,
             handler: anytype,
-        ) !Progress {
+        ) DispatchResult {
             var progress: Progress = .{};
             for (completions) |completion| {
-                try driver.completeRouted(
+                switch (driver.completeRoutedOwned(
                     completion.completion,
                     completion.target,
                     handler,
                     &progress,
-                );
-                progress.completions += 1;
+                )) {
+                    .complete => progress.completions += 1,
+                    .failed => |failure| {
+                        if (failure.ownership == .driver)
+                            progress.completions += 1;
+                        return .{ .failed = .{
+                            .cause = failure.cause,
+                            .ownership = failure.ownership,
+                            .progress = progress,
+                        } };
+                    },
+                }
             }
-            return progress;
+            return .{ .complete = progress };
         }
 
         /// Prepares queued sends, close cancellation, destruction, and deferred
@@ -2511,10 +2560,13 @@ pub fn Driver(comptime protocol: type) type {
             target: io_uring.CompletionTarget,
             handler: anytype,
             progress: *Progress,
+            ownership: *CompletionOwnership,
         ) !void {
             const reactor = driver.runtime.clients.reactor;
             switch (target) {
                 .listener => {
+                    // Completion may advance listener state before admission fails.
+                    ownership.* = .driver;
                     if (try driver.runtime.completeListener(
                         completion,
                         driver.display_context,
@@ -2534,11 +2586,13 @@ pub fn Driver(comptime protocol: type) type {
                     const actor = try reactor.getActor(peer);
                     const event = actor.completeRouted(routed.operation, completion) catch |err| {
                         if (err == error.IoFailure and actor.lifecycle == .closing) {
+                            ownership.* = .driver;
                             _ = try driver.schedule(peer);
                             return;
                         }
                         return err;
                     };
+                    ownership.* = .driver;
                     switch (event) {
                         .received => {
                             var context = RequestContext(@TypeOf(handler)){
@@ -2577,6 +2631,27 @@ pub fn Driver(comptime protocol: type) type {
                     }
                 },
             }
+        }
+
+        fn completeRoutedOwned(
+            driver: *Self,
+            completion: std.os.linux.io_uring_cqe,
+            target: io_uring.CompletionTarget,
+            handler: anytype,
+            progress: *Progress,
+        ) CompletionResult {
+            var ownership: CompletionOwnership = .caller;
+            driver.completeRouted(
+                completion,
+                target,
+                handler,
+                progress,
+                &ownership,
+            ) catch |cause| return .{ .failed = .{
+                .cause = cause,
+                .ownership = ownership,
+            } };
+            return .complete;
         }
 
         fn popPending(driver: *Self) void {
