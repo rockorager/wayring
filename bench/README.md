@@ -74,13 +74,28 @@ CONNECTIONS=64 IDLE_MS=5000 bench/run.sh idle-perf
 SHM_SIZES="4096 65536 8294400" SHM_BATCHES="1 16" bench/run.sh shm
 ```
 
-SHM mode compares the shrink-sealed zero-copy pin path with the SIGBUS-safe
-io_uring copy path. The sealed result measures mapping acquisition and endpoint
-sampling rather than memory-copy bandwidth; its reported byte rate is effective
-buffer availability. Copy mode moves every reported byte into caller-owned
+SHM mode compares the shrink-sealed zero-copy pin path, ordinary and nested
+SIGBUS-guarded scopes, and the io_uring copy path. The sealed result measures
+mapping acquisition and endpoint sampling rather than memory-copy bandwidth;
+its reported byte rate is effective buffer availability. Guarded and nested
+modes reuse one pin and measure access/end plus endpoint sampling, not pin
+acquisition or memory bandwidth.
+Nested mode holds one outer scope across the run; `batch` does not affect these
+two scope-only modes. Copy mode moves every reported byte into caller-owned
 memory. `SHM_TARGET_BYTES` controls work per matrix cell and
 `SHM_MAX_WORKING_BYTES` caps `size * batch` destination storage. Perf and syscall
 modes use `SHM_SIZE`, `SHM_BATCH`, `SHM_OPERATIONS`, and `SHM_WARMUP`.
+
+The contention benchmark compares one and two threads, each with its own store,
+using five samples of 100,000 scopes per thread. Setup is outside timing; thread
+join is included. It reports aggregate nanoseconds per scope, not per-thread
+latency. Run it with both modules optimized:
+
+```sh
+zig test -O ReleaseFast --dep wayring -Mroot=bench/shm.zig \
+    -O ReleaseFast -Mwayring=src/root.zig \
+    --test-filter 'guarded access contention benchmark'
+```
 
 Viewport mode sends the same three real protocol requests per operation from
 the same libwayland client: `set_source`, `set_destination`, and

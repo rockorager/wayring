@@ -384,10 +384,10 @@ case "$mode" in
                 sample=1
                 while [ "$sample" -le "$repeats" ]; do
                     echo "# sample=$sample scope=shm size=$shm_size batch=$shm_batch operations=$shm_operations" >&2
-                    "$root/zig-out/bench/wayring-shm" \
-                        sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
-                    "$root/zig-out/bench/wayring-shm" \
-                        copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+                    for shm_mode in sealed guarded nested copy; do
+                        "$root/zig-out/bench/wayring-shm" \
+                            "$shm_mode" "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+                    done
                     sample=$((sample + 1))
                 done
             done
@@ -399,10 +399,10 @@ case "$mode" in
         shm_batch=${SHM_BATCH:-16}
         shm_operations=${SHM_OPERATIONS:-$((shm_target_bytes / shm_size))}
         shm_warmup=${SHM_WARMUP:-$((shm_operations / 10))}
-        perf stat -e "$events" "$root/zig-out/bench/wayring-shm" \
-            sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
-        perf stat -e "$events" "$root/zig-out/bench/wayring-shm" \
-            copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        for shm_mode in sealed guarded nested copy; do
+            perf stat -e "$events" "$root/zig-out/bench/wayring-shm" \
+                "$shm_mode" "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        done
         ;;
     shm-syscalls)
         echo "warning: strace perturbs timing; use this mode only for syscall counts" >&2
@@ -410,10 +410,10 @@ case "$mode" in
         shm_batch=${SHM_BATCH:-16}
         shm_operations=${SHM_OPERATIONS:-$((shm_target_bytes / shm_size))}
         shm_warmup=${SHM_WARMUP:-$((shm_operations / 10))}
-        strace -f -c "$root/zig-out/bench/wayring-shm" \
-            sealed "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
-        strace -f -c "$root/zig-out/bench/wayring-shm" \
-            copy "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        for shm_mode in sealed guarded nested copy; do
+            strace -f -c "$root/zig-out/bench/wayring-shm" \
+                "$shm_mode" "$shm_size" "$shm_operations" "$shm_batch" "$shm_warmup"
+        done
         ;;
     viewport)
         sample=1

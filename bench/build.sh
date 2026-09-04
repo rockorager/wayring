@@ -82,7 +82,7 @@ zig build-exe -OReleaseFast -lc --dep wayring --dep benchmark_protocol \
 
 zig build-exe -OReleaseFast --dep wayring \
     -Mroot="$root/bench/shm.zig" \
-    -Mwayring="$root/src/root.zig" \
+    -OReleaseFast -Mwayring="$root/src/root.zig" \
     -femit-bin="$out/wayring-shm"
 
 # Keep libwayland out of the normal Wayring executable so mixed-interoperability

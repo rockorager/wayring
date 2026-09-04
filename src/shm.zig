@@ -11,7 +11,7 @@ const linux = std.os.linux;
 const none = std.math.maxInt(u32);
 
 var handler_mutex: std.atomic.Mutex = .unlocked;
-var handler_installed = false;
+var handler_installed: std.atomic.Value(bool) = .init(false);
 var previous_sigbus: linux.Sigaction = .{
     .handler = .{ .handler = std.posix.SIG.DFL },
     .mask = std.mem.zeroes(linux.sigset_t),
@@ -23,26 +23,32 @@ threadlocal var access_depth: usize = 0;
 threadlocal var backing_faulted: std.atomic.Value(bool) = .init(false);
 
 fn ensureSigbusHandler() error{SignalSetupFailed}!void {
-    while (!handler_mutex.tryLock()) std.atomic.spinLoopHint();
-    defer handler_mutex.unlock();
-
-    var current: linux.Sigaction = undefined;
-    if (linux.errno(linux.sigaction(.BUS, null, &current)) != .SUCCESS)
-        return error.SignalSetupFailed;
-    if (handler_installed) {
-        if (current.handler.sigaction != handleSigbus)
-            return error.SignalSetupFailed;
-        return;
+    if (!handler_installed.load(.acquire)) {
+        while (!handler_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer handler_mutex.unlock();
+        if (!handler_installed.load(.monotonic)) {
+            var current: linux.Sigaction = undefined;
+            if (linux.errno(linux.sigaction(.BUS, null, &current)) != .SUCCESS)
+                return error.SignalSetupFailed;
+            previous_sigbus = current;
+            const action: linux.Sigaction = .{
+                .handler = .{ .sigaction = handleSigbus },
+                .mask = std.mem.zeroes(linux.sigset_t),
+                .flags = linux.SA.SIGINFO | linux.SA.NODEFER,
+            };
+            if (linux.errno(linux.sigaction(.BUS, &action, null)) != .SUCCESS)
+                return error.SignalSetupFailed;
+            handler_installed.store(true, .release);
+            return;
+        }
     }
-    previous_sigbus = current;
-    const action: linux.Sigaction = .{
-        .handler = .{ .sigaction = handleSigbus },
-        .mask = std.mem.zeroes(linux.sigset_t),
-        .flags = linux.SA.SIGINFO | linux.SA.NODEFER,
-    };
-    if (linux.errno(linux.sigaction(.BUS, &action, null)) != .SUCCESS)
+
+    // Validation remains per-scope, but does not need to serialize readers.
+    // The installation publishes previous_sigbus once and never changes it.
+    var current: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(.BUS, null, &current)) != .SUCCESS or
+        current.handler.sigaction != handleSigbus)
         return error.SignalSetupFailed;
-    handler_installed = true;
 }
 
 fn handleSigbus(_: linux.SIG, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(.c) void {
@@ -732,6 +738,61 @@ fn fileCannotShrinkBelow(fd: linux.fd_t, size: usize) bool {
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
+}
+
+test "SIGBUS handler initializes concurrently and rejects replacement" {
+    const Worker = struct {
+        fn run(ready: *std.atomic.Value(usize), go: *std.atomic.Value(bool), failure: *?anyerror) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..1000) |_| ensureSigbusHandler() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var ready: std.atomic.Value(usize) = .init(0);
+    var go: std.atomic.Value(bool) = .init(false);
+    var failures = [_]?anyerror{null} ** 2;
+    var threads: [2]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        go.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads, &failures) |*thread, *failure| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &ready, &go, failure });
+        spawned += 1;
+    }
+    while (ready.load(.acquire) != threads.len) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    for (threads) |thread| thread.join();
+    spawned = 0;
+    for (failures) |failure| if (failure) |err| return err;
+
+    var store = try Store.init(std.testing.allocator, .{ .max_pool_bytes = 4096 }, 1, 1);
+    defer store.deinit(std.testing.allocator);
+    const pool = try store.addPool(try testMemfd(4096, false), 4096);
+    defer store.destroyPoolResource(pool) catch unreachable;
+    const buffer = try store.addBuffer(pool, .{ .value = 0, .bytes_per_pixel = 4 }, 0, 1, 1, 4);
+    defer store.destroyBuffer(buffer) catch unreachable;
+    const pin_value = try store.pin(buffer);
+    defer store.unpin(pin_value) catch unreachable;
+    var outer = try store.access(pin_value);
+    defer outer.end() catch unreachable;
+
+    const replacement: linux.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = 0,
+    };
+    var original: linux.Sigaction = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.BUS, &replacement, &original)));
+    defer std.debug.assert(linux.errno(linux.sigaction(.BUS, &original, null)) == .SUCCESS);
+    try std.testing.expectError(error.SignalSetupFailed, store.access(pin_value));
+    try std.testing.expectError(error.SignalSetupFailed, store.writeAccess(pin_value));
+    try std.testing.expectEqual(@as(usize, 1), (try store.resolvePin(pin_value.token)).access_count);
+    try std.testing.expectEqual(@as(usize, 1), access_depth);
 }
 
 test "store accepts stateless and stateful allocators" {
