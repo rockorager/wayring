@@ -24,6 +24,8 @@ pub const Object = struct {
 
 /// Cold-path notification for published objects removed individually or by
 /// connection teardown. Transactional cancellation does not invoke this hook.
+/// The object is detached before notification; hooks may remove other objects.
+/// During teardown, hooks must not insert objects or recursively call deinit.
 pub const RemovalHook = struct {
     context: ?*anyopaque = null,
     notify: *const fn (?*anyopaque, Handle, Object) void,
@@ -403,12 +405,20 @@ pub const ServerObjects = struct {
 
     pub fn deinit(server_objects: *ServerObjects, allocator: std.mem.Allocator) void {
         if (server_objects.removal_hook) |hook| {
-            var entries = server_objects.iterator();
-            while (entries.next()) |entry| hook.notify(
-                hook.context,
-                entry.handle,
-                entry.value.*,
-            );
+            const table = &server_objects.namespace.table;
+            // Walk backwards from an empty slot, removing cluster tails.
+            // No hole-closing scan is needed, and cascading removals cannot
+            // move an unvisited entry into the already-cleared region.
+            var index: usize = 0;
+            while (table.slots[index].id != 0) index += 1;
+            for (0..table.slots.len) |_| {
+                index = (index -% 1) & (table.slots.len - 1);
+                if (table.slots[index].id == 0) continue;
+                const slot = table.slots[index];
+                table.slots[index].id = 0;
+                table.count -= 1;
+                hook.notify(hook.context, .{ .id = slot.id, .generation = slot.generation }, slot.value);
+            }
         }
         server_objects.ids.deinit(allocator);
         server_objects.namespace.deinit(allocator);
@@ -965,12 +975,15 @@ pub const SharedServerObjects = struct {
 
     pub fn deinit(server_objects: *SharedServerObjects) void {
         if (server_objects.removal_hook) |hook| {
-            var entries = server_objects.iterator();
-            while (entries.next()) |entry| hook.notify(
-                hook.context,
-                entry.handle,
-                entry.value.*,
-            );
+            const namespace = &server_objects.namespace;
+            // The newest remaining object is also its bucket's head. Removing
+            // it is O(1), even when many IDs collide in the same bucket.
+            while (namespace.owner_tail != shared_end) {
+                const node = namespace.pool.nodes.items[namespace.owner_tail];
+                const handle: Handle = .{ .id = node.id, .generation = node.generation };
+                const object = namespace.remove(handle).?;
+                hook.notify(hook.context, handle, object);
+            }
         }
         server_objects.namespace.deinit();
         server_objects.* = undefined;
@@ -1477,6 +1490,65 @@ test "server objects separate client and server ID ownership" {
 fn countRemoval(context: ?*anyopaque, _: Handle, _: Object) void {
     const count: *usize = @ptrCast(@alignCast(context.?));
     count.* += 1;
+}
+
+test "teardown detaches objects exactly once across cascading removals and collisions" {
+    const info: metadata.Interface = .{ .name = "test", .version = 1, .requests = &.{}, .events = &.{} };
+    inline for (.{ ServerObjects, SharedServerObjects }) |Objects| {
+        for (0..16) |victim_index| {
+            var counts = [_]usize{0} ** 17;
+            var pool = try SharedObjectPool.init(std.testing.allocator, 17);
+            defer pool.deinit(std.testing.allocator);
+            var buckets = [_]SharedObjectBucket{.{}} ** 2;
+            var objects = if (Objects == ServerObjects)
+                try Objects.init(std.testing.allocator, 17, 1, &info, &counts[0])
+            else
+                try Objects.init(&pool, &buckets, 1, 17, &info, &counts[0]);
+            var handles: [16]Handle = undefined;
+            var id: u32 = 2;
+            for (handles[0..15], counts[1..16]) |*handle, *count| {
+                if (Objects == ServerObjects) {
+                    // Force a probe cluster that wraps through slot zero.
+                    while (objects.namespace.table.home(id) != objects.namespace.table.slots.len - 1) id += 1;
+                }
+                handle.* = try objects.insertClient(id, &info, 1, count);
+                id += 1;
+            }
+            handles[15] = try objects.createLocal(&info, 1, &counts[16]);
+            const State = struct {
+                objects: *Objects,
+                handles: []const Handle,
+                counts: []const usize,
+                victim: Handle,
+                triggered: bool = false,
+
+                fn notify(raw: ?*anyopaque, handle: Handle, object: Object) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    std.testing.expect(self.objects.namespace.resolve(handle) == null) catch unreachable;
+                    const count: *usize = @ptrCast(@alignCast(object.context.?));
+                    count.* += 1;
+                    // Cascading cleanup must still be able to find every live object.
+                    for (self.handles, self.counts[1..]) |other, notifications| {
+                        std.testing.expectEqual(notifications == 0, self.objects.namespace.resolve(other) != null) catch unreachable;
+                    }
+                    if (!self.triggered) {
+                        self.triggered = true;
+                        if (self.objects.namespace.resolve(self.victim) != null) {
+                            if (self.victim.id >= server_id_start)
+                                _ = self.objects.removeLocal(self.victim) catch unreachable
+                            else
+                                _ = self.objects.removeClient(self.victim) catch unreachable;
+                        }
+                    }
+                }
+            };
+            var state: State = .{ .objects = &objects, .handles = &handles, .counts = &counts, .victim = handles[victim_index] };
+            objects.setRemovalHook(.{ .context = &state, .notify = State.notify });
+            if (Objects == ServerObjects) objects.deinit(std.testing.allocator) else objects.deinit();
+            try std.testing.expectEqualSlices(usize, &(@as([17]usize, @splat(1))), &counts);
+            try std.testing.expectEqual(@as(usize, 17), pool.available());
+        }
+    }
 }
 
 test "server namespaces share physical objects with isolated quotas" {

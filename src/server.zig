@@ -1187,10 +1187,10 @@ pub fn SharedClients(comptime protocol: type) type {
         }
 
         pub fn deinit(clients: *Self, allocator: std.mem.Allocator) void {
-            std.debug.assert(allocator.ptr == clients.allocator.ptr);
+            _ = allocator; // Retained for compatibility; allocation ownership is stored.
             for (clients.records.items) |record| std.debug.assert(record == null);
-            clients.records.deinit(allocator);
-            clients.object_pool.deinit(allocator);
+            clients.records.deinit(clients.allocator);
+            clients.object_pool.deinit(clients.allocator);
             clients.* = undefined;
         }
 
@@ -2258,6 +2258,9 @@ pub fn Runtime(comptime protocol: type) type {
 /// allocates one intrusive pending-work node per reactor connection slot; CQE
 /// processing and request dispatch allocate nothing. Ring submission remains
 /// explicit so owned- and borrowed-ring users share the same batching policy.
+/// The optional disconnected hook performs application cleanup while client
+/// metadata is live. It must not destroy the client or reenter the driver;
+/// the driver calls Runtime.destroyClient after the hook returns.
 pub fn Driver(comptime protocol: type) type {
     return struct {
         const Self = @This();
@@ -2514,6 +2517,8 @@ pub fn Driver(comptime protocol: type) type {
 
                 if (actor.lifecycle == .closing and actor.canDeinit()) {
                     driver.popPending();
+                    // Application cleanup runs while client metadata is live.
+                    // The driver, not the callback, owns destroyClient.
                     if (@hasDecl(@TypeOf(handler.*), "disconnected"))
                         handler.disconnected(peer);
                     try driver.runtime.destroyClient(peer);

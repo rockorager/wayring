@@ -770,6 +770,15 @@ const UnreachableServerHandler = struct {
     }
 };
 
+test "client stores accept stateless and stateful allocators" {
+    inline for (.{ std.heap.page_allocator, std.testing.allocator }) |allocator| {
+        // Empty store initialization and teardown do not access the reactor.
+        var reactor: wayring.io_uring.Reactor = undefined;
+        var clients = try wayring.server.SharedClients(protocol).init(allocator, &reactor, 1, 1, 2);
+        clients.deinit(allocator);
+    }
+}
+
 test "clients keep independent bounded object namespaces" {
     const allocator = std.testing.allocator;
     var reactor: wayring.io_uring.Reactor = undefined;

@@ -96,6 +96,7 @@ pub const StoreError = Error || std.mem.Allocator.Error || std.posix.MMapError |
     ShortRead,
     SignalSetupFailed,
     AccessConflict,
+    AccessActive,
     InvalidBacking,
 };
 
@@ -226,6 +227,7 @@ const PinNode = struct {
     generation: u32 = 1,
     next_free: u32 = none,
     active: bool = false,
+    access_count: usize = 0,
     pool: PoolToken = undefined,
     metadata: Buffer = undefined,
 };
@@ -293,7 +295,7 @@ pub const Store = struct {
         std.debug.assert(store.active_pools == 0);
         std.debug.assert(store.active_buffers == 0);
         std.debug.assert(store.active_pins == 0);
-        std.debug.assert(allocator.ptr == store.allocator.ptr);
+        _ = allocator; // Retained for compatibility; allocation ownership is stored.
         store.deinitNodes();
         store.* = undefined;
     }
@@ -474,7 +476,9 @@ pub const Store = struct {
             /// zero pages and this reports the client-owned backing as invalid.
             pub fn end(self: *Self) StoreError!void {
                 if (!self.active) return error.StalePin;
-                _ = try self.store.resolvePin(self.pin.token);
+                const pin_node = try self.store.resolvePin(self.pin.token);
+                std.debug.assert(pin_node.access_count > 0);
+                pin_node.access_count -= 1;
                 if (self.guarded) {
                     std.debug.assert(
                         active_pool_address.load(.acquire) == @intFromPtr(self.pool) and
@@ -503,7 +507,8 @@ pub const Store = struct {
     /// Begins scoped direct access to a pinned buffer. Ordinary unsealed pools
     /// are protected against concurrent truncation by a process-wide SIGBUS
     /// guard; shrink-sealed pools need no signal scope. Nested access on one
-    /// thread is allowed only for the same pool.
+    /// thread is allowed only for the same pool. End every access exactly once,
+    /// on the originating thread, before unpinning; do not copy active scopes.
     pub fn access(store: *Store, pin_value: Pin) StoreError!Access {
         return store.beginAccess(pin_value, false);
     }
@@ -534,6 +539,7 @@ pub const Store = struct {
             }
             access_depth += 1;
         }
+        pin_node.access_count += 1;
         return .{
             .store = store,
             .pin = pin_value,
@@ -545,9 +551,11 @@ pub const Store = struct {
 
     /// Consumes the pin before applying deferred growth. A remap failure is
     /// returned with the growth still pending, but the completed copy pin is
-    /// not retained and must not be unpinned again.
+    /// not retained and must not be unpinned again. AccessActive instead leaves
+    /// the pin unchanged: end its scoped accesses before retrying unpin.
     pub fn unpin(store: *Store, pin_value: Pin) StoreError!void {
         const pin_node = try store.resolvePin(pin_value.token);
+        if (pin_node.access_count != 0) return error.AccessActive;
         const pool_token = pin_node.pool;
         const pool_index = pool_token.index;
         const pool = try store.resolvePool(pool_token);
@@ -724,6 +732,53 @@ fn fileCannotShrinkBelow(fd: linux.fd_t, size: usize) bool {
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
+}
+
+test "store accepts stateless and stateful allocators" {
+    inline for (.{ std.heap.page_allocator, std.testing.allocator }) |allocator| {
+        var store = try Store.init(allocator, .{ .max_pool_bytes = 4096 }, 1, 1);
+        const pool = try store.addPool(try testMemfd(4096, true), 4096);
+        try store.destroyPoolResource(pool);
+        store.deinit(allocator);
+    }
+}
+
+test "scoped access prevents unpin without blocking unrelated pins" {
+    for ([_]bool{ true, false }) |sealed| {
+        var store = try Store.init(std.testing.allocator, .{ .max_pool_bytes = 8192 }, 2, 2);
+        defer store.deinit(std.testing.allocator);
+        const pool = try store.addPool(try testMemfd(8192, sealed), 4096);
+        const buffer = try store.addBuffer(pool, .{ .value = 0, .bytes_per_pixel = 4 }, 0, 1, 1, 4);
+        const pin_value = try store.pin(buffer);
+        const sibling = try store.pin(buffer);
+        var outer = try store.access(pin_value);
+        var nested = try store.writeAccess(pin_value);
+        try store.resize(pool, 8192);
+        const before = try store.poolInfo(pool);
+        try std.testing.expectError(error.AccessActive, store.unpin(pin_value));
+        try std.testing.expectEqualDeep(before, try store.poolInfo(pool));
+        try std.testing.expectEqual(@as(usize, 2), store.active_pins);
+        try store.unpin(sibling);
+        try nested.end();
+        try std.testing.expectError(error.StalePin, nested.end());
+        try std.testing.expectError(error.AccessActive, store.unpin(pin_value));
+        try outer.end();
+        try store.unpin(pin_value);
+        try std.testing.expectEqual(@as(usize, 8192), (try store.poolInfo(pool)).mapped_size);
+        try std.testing.expectError(error.StalePin, store.unpin(pin_value));
+
+        // A retained scope also prevents reclamation after protocol resources die.
+        const retained = try store.pin(buffer);
+        var scope = try store.access(retained);
+        try store.destroyBuffer(buffer);
+        try store.destroyPoolResource(pool);
+        try std.testing.expectError(error.AccessActive, store.unpin(retained));
+        try scope.end();
+        try store.unpin(retained);
+        try std.testing.expectEqual(@as(usize, 0), store.active_pools);
+        try std.testing.expectEqual(@as(usize, 0), access_depth);
+        try std.testing.expectEqual(@as(usize, 0), active_pool_address.load(.acquire));
+    }
 }
 
 test "store grows pools buffers and pins beyond initial capacities" {

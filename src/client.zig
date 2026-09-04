@@ -514,6 +514,9 @@ pub fn Roundtrip(comptime protocol: type, comptime Handler: type) type {
 /// Allocation-free completion driver for one client `Connection`. The driver
 /// borrows both connection and ring, keeps submission explicit, and leaves
 /// final `Connection.deinit` to the owner once `Progress.quiescent` is true.
+/// The optional disconnected hook runs last, with no subsequent connection
+/// access. It may release the connection, but must not reenter the driver; do
+/// not use the driver again after releasing its connection.
 pub fn Driver(comptime protocol: type) type {
     return struct {
         const Self = @This();
@@ -577,14 +580,10 @@ pub fn Driver(comptime protocol: type) type {
             var progress: Progress = .{};
             const reactor = driver.connection.reactor;
             const actor = try driver.connection.actor();
+            var disconnected = false;
             if (driver.scheduled) {
                 if (actor.lifecycle == .closing and actor.canDeinit()) {
-                    driver.scheduled = false;
-                    if (!driver.disconnected_notified) {
-                        driver.disconnected_notified = true;
-                        if (@hasDecl(@TypeOf(handler.*), "disconnected"))
-                            handler.disconnected(driver.connection.peer);
-                    }
+                    disconnected = true;
                 } else if (actor.lifecycle == .closing) {
                     if (!actor.cancel_requested) {
                         const queued = reactor.prepareClose(driver.connection.peer) catch |err| {
@@ -615,8 +614,14 @@ pub fn Driver(comptime protocol: type) type {
             }
 
             progress.prepared += try reactor.prepareDeferredReceives();
+            if (disconnected) driver.scheduled = false;
             progress.pending = driver.scheduled or reactor.deferredReceivesPending();
             progress.quiescent = actor.canDeinit();
+            if (disconnected and !driver.disconnected_notified) {
+                driver.disconnected_notified = true;
+                if (@hasDecl(@TypeOf(handler.*), "disconnected"))
+                    handler.disconnected(driver.connection.peer);
+            }
             return progress;
         }
 

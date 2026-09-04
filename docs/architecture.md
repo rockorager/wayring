@@ -93,6 +93,9 @@ credentials plus global and resource handles; factory failure cancels the
 unpublished insertion. Each client namespace may also install one removal hook
 for application resource cleanup. Published destructor removals and disconnect
 teardown notify it, while constructor and bind rollback deliberately do not.
+Objects are detached before notification, and hooks may remove other objects
+without duplicating or skipping notifications. Teardown hooks must not insert
+objects or recursively deinitialize the namespace.
 The hook lives once per client rather than once per object, preserving object
 size and hot lookup locality; disconnect remains O(1) when no hook is installed.
 The server runtime may also install one cold-path global-visibility predicate.
@@ -318,7 +321,10 @@ deferred receive rearming, and reports quiescence; the application still owns
 submission and calls `Connection.deinit` with its allocator. External request
 producers explicitly schedule the driver after queueing output. Typed optional
 hooks report terminal event failures and final disconnection without dynamic
-callback registration.
+callback registration. The disconnection hook runs after the driver's last
+connection access, so it may release the connection instead of waiting for the
+returned quiescence flag. It must not reenter the driver, and releasing the
+connection ends the driver's lifetime.
 Against the same libwayland server, the client driver's five-sample throughput
 median was 5.39 million messages/second versus 5.31 million for the handwritten
 loop. A longer alternating latency run measured median p50 of 54.5 microseconds
@@ -397,9 +403,11 @@ dispatches batches of already-filtered Wayring CQEs, and prepares resulting
 sends, cancellation, destruction, and deferred receives without submitting.
 Application handlers receive the peer, resolved target, message, and descriptor
 queue directly; optional connection, disconnection, and protocol-error hooks
-remain statically dispatched. The driver advances the runtime's initial and
-incremental global-publication cursors and schedules each affected peer, so
-registry backpressure resumes on later send completions. External producers of
+remain statically dispatched. The disconnection hook runs while client metadata
+is live and must not destroy the client or reenter the driver; the driver owns
+client destruction after the hook returns. The driver advances the runtime's
+initial and incremental global-publication cursors and schedules each affected
+peer, so registry backpressure resumes on later send completions. External producers of
 other events explicitly schedule the affected peer. Borrowed-ring users must
 filter unrelated CQEs before dispatch and retain control of `submit`; if a
 batch reports pending work because the SQ filled, they submit and call
@@ -501,6 +509,9 @@ protocol resource may be destroyed first. Generation-checked tokens reject
 stale slot reuse. Growth uses `mremap` immediately when idle and is deferred
 while pinned, preventing address movement beneath an importer. Failed deferred
 growth consumes the last pin but remains retryable by a later pin or resize.
+Scoped accesses must end exactly once on their originating thread before their
+pin is released. Premature unpin returns `AccessActive` without consuming the
+pin or applying deferred growth; unrelated pins can still be released.
 Shrink-sealed files whose length covers the complete mapping expose an
 unguarded zero-copy read-only slice. Scoped access to ordinary unsealed files
 installs a process-wide SIGBUS guard modeled on the MIT-licensed Wayland

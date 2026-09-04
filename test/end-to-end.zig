@@ -300,6 +300,56 @@ test "client closes after a transported terminal display error" {
     reactor.deinit(std.testing.allocator);
 }
 
+test "client driver does not access connection after disconnect hook" {
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, .{
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 2,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 1,
+        .transmit_block_size = 64,
+        .transmit_block_count = 1,
+        .descriptor_count = 2,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(allocator);
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &sockets,
+    )));
+    defer _ = linux.close(sockets[1]);
+    var connection = try ClientConnection.attach(allocator, &reactor, sockets[0], .{
+        .received_fd_budget = 1,
+        .transmit_byte_budget = 64,
+        .transmit_fd_budget = 1,
+    }, .{ .max_objects = 1, .max_client_ids = 1 });
+    const peer = connection.peer;
+    try (try connection.receiver()).stop(reactor.ring, reactor.slots, try connection.actor());
+    const Handler = struct {
+        connection: *ClientConnection,
+        count: usize = 0,
+
+        pub fn disconnected(self: *@This(), _: wayring.io_uring.Peer) void {
+            self.connection.deinit(std.testing.allocator) catch unreachable;
+            self.count += 1;
+        }
+    };
+    var handler: Handler = .{ .connection = &connection };
+    var driver = ClientDriver.init(&connection);
+    _ = try driver.schedule();
+    const progress = try driver.prepare(&handler);
+    try std.testing.expect(progress.quiescent);
+    try std.testing.expect(!progress.pending);
+    try std.testing.expectEqual(@as(usize, 1), handler.count);
+    try std.testing.expectEqual(@as(usize, 0), reactor.slots.active_count);
+    try std.testing.expectError(error.SlotInactive, reactor.getActor(peer));
+}
+
 test "client connection rolls back failed object initialization" {
     var sockets: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(

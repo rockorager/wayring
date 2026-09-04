@@ -64,7 +64,7 @@ pub const SharedBlocks = struct {
 
     pub fn deinit(blocks: *SharedBlocks, allocator: std.mem.Allocator) void {
         std.debug.assert(blocks.active_count == 0);
-        std.debug.assert(allocator.ptr == blocks.allocator.ptr);
+        _ = allocator; // Retained for compatibility; allocation ownership is stored.
         blocks.deinitNodes();
         blocks.* = undefined;
     }
@@ -193,7 +193,7 @@ pub const SharedFds = struct {
 
     pub fn deinit(fds: *SharedFds, allocator: std.mem.Allocator) void {
         std.debug.assert(fds.active_count == 0);
-        std.debug.assert(allocator.ptr == fds.allocator.ptr);
+        _ = allocator; // Retained for compatibility; allocation ownership is stored.
         fds.deinitNodes();
         fds.* = undefined;
     }
@@ -283,6 +283,17 @@ pub const SharedFds = struct {
 fn nextGeneration(current: u32) u32 {
     const next = current +% 1;
     return if (next == 0) 1 else next;
+}
+
+test "shared pools accept stateless and stateful allocators" {
+    inline for (.{ std.heap.page_allocator, std.testing.allocator }) |allocator| {
+        var blocks = try SharedBlocks.init(allocator, 64, 1);
+        const lease = try blocks.acquire();
+        try blocks.release(lease);
+        blocks.deinit(allocator);
+        var fds = try SharedFds.init(allocator, 1);
+        fds.deinit(allocator);
+    }
 }
 
 test "blocks grow and recycle with stable leases" {
