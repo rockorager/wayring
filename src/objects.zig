@@ -20,6 +20,8 @@ pub const Object = struct {
     interface: *const metadata.Interface,
     version: u32,
     context: ?*anyopaque = null,
+    /// A client destructor was published, but delete_id has not arrived yet.
+    destroyed: bool = false,
 };
 
 /// Cold-path notification for published objects removed individually or by
@@ -42,7 +44,7 @@ pub const Dispatch = struct {
     }
 };
 
-pub const NamespaceError = Error || metadata.Error || error{UnknownObject};
+pub const NamespaceError = Error || metadata.Error || error{ UnknownObject, DestroyedObject };
 
 /// A policy-light object namespace suitable for a single Wayland connection.
 /// It validates interface versions at insertion and message availability at
@@ -87,6 +89,7 @@ pub const Namespace = struct {
         opcode: u16,
     ) NamespaceError!Dispatch {
         const object = namespace.table.get(id) orelse return error.UnknownObject;
+        if (object.destroyed) return error.DestroyedObject;
         return .{
             .object = object,
             .message = try object.interface.request(opcode, object.version),
@@ -110,7 +113,15 @@ pub const Namespace = struct {
     }
 
     pub fn get(namespace: *Namespace, id: u32) ?*Object {
-        return namespace.table.get(id);
+        const object = namespace.table.get(id) orelse return null;
+        return if (object.destroyed) null else object;
+    }
+
+    /// Resolves an object argument in a server event. Destroyed client objects
+    /// are known IDs, but are exposed to typed handlers as null/zero.
+    pub fn eventArgument(namespace: *Namespace, id: u32) error{UnknownObject}!?*Object {
+        const object = namespace.table.get(id) orelse return error.UnknownObject;
+        return if (object.destroyed) null else object;
     }
 
     pub fn resolve(namespace: *Namespace, handle: Handle) ?*Object {
@@ -222,6 +233,7 @@ pub const ClientObjectsError = NamespaceError || ClientIdError || error{
     InvalidLocalId,
     InvalidPeerId,
     StaleHandle,
+    DestroyedObject,
 };
 
 /// Couples client-created ID reuse rules to the dispatch namespace while
@@ -280,18 +292,23 @@ pub const ClientObjects = struct {
         return objects.namespace.remove(handle).?;
     }
 
-    /// Removes a locally destroyed object from dispatch but keeps its ID held
-    /// until `deleted` applies wl_display.delete_id.
+    /// Retains a locally destroyed object as an event-dispatch tombstone until
+    /// `deleted` applies wl_display.delete_id.
     pub fn retireLocal(objects: *ClientObjects, handle: Handle) ClientObjectsError!Object {
         if (handle.id < 2 or handle.id >= server_id_start) return error.InvalidLocalId;
         const value = objects.namespace.resolve(handle) orelse return error.StaleHandle;
-        _ = value;
+        if (value.destroyed) return error.DestroyedObject;
         try objects.ids.retire(handle.id);
-        return objects.namespace.remove(handle).?;
+        value.destroyed = true;
+        return value.*;
     }
 
     pub fn deleted(objects: *ClientObjects, id: u32) ClientObjectsError!void {
+        const handle = objects.namespace.lookupHandle(id) orelse return error.UnknownObject;
+        const object = objects.namespace.resolve(handle).?;
+        if (!object.destroyed) return error.InvalidTransition;
         try objects.ids.deleted(id);
+        _ = objects.namespace.remove(handle).?;
     }
 
     pub fn insertPeer(
@@ -1423,12 +1440,17 @@ test "client objects transact creation, retirement, and peer IDs" {
     const first = try objects.createLocal(&child_info, 2, null);
     try std.testing.expectEqual(unpublished.id, first.id);
     _ = try objects.retireLocal(first);
+    try std.testing.expect(objects.namespace.resolve(first).?.destroyed);
+    try std.testing.expectError(error.DestroyedObject, objects.namespace.request(first.id, 0));
     const second = try objects.createLocal(&child_info, 1, null);
     try std.testing.expect(first.id != second.id);
     try std.testing.expectError(error.Exhausted, objects.createLocal(&child_info, 1, null));
     try objects.deleted(first.id);
+    try std.testing.expect(objects.namespace.resolve(first) == null);
     const reused = try objects.createLocal(&child_info, 1, null);
     try std.testing.expectEqual(first.id, reused.id);
+    try std.testing.expect(first.generation != reused.generation);
+    try std.testing.expect(objects.namespace.resolve(first) == null);
 
     const peer = try objects.insertPeer(server_id_start, &child_info, 1, null);
     _ = try objects.removePeer(peer);

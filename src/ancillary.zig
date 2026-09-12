@@ -55,6 +55,11 @@ pub const FdQueue = struct {
         return fd;
     }
 
+    pub fn discard(queue: *FdQueue, count: usize) Error!void {
+        if (queue.count < count) return error.Empty;
+        for (0..count) |_| _ = linux.close(try queue.pop());
+    }
+
     pub fn append(queue: *FdQueue, fd: linux.fd_t) Error!void {
         try queue.ensureCapacity(1);
         const lease = try queue.pool.acquire(fd);

@@ -439,6 +439,7 @@ test "generated server events transact peer object creation" {
     );
     const payload = switch (event) {
         .spawn_children => |value| value,
+        else => return error.UnexpectedEvent,
     };
     try std.testing.expectEqual(constructed.local_child.id, payload.local_child);
     try std.testing.expectEqual(constructed.external_child.id, payload.external_child);

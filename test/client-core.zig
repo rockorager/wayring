@@ -150,7 +150,17 @@ test "generic client helpers apply generated destructor lifecycle" {
         object,
         .{ .destroy = .{} },
     );
-    try std.testing.expect(client_objects.namespace.resolve(object) == null);
+    try std.testing.expect(client_objects.namespace.resolve(object).?.destroyed);
+    try std.testing.expectError(
+        error.DestroyedObject,
+        wayring.client.sendRequest(
+            protocol.wp_wayring_test_v1,
+            &client_objects,
+            &queue,
+            object,
+            .{ .destroy = .{} },
+        ),
+    );
     try consume(&queue);
     const next = try client_objects.createLocal(&protocol.wp_wayring_test_v1.info, 1, null);
     try std.testing.expectEqual(@as(u32, 3), next.id);
@@ -189,7 +199,7 @@ test "generic client helpers apply generated destructor lifecycle" {
     try std.testing.expectEqual(@as(u32, 42), switch (event) {
         .done => |done| done.callback_data,
     });
-    try std.testing.expect(client_objects.namespace.resolve(callback) == null);
+    try std.testing.expect(client_objects.namespace.resolve(callback).?.destroyed);
 }
 
 test "generated constructors transact typed and dynamic new IDs" {
@@ -404,6 +414,71 @@ test "client terminal display error stops concatenated event dispatch" {
     try std.testing.expectEqual(@as(usize, 12), bytes.len);
     try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle);
     try std.testing.expect(client_objects.ids.isActive(callback.id));
+}
+
+test "late events discard destroyed targets and their fds until delete_id" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+    defer queue.deinit();
+    var fragments: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(0, 1, &fragments, &descriptors, 1, &blocks, 64, 0);
+    defer actor.deinit();
+    var objects = try wayring.objects.ClientObjects.init(std.testing.allocator, 4, 2, &Core.Display.info, null);
+    defer objects.deinit(std.testing.allocator);
+    const Interface = protocol.wp_wayring_test_v1;
+    const dead = try objects.createLocal(&Interface.info, 1, null);
+    _ = try objects.retireLocal(dead);
+    const original = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(original));
+    const duplicate = linux.fcntl(@intCast(original), linux.F.DUPFD_CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(duplicate));
+    const received: linux.fd_t = @intCast(duplicate);
+    try actor.received_fds.append(received);
+    try Interface.encodeEvent(&queue, dead.id, .{ .late_fd = .{ .descriptor = @intCast(original) } });
+    try Core.Display.encodeEvent(&queue, 1, .{ .delete_id = .{ .id = dead.id } });
+    var fd_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var bytes = (try queue.snapshot(&fd_scratch, &control)).first;
+    var handler: DisplayErrorHandler = .{ .objects = &objects };
+    const result = Core.dispatchEvents(&actor, &objects.namespace, &bytes, &handler);
+    try std.testing.expectEqual(@as(usize, 1), result.dispatched);
+    try std.testing.expectEqual(@as(usize, 1), handler.deleted);
+    try std.testing.expectEqual(@as(usize, 0), actor.received_fds.count);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(received, linux.F.GETFD, 0)));
+    try std.testing.expect(objects.namespace.lookupHandle(dead.id) == null);
+    try consume(&queue);
+    // Past delete_id this really is unknown and must fail, not be swallowed.
+    try Interface.encodeEvent(&queue, dead.id, .{ .late_reference = .{ .target = 123, .optional_target = null } });
+    bytes = (try queue.snapshot(&fd_scratch, &control)).first;
+    const failure = Core.dispatchEvents(&actor, &objects.namespace, &bytes, &handler).terminal;
+    try std.testing.expectEqual(error.UnknownObject, failure.cause);
+}
+
+test "late event object arguments become null but unknown and outgoing dead references fail" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+    defer queue.deinit();
+    var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    var objects = try wayring.objects.ClientObjects.init(std.testing.allocator, 4, 3, &Core.Display.info, null);
+    defer objects.deinit(std.testing.allocator);
+    const Interface = protocol.wp_wayring_test_v1;
+    const live = try objects.createLocal(&Interface.info, 1, null);
+    const dead = try objects.createLocal(&Interface.info, 1, null);
+    _ = try objects.retireLocal(dead);
+    try Interface.encodeEvent(&queue, live.id, .{ .late_reference = .{ .target = dead.id, .optional_target = dead.id } });
+    const event = try wayring.client.decodeEvent(Interface, &objects, live, try firstMessage(&queue), &fds);
+    try std.testing.expectEqual(@as(u32, 0), event.late_reference.target);
+    try std.testing.expect(event.late_reference.optional_target == null);
+    try consume(&queue);
+    try std.testing.expectError(error.UnknownObject, wayring.client.sendRequest(Interface, &objects, &queue, live, .{ .set_target = .{ .target = dead.id } }));
+    try Interface.encodeEvent(&queue, live.id, .{ .late_reference = .{ .target = 123, .optional_target = null } });
+    try std.testing.expectError(error.UnknownObject, wayring.client.decodeEvent(Interface, &objects, live, try firstMessage(&queue), &fds));
 }
 
 const DisplayErrorHandler = struct {

@@ -944,6 +944,14 @@ fn emitMetadata(
         try add(output, allocator, ", .destructor = true")
     else
         try add(output, allocator, "");
+    var fd_count: usize = 0;
+    for (message.arguments) |argument| if (argument.type == .fd) {
+        fd_count += 1;
+    };
+    if (fd_count != 0) {
+        try add(output, allocator, ", .fd_count = ");
+        try unsigned(output, allocator, fd_count);
+    }
     try add(output, allocator, " },\n");
 }
 
@@ -996,7 +1004,13 @@ fn emitDirection(
     };
     if (!has_fds) try add(output, allocator, "        _ = fds;\n");
     try add(output, allocator, "        const value: " ++ direction ++ " = switch (message.header.opcode) {\n");
-    for (messages) |message| try emitDecoderCase(output, allocator, message, has_objects);
+    for (messages) |message| try emitDecoderCase(
+        output,
+        allocator,
+        message,
+        has_objects,
+        std.mem.eql(u8, direction, "Event"),
+    );
     try add(output, allocator, "            else => return error.UnknownOpcode,\n        };\n        debug" ++ direction ++ "(.");
     try add(output, allocator, if (std.mem.eql(u8, direction, "Request")) "server" else "client");
     try add(output, allocator, ", false, message.header.object_id, value);\n        return value;\n    }\n\n");
@@ -1398,13 +1412,14 @@ fn emitDecoderCase(
     allocator: std.mem.Allocator,
     message: protocol_ir.Message,
     supports_object_validation: bool,
+    event_decode: bool,
 ) Error!void {
     try add(output, allocator, "            ");
     try unsigned(output, allocator, message.opcode);
     try add(output, allocator, " => decoded_message: {\n                var arguments = message.arguments();\n");
     for (message.arguments) |argument| {
         if (argument.type == .fd) continue;
-        try add(output, allocator, "                const decoded_");
+        try add(output, allocator, if (event_decode and argument.type == .object) "                var decoded_" else "                const decoded_");
         try add(output, allocator, argument.name);
         try add(output, allocator, ": ");
         try emitType(output, allocator, argument);
@@ -1425,6 +1440,7 @@ fn emitDecoderCase(
                 "decoded_",
                 object_index,
                 20,
+                event_decode,
             );
             try add(output, allocator, "                }\n");
             object_index += 1;
@@ -1489,6 +1505,7 @@ fn emitObjectValidator(
                 "payload.",
                 object_index,
                 16,
+                false,
             );
             object_index += 1;
         }
@@ -1506,6 +1523,7 @@ fn emitObjectValidation(
     value_prefix: []const u8,
     index: usize,
     indent: usize,
+    event_decode: bool,
 ) Error!void {
     try addSpaces(output, allocator, indent);
     if (argument.allow_null) {
@@ -1515,25 +1533,43 @@ fn emitObjectValidation(
     }
     const body_indent = indent + @as(usize, if (argument.allow_null) 4 else 0);
     try addSpaces(output, allocator, body_indent);
-    if (argument.interface != null) {
+    if (argument.interface != null or event_decode) {
         try add(output, allocator, "const referenced_");
         try unsigned(output, allocator, index);
         try add(output, allocator, " = ");
     } else {
         try add(output, allocator, "_ = ");
     }
-    try add(output, allocator, "namespace.get(");
+    if (event_decode) try add(output, allocator, "namespace.eventArgument(") else try add(output, allocator, "namespace.get(");
     if (argument.allow_null) {
         try add(output, allocator, "object_id");
     } else {
         try emitObjectValue(output, allocator, argument.name, value_prefix);
     }
-    try add(output, allocator, ") orelse return error.UnknownObject;\n");
+    if (event_decode) {
+        try add(output, allocator, ") catch |err| return err;\n");
+        try addSpaces(output, allocator, body_indent);
+        try add(output, allocator, "if (referenced_");
+        try unsigned(output, allocator, index);
+        try add(output, allocator, " == null) { ");
+        try add(output, allocator, value_prefix);
+        try add(output, allocator, argument.name);
+        try add(output, allocator, " = ");
+        try add(output, allocator, if (argument.allow_null) "null" else "0");
+        try add(output, allocator, "; ");
+        try add(output, allocator, "}\n");
+    } else try add(output, allocator, ") orelse return error.UnknownObject;\n");
     if (argument.interface) |interface| {
         try addSpaces(output, allocator, body_indent);
-        try add(output, allocator, "if (!std.mem.eql(u8, referenced_");
+        try add(output, allocator, "if (");
+        if (event_decode) {
+            try add(output, allocator, "referenced_");
+            try unsigned(output, allocator, index);
+            try add(output, allocator, " != null and ");
+        }
+        try add(output, allocator, "!std.mem.eql(u8, referenced_");
         try unsigned(output, allocator, index);
-        try add(output, allocator, ".interface.name, \"");
+        try add(output, allocator, if (event_decode) ".?.interface.name, \"" else ".interface.name, \"");
         try add(output, allocator, interface);
         try add(output, allocator, "\")) return error.WrongInterface;\n");
     }

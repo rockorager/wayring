@@ -40,6 +40,7 @@ pub fn sendRequest(
 ) !void {
     const object = client_objects.namespace.resolve(handle) orelse
         return error.StaleHandle;
+    if (object.destroyed) return error.DestroyedObject;
     if (object.interface != &Interface.info) return error.WrongInterface;
     const opcode: u16 = @intCast(@intFromEnum(std.meta.activeTag(request)));
     const message = try object.interface.request(opcode, object.version);
@@ -62,6 +63,7 @@ pub fn decodeEvent(
     if (message.header.object_id != handle.id) return error.WrongObject;
     const object = client_objects.namespace.resolve(handle) orelse
         return error.StaleHandle;
+    if (object.destroyed) return error.DestroyedObject;
     if (object.interface != &Interface.info) return error.WrongInterface;
     const metadata_message = try object.interface.event(
         message.header.opcode,
@@ -206,6 +208,11 @@ pub fn Core(comptime protocol: type) type {
                     complete.header.object_id,
                     cause,
                 );
+                if (target.object.destroyed) {
+                    actor.received_fds.discard(target.message.fd_count) catch |cause|
+                        return terminalEvent(actor, count, complete.header.object_id, cause);
+                    continue;
+                }
                 const server_error = target.object.interface == &Display.info and
                     complete.header.opcode == @intFromEnum(
                         std.meta.Tag(Display.Event).@"error",
@@ -384,6 +391,7 @@ pub fn Core(comptime protocol: type) type {
         ) Error!void {
             const object = client_objects.namespace.resolve(handle) orelse
                 return error.StaleHandle;
+            if (object.destroyed) return error.DestroyedObject;
             if (object.interface != interface) return error.WrongInterface;
         }
 

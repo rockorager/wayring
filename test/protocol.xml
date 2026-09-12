@@ -131,5 +131,12 @@
       <arg name="external_child" type="new_id" interface="wp_external_v1"/>
       <arg name="dynamic_child" type="new_id"/>
     </event>
+    <event name="late_reference">
+      <arg name="target" type="object" interface="wp_wayring_test_v1"/>
+      <arg name="optional_target" type="object" interface="wp_wayring_test_v1" allow-null="true"/>
+    </event>
+    <event name="late_fd">
+      <arg name="descriptor" type="fd"/>
+    </event>
   </interface>
 </protocol>

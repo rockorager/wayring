@@ -11,6 +11,7 @@ pub const Error = error{
 pub const Message = struct {
     since: u32,
     destructor: bool = false,
+    fd_count: u16 = 0,
 };
 
 pub const Interface = struct {
