@@ -34,6 +34,8 @@ const Options = struct {
     batch: u32 = 256,
     warmup: u64 = 100_000,
     mode: enum {
+        wayring,
+        libwayland,
         libwayland_client,
         libwayland_client_driver,
         libwayland_server,
@@ -67,8 +69,8 @@ const Options = struct {
 pub fn main(init: std.process.Init.Minimal) !u8 {
     const options = try parseOptions(init.args);
     return switch (options.mode) {
-        .libwayland_client, .libwayland_client_driver => wayringServer(options),
-        .libwayland_server, .libwayland_server_driver => wayringClient(options),
+        .wayring, .libwayland_client, .libwayland_client_driver => wayringServer(options),
+        .libwayland, .libwayland_server, .libwayland_server_driver => libwaylandServer(options),
         .xdg_libwayland_client => wayringProtocolServer(.xdg, options),
         .xdg_libwayland_server => wayringXdgClient(),
         .shm_libwayland_client => wayringProtocolServer(.shm, options),
@@ -109,47 +111,20 @@ fn wayringServer(options: Options) !u8 {
     if (child == 0) {
         _ = linux.close(listener_fd);
         const connected_fd = wayring.unix_socket.connect(path) catch c._exit(1);
-        const c_options = cOptions(options);
-        var result: ffi.struct_benchmark_result = undefined;
-        const status = ffi.benchmark_client_fd(connected_fd, &c_options, &result);
-        if (status == 0 and result.messages == options.messages) {
-            const driver_name: [*:0]const u8 = if (options.mode == .libwayland_client_driver)
-                "batched"
-            else
-                "manual";
-            if (options.latency) {
-                _ = c.printf(
-                    "server=wayring server_driver=%s client=libwayland latency_scope=round_trip rounds=%llu mean_ns=%llu p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
-                    driver_name,
-                    options.messages,
-                    result.mean_ns,
-                    result.p50_ns,
-                    result.p95_ns,
-                    result.p99_ns,
-                    result.max_ns,
-                );
-            } else {
-                _ = c.printf(
-                    "server=wayring server_driver=%s client=libwayland messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
-                    driver_name,
-                    options.messages,
-                    options.batch,
-                    result.elapsed_ns,
-                    @as(f64, @floatFromInt(options.messages)) * @as(f64, std.time.ns_per_s) /
-                        @as(f64, @floatFromInt(result.elapsed_ns)),
-                );
-            }
+        if (options.mode == .wayring) {
+            wayringClientFd(connected_fd, options) catch |err| {
+                std.debug.print("Wayring client failed: {s}\n", .{@errorName(err)});
+                c._exit(1);
+            };
             _ = ffi.fflush(null);
-        } else if (status == 0) {
-            c._exit(1);
+            c._exit(0);
         }
-        c._exit(status);
+        c._exit(libwaylandClientFd(connected_fd, options, "wayring"));
     }
 
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -193,16 +168,58 @@ fn wayringServer(options: Options) !u8 {
         .warmup = options.warmup,
         .target = options.warmup + options.messages,
         .latency = options.latency,
-        .driver_publication = options.mode == .libwayland_client_driver,
+        .driver_publication = options.mode == .libwayland_client_driver or options.mode == .wayring,
     };
     _ = try reactor.ring.submit();
-    if (options.mode == .libwayland_client_driver)
+    if (options.mode == .libwayland_client_driver or options.mode == .wayring)
         try runDriverServer(allocator, &reactor, &runtime, actor, &handler)
     else
         try runManualServer(&reactor, &runtime, peer, actor, &handler);
     try runtime.deinit(allocator);
     reactor.deinit(allocator);
     return waitChild(child);
+}
+
+fn libwaylandClientFd(fd: c_int, options: Options, server_name: [*:0]const u8) c_int {
+    const c_options = cOptions(options);
+    var result: ffi.struct_benchmark_result = undefined;
+    const status = ffi.benchmark_client_fd(fd, &c_options, &result);
+    if (status == 0 and result.messages == options.messages) {
+        const driver_name: [*:0]const u8 = if (options.mode == .libwayland_client_driver)
+            "batched"
+        else if (options.mode == .libwayland)
+            "libwayland"
+        else
+            "manual";
+        if (options.latency) {
+            _ = c.printf(
+                "server=%s server_driver=%s client=libwayland latency_scope=round_trip rounds=%llu mean_ns=%llu p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+                server_name,
+                driver_name,
+                options.messages,
+                result.mean_ns,
+                result.p50_ns,
+                result.p95_ns,
+                result.p99_ns,
+                result.max_ns,
+            );
+        } else {
+            _ = c.printf(
+                "server=%s server_driver=%s client=libwayland messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+                server_name,
+                driver_name,
+                options.messages,
+                options.batch,
+                result.elapsed_ns,
+                @as(f64, @floatFromInt(options.messages)) * @as(f64, std.time.ns_per_s) /
+                    @as(f64, @floatFromInt(result.elapsed_ns)),
+            );
+        }
+        _ = ffi.fflush(null);
+    } else if (status == 0) {
+        return 1;
+    }
+    return status;
 }
 
 fn runManualServer(
@@ -509,7 +526,6 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -618,63 +634,58 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
     defer {
         if (handler.selection_read_fd >= 0) _ = linux.close(handler.selection_read_fd);
     }
-    _ = try reactor.ring.submit();
 
     var disconnected = false;
     while (!disconnected) {
-        const completion = try reactor.ring.copy_cqe();
-        const routed = switch (reactor.route(&runtime.endpoint.listener, completion) orelse
-            return error.InvalidCompletion) {
-            .listener => {
-                if (try runtime.completeListener(completion, null) != null)
-                    return error.UnexpectedClient;
-                continue;
-            },
-            .connection => |value| value,
-        };
-        const event = actor.completeRouted(routed.operation, completion) catch |err| {
-            if (err == error.IoFailure and actor.lifecycle == .closing) {
-                disconnected = true;
-                continue;
-            }
-            return err;
-        };
-        var prepared = false;
-        switch (event) {
-            .received => {
-                switch (try XdgServerCore.receivedRequests(
-                    actor,
-                    &handler.objects.namespace,
-                    try reactor.getReceiver(peer),
-                    completion,
-                    &handler,
-                )) {
-                    .dispatched => {},
-                    .terminal => |failure| if (failure.cause == error.Disconnected) {
-                        disconnected = true;
-                    } else return failure.cause,
+        // copy_cqe only waits; submit replies together with the next wait.
+        _ = try reactor.ring.submit_and_wait(1);
+        while (!disconnected and reactor.ring.cq_ready() != 0) {
+            const completion = try reactor.ring.copy_cqe();
+            const routed = switch (reactor.route(&runtime.endpoint.listener, completion) orelse
+                return error.InvalidCompletion) {
+                .listener => {
+                    if (try runtime.completeListener(completion, null) != null)
+                        return error.UnexpectedClient;
+                    continue;
+                },
+                .connection => |value| value,
+            };
+            const event = actor.completeRouted(routed.operation, completion) catch |err| {
+                if (err == error.IoFailure and actor.lifecycle == .closing) {
+                    disconnected = true;
+                    continue;
                 }
-                if (!disconnected and !actor.receive_active) {
+                return err;
+            };
+            switch (event) {
+                .received => {
+                    switch (try XdgServerCore.receivedRequests(
+                        actor,
+                        &handler.objects.namespace,
+                        try reactor.getReceiver(peer),
+                        completion,
+                        &handler,
+                    )) {
+                        .dispatched => {},
+                        .terminal => |failure| if (failure.cause == error.Disconnected) {
+                            disconnected = true;
+                        } else return failure.cause,
+                    }
+                    if (!disconnected and !actor.receive_active)
+                        try reactor.prepareReceive(peer);
+                },
+                .sent => |sent| if (sent.more_queued) {
+                    try reactor.prepareSend(peer);
+                },
+                .buffers_exhausted => {
                     try reactor.prepareReceive(peer);
-                    prepared = true;
-                }
-            },
-            .sent => |sent| if (sent.more_queued) {
+                },
+                .disconnected => disconnected = true,
+                else => return error.InvalidCompletion,
+            }
+            if (!disconnected and actor.transmit.queuedBytes() > 0 and !actor.transmit.sendActive())
                 try reactor.prepareSend(peer);
-                prepared = true;
-            },
-            .buffers_exhausted => {
-                try reactor.prepareReceive(peer);
-                prepared = true;
-            },
-            .disconnected => disconnected = true,
-            else => return error.InvalidCompletion,
         }
-        if (!disconnected and actor.transmit.queuedBytes() > 0 and !actor.transmit.sendActive()) {
-            try reactor.prepareSend(peer);
-            prepared = true;
-        }
-        if (prepared) _ = try reactor.ring.submit();
     }
     switch (kind) {
         .xdg => if (!handler.ponged or !handler.configured or !handler.clock_seen or
@@ -2339,7 +2350,6 @@ fn wayringXdgClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -2738,7 +2748,6 @@ fn wayringPointerClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -3012,7 +3021,6 @@ fn wayringKeyboardClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -3276,7 +3284,6 @@ fn wayringTouchClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -3535,7 +3542,6 @@ fn wayringSubsurfaceClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -3779,7 +3785,6 @@ fn wayringOutputClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -3962,7 +3967,6 @@ fn wayringDataDeviceClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -4400,7 +4404,6 @@ fn wayringShellClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -4629,7 +4632,6 @@ fn wayringShmClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -5029,7 +5031,6 @@ fn wayringDmabufClient() !u8 {
     const allocator = std.heap.c_allocator;
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -5394,7 +5395,7 @@ const DmabufClientHandler = struct {
     }
 };
 
-fn wayringClient(options: Options) !u8 {
+fn libwaylandServer(options: Options) !u8 {
     var sockets: [2]c_int = undefined;
     if (c.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets) != 0)
         return error.SystemCallFailed;
@@ -5406,13 +5407,22 @@ fn wayringClient(options: Options) !u8 {
         c._exit(ffi.benchmark_server(sockets[1], &c_options));
     }
     _ = c.close(sockets[1]);
+    if (options.mode == .libwayland) {
+        const status = libwaylandClientFd(sockets[0], options, "libwayland");
+        _ = try waitChild(child);
+        if (status != 0) return error.PeerFailed;
+        return 0;
+    }
+    try wayringClientFd(sockets[0], options);
+    return waitChild(child);
+}
 
+fn wayringClientFd(fd: linux.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
     const batch_bytes = try std.math.mul(usize, options.batch, 12);
     const byte_budget = @max(@as(usize, 4096), batch_bytes);
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 64 * 1024,
         .receive_buffer_count = 8,
         .receive_control_capacity = 256,
@@ -5426,7 +5436,7 @@ fn wayringClient(options: Options) !u8 {
     var connection = try ClientConnection.attach(
         allocator,
         &reactor,
-        sockets[0],
+        fd,
         .{
             .received_fd_budget = 4,
             .transmit_byte_budget = byte_budget,
@@ -5446,7 +5456,7 @@ fn wayringClient(options: Options) !u8 {
         .callback = callback,
     };
     var driver_storage = ClientDriver.init(&connection);
-    const driver: ?*ClientDriver = if (options.mode == .libwayland_server_driver)
+    const driver: ?*ClientDriver = if (options.mode == .libwayland_server_driver or options.mode == .wayring)
         &driver_storage
     else
         null;
@@ -5482,7 +5492,8 @@ fn wayringClient(options: Options) !u8 {
         const elapsed = try monotonicNs() - start;
         const driver_name: [*:0]const u8 = if (driver != null) "batched" else "manual";
         _ = c.printf(
-            "server=libwayland client=wayring client_driver=%s messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+            "server=%s client=wayring client_driver=%s messages=%llu batch=%u elapsed_ns=%llu messages_per_second=%.0f\n",
+            @as([*:0]const u8, if (options.mode == .wayring) "wayring" else "libwayland"),
             driver_name,
             options.messages,
             options.batch,
@@ -5495,7 +5506,6 @@ fn wayringClient(options: Options) !u8 {
     try (try connection.receiver()).stop(reactor.ring, reactor.slots, actor);
     try connection.deinit(allocator);
     reactor.deinit(allocator);
-    return waitChild(child);
 }
 
 const ClientHandler = struct {
@@ -5647,7 +5657,8 @@ fn clientLatency(
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
     const driver_name: [*:0]const u8 = if (driver != null) "batched" else "manual";
     _ = c.printf(
-        "server=libwayland client=wayring client_driver=%s latency_scope=round_trip rounds=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+        "server=%s client=wayring client_driver=%s latency_scope=round_trip rounds=%llu mean_ns=%.0f p50_ns=%llu p95_ns=%llu p99_ns=%llu max_ns=%llu\n",
+        @as([*:0]const u8, if (options.mode == .wayring) "wayring" else "libwayland"),
         driver_name,
         options.messages,
         @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(options.messages)),
@@ -5804,7 +5815,17 @@ fn parseOptions(args: std.process.Args) !Options {
     if (iterator.next()) |value| options.batch = try std.fmt.parseUnsigned(u32, value, 10);
     if (iterator.next()) |value| options.warmup = try std.fmt.parseUnsigned(u64, value, 10);
     if (iterator.next()) |value| {
-        if (std.mem.eql(u8, value, "libwayland-client"))
+        if (std.mem.eql(u8, value, "wayring"))
+            options.mode = .wayring
+        else if (std.mem.eql(u8, value, "libwayland"))
+            options.mode = .libwayland
+        else if (std.mem.eql(u8, value, "wayring-latency")) {
+            options.mode = .wayring;
+            options.latency = true;
+        } else if (std.mem.eql(u8, value, "libwayland-latency")) {
+            options.mode = .libwayland;
+            options.latency = true;
+        } else if (std.mem.eql(u8, value, "libwayland-client"))
             options.mode = .libwayland_client
         else if (std.mem.eql(u8, value, "libwayland-client-driver"))
             options.mode = .libwayland_client_driver

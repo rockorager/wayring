@@ -327,6 +327,33 @@ case "$mode" in
             sample=$((sample + 1))
         done
         ;;
+    matrix|matrix-latency)
+        if [ "$mode" = matrix-latency ]; then
+            messages=$latency_messages
+            warmup=$latency_warmup
+            batch=1
+        fi
+        sample=1
+        while [ "$sample" -le "$repeats" ]; do
+            echo "# sample=$sample scope=$mode" >&2
+            set -- libwayland libwayland-client-driver wayring libwayland-server-driver
+            rotate=$(((sample - 1) % 4))
+            while [ "$rotate" -gt 0 ]; do
+                first=$1
+                shift
+                set -- "$@" "$first"
+                rotate=$((rotate - 1))
+            done
+            for pairing in "$@"; do
+                if [ "$mode" = matrix-latency ]; then
+                    pairing="$pairing-latency"
+                fi
+                "$root/zig-out/bench/wayring-interop" \
+                    "$messages" "$batch" "$warmup" "$pairing"
+            done
+            sample=$((sample + 1))
+        done
+        ;;
     client-driver)
         sample=1
         while [ "$sample" -le "$repeats" ]; do
@@ -462,7 +489,7 @@ case "$mode" in
         "$root/zig-out/bench/wayring-interop" 1 1 1 subsurface-libwayland-server
         ;;
     *)
-        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|shm|shm-perf|shm-syscalls|viewport|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
+        echo "usage: $0 [throughput|objects|perf|syscalls|multi|multi-syscalls|resources|idle-perf|latency|client|client-perf|client-syscalls|interop|interop-perf|interop-syscalls|interop-latency|matrix|matrix-latency|shm|shm-perf|shm-syscalls|viewport|xdg-interop|shm-interop|dmabuf-interop|data-device-interop|output-interop|pointer-interop|keyboard-interop|touch-interop|subsurface-interop]" >&2
         exit 2
         ;;
 esac

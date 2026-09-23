@@ -45,6 +45,8 @@ bench/run.sh interop
 bench/run.sh interop-perf
 bench/run.sh interop-syscalls
 bench/run.sh interop-latency
+bench/run.sh matrix
+bench/run.sh matrix-latency
 bench/run.sh server-driver
 bench/run.sh server-driver-latency
 bench/run.sh client-driver
@@ -196,6 +198,19 @@ both directions through generated `fd` arguments and verifies close-on-exec.
 The measurements are useful for validating real wire
 compatibility and finding asymmetric runtime costs; they are not a direct
 replacement for the symmetric implementation comparisons above.
+
+Matrix modes run all four client/server pairings in the same executable:
+libwayland/libwayland, libwayland/Wayring, Wayring/Wayring, and
+Wayring/libwayland. Every Wayring side uses its production client or server
+driver and generated protocol APIs, rather than the minimal sender used by
+the transport benchmark. Each client implementation is shared across both
+server pairings. All pairings perform registry setup and bidirectional FD
+transfer before warmup. Throughput sends 12-byte `ping` requests in `BATCH`
+chunks, with one `pong` at each phase boundary; latency sends one ping and
+waits for its pong per round. This measures protocol processing, not rendering.
+Execution order rotates each sample. Use `MESSAGES`, `BATCH`, `WARMUP`, and
+`REPEATS` for `matrix`, or `LATENCY_MESSAGES`, `LATENCY_WARMUP`, and `REPEATS`
+for `matrix-latency`. Socket setup, warmup, and teardown are outside timing.
 
 Server-driver modes isolate the allocation-free batched `server.Driver` from
 the prior handwritten one-client CQE loop while keeping the same libwayland

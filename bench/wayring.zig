@@ -194,11 +194,11 @@ fn flushMultiActorSend(
     deferred_rearm: bool,
     fixed_files: bool,
     target_slot: usize,
-    actors: []connection.Actor,
-    receivers: []MultishotReceiver,
+    actors: []const *connection.Actor,
+    receivers: []const *MultishotReceiver,
     fds: []const c.fd_t,
 ) !void {
-    const actor = &actors[target_slot];
+    const actor = actors[target_slot];
     const peer: wayring.io_uring.Peer = .{
         .slot = actor.slot,
         .generation = actor.generation,
@@ -214,7 +214,7 @@ fn flushMultiActorSend(
             const cqe = try ring.copy_cqe();
             const routed = owner.slots.route(cqe.user_data) orelse return error.InvalidCompletion;
             const routed_slot: usize = routed.slot;
-            const routed_actor = &actors[routed_slot];
+            const routed_actor = actors[routed_slot];
             const event = try routed_actor.completeRouted(routed.operation, cqe);
             switch (routed.operation) {
                 .send => {
@@ -430,7 +430,6 @@ fn clientTransmitMain(options: Options) !u8 {
     const transmit_blocks = try std.math.divCeil(usize, transmit_capacity, 4096);
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = ring_entries }, .{
-        .max_connections = 1,
         .buffer_group_id = buffer_group_id,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 2,
@@ -576,7 +575,6 @@ fn clientReceiveMain(options: Options) !u8 {
     const allocator = std.heap.c_allocator;
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = ring_entries }, .{
-        .max_connections = 1,
         .buffer_group_id = buffer_group_id,
         .receive_buffer_size = recv_buffer_size,
         .receive_buffer_count = recv_buffer_count,
@@ -639,7 +637,6 @@ fn server(comptime varied_objects: bool, fd: c.fd_t, options: Options) !void {
     const allocator = std.heap.c_allocator;
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = ring_entries }, .{
-        .max_connections = 1,
         .buffer_group_id = buffer_group_id,
         .receive_buffer_size = recv_buffer_size,
         .receive_buffer_count = recv_buffer_count,
@@ -754,8 +751,8 @@ fn nextMultiInput(
     owner: *IoReactor,
     deferred_rearm: bool,
     fds: []const c.fd_t,
-    actors: []connection.Actor,
-    receivers: []MultishotReceiver,
+    actors: []const *connection.Actor,
+    receivers: []const *MultishotReceiver,
 ) !MultiInput {
     while (true) {
         const cqe = try ring.copy_cqe();
@@ -764,8 +761,8 @@ fn nextMultiInput(
         const routed = owner.slots.routeToken(token) orelse continue;
         if (routed.operation != .receive) return error.InvalidCompletion;
         const slot: usize = routed.slot;
-        const actor = &actors[slot];
-        const receiver = &receivers[slot];
+        const actor = actors[slot];
+        const receiver = receivers[slot];
         const event = try actor.completeRouted(routed.operation, cqe);
         switch (event) {
             .received => return .{
@@ -810,13 +807,13 @@ fn serverMultiHandshake(
     deferred_rearm: bool,
     fixed_files: bool,
     fds: []const c.fd_t,
-    actors: []connection.Actor,
-    receivers: []MultishotReceiver,
+    actors: []const *connection.Actor,
+    receivers: []const *MultishotReceiver,
     namespaces: []objects.SharedNamespace,
 ) !void {
     const input = try nextMultiInput(ring, owner, deferred_rearm, fds, actors, receivers);
-    const actor = &actors[input.slot];
-    const receiver = &receivers[input.slot];
+    const actor = actors[input.slot];
+    const receiver = receivers[input.slot];
     if (input.slot != 0) return error.InvalidMessage;
     _ = try actor.ingestControl(input.received.control);
     var payload = input.received.payload;
@@ -864,8 +861,8 @@ fn serverMultiPhase(
     deferred_rearm: bool,
     fixed_files: bool,
     fds: []const c.fd_t,
-    actors: []connection.Actor,
-    receivers: []MultishotReceiver,
+    actors: []const *connection.Actor,
+    receivers: []const *MultishotReceiver,
     namespaces: []objects.SharedNamespace,
     counts: []u64,
     target: u64,
@@ -875,8 +872,8 @@ fn serverMultiPhase(
     var completed: usize = 0;
     while (completed < actors.len) {
         const input = try nextMultiInput(ring, owner, deferred_rearm, fds, actors, receivers);
-        const actor = &actors[input.slot];
-        const receiver = &receivers[input.slot];
+        const actor = actors[input.slot];
+        const receiver = receivers[input.slot];
         _ = try actor.ingestControl(input.received.control);
         var payload = input.received.payload;
         var context: BenchmarkRequestHandler = .{
@@ -902,7 +899,7 @@ fn serverMultiPhase(
         );
     }
 
-    for (actors) |*actor| try Benchmark.encodeEvent(&actor.transmit, object_id, .{
+    for (actors) |actor| try Benchmark.encodeEvent(&actor.transmit, object_id, .{
         .pong = .{ .sequence = sequence },
     });
     for (fds, 0..) |_, index| try flushMultiActorSend(
@@ -945,12 +942,12 @@ const BenchmarkRequestHandler = struct {
 fn stopMulti(
     ring: *linux.IoUring,
     slots: reactor.Slots,
-    actors: []connection.Actor,
-    receivers: []MultishotReceiver,
+    actors: []const *connection.Actor,
+    receivers: []const *MultishotReceiver,
 ) !void {
     var receive_remaining: usize = 0;
     var cancel_remaining: usize = 0;
-    for (actors, receivers) |*actor, *receiver| {
+    for (actors, receivers) |actor, receiver| {
         if (try receiver.prepareStop(ring, actor)) {
             receive_remaining += 1;
             cancel_remaining += 1;
@@ -962,7 +959,7 @@ fn stopMulti(
         const cqe = try ring.copy_cqe();
         const routed = slots.route(cqe.user_data) orelse return error.InvalidCompletion;
         const slot: usize = routed.slot;
-        const actor = &actors[slot];
+        const actor = actors[slot];
         const was_receiving = actor.receive_active;
         const event = try actor.completeRouted(routed.operation, cqe);
         switch (routed.operation) {
@@ -1004,7 +1001,6 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         );
     var owner: IoReactor = undefined;
     try owner.initOwned(allocator, .{ .entries = multi_ring_entries }, .{
-        .max_connections = options.connections,
         .buffer_group_id = buffer_group_id,
         .receive_buffer_size = recv_buffer_size,
         .receive_buffer_count = receive_buffer_count,
@@ -1024,9 +1020,10 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         try printFixedRegistration("server", options.connections, registration_elapsed);
     }
     defer if (fixed_files) ring.unregister_files() catch unreachable;
-    const slots = owner.slots;
-    const actors = owner.actor_storage[0..options.connections];
-    const receivers = owner.receiver_storage[0..options.connections];
+    const actors = try allocator.alloc(*connection.Actor, options.connections);
+    defer allocator.free(actors);
+    const receivers = try allocator.alloc(*MultishotReceiver, options.connections);
+    defer allocator.free(receivers);
     const counts = try allocator.alloc(u64, options.connections);
     defer allocator.free(counts);
     var object_pool = try objects.SharedObjectPool.init(allocator, options.connections);
@@ -1047,8 +1044,10 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
             .transmit_fd_budget = 16,
         });
         if (peer.slot != slot) return error.InvalidSlot;
-        const actor = &actors[index];
-        const receiver = &receivers[index];
+        const actor = try owner.getActor(peer);
+        const receiver = try owner.getReceiver(peer);
+        actors[index] = actor;
+        receivers[index] = receiver;
         namespace.* = try objects.SharedNamespace.init(
             &object_pool,
             object_buckets[index * 8 ..][0..8],
@@ -1129,8 +1128,8 @@ fn serverMulti(fds: []const c.fd_t, options: Options) !void {
         );
     }
 
-    try stopMulti(ring, slots, actors, receivers);
-    for (actors, namespaces) |*actor, *namespace| {
+    try stopMulti(ring, owner.slots, actors, receivers);
+    for (actors, namespaces) |actor, *namespace| {
         const peer: wayring.io_uring.Peer = .{
             .slot = actor.slot,
             .generation = actor.generation,
