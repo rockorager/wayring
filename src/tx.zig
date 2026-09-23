@@ -143,7 +143,7 @@ pub const Queue = struct {
             new_bytes,
             queue.blocks.block_size,
         ) catch unreachable;
-        try queue.blocks.ensureAvailable(blocks_needed);
+        if (blocks_needed != 0) try queue.blocks.ensureAvailable(blocks_needed);
 
         var new_head: ?pools.Lease = null;
         var new_tail: ?pools.Lease = null;
@@ -305,9 +305,20 @@ pub const Reservation = struct {
     final_tail_used: usize,
     finished: bool = false,
 
-    pub fn write(reservation: *Reservation, bytes: []const u8) Error!void {
+    pub inline fn write(reservation: *Reservation, bytes: []const u8) Error!void {
         if (reservation.finished or bytes.len > reservation.byte_count - reservation.written)
             return error.ReservationOverflow;
+        // Keep the full write length visible to the optimizer for small fixed
+        // fields. The spanning path below needs a runtime-sized copy instead.
+        if (reservation.original_tail != null and
+            bytes.len <= reservation.tail_space - reservation.existing_written)
+        {
+            const start = reservation.original_tail_used + reservation.existing_written;
+            @memcpy(reservation.original_tail.?.bytes[start..][0..bytes.len], bytes);
+            reservation.existing_written += bytes.len;
+            reservation.written += bytes.len;
+            return;
+        }
         var remaining = bytes;
         if (reservation.existing_written < reservation.tail_space) {
             const count = @min(
@@ -345,7 +356,7 @@ pub const Reservation = struct {
     ) Error!void {
         if (reservation.finished or reservation.written != reservation.byte_count)
             return error.InvalidCompletion;
-        try reservation.queue.descriptors.ensureCapacity(descriptors.len);
+        if (descriptors.len != 0) try reservation.queue.descriptors.ensureCapacity(descriptors.len);
 
         if (reservation.new_head) |new_head| {
             if (reservation.original_tail) |tail|
@@ -408,6 +419,69 @@ test "reservation remains private until commit and spans block boundaries" {
     try queue.complete(8);
     const second = try queue.snapshot(&scratch, &control);
     try std.testing.expectEqualStrings("ijkl", second.first);
+}
+
+test "fixed-size reservation writes fit and cross every tail boundary" {
+    const allocator = std.testing.allocator;
+    for (0..17) |prefix_len| {
+        var blocks = try pools.SharedBlocks.init(allocator, 16, 2);
+        defer blocks.deinit(allocator);
+        var fds = try pools.SharedFds.init(allocator, 1);
+        defer fds.deinit(allocator);
+        var queue = Queue.init(&blocks, 32, &fds, 0);
+        defer queue.deinit();
+        const prefix = "ABCDEFGHIJKLMNOP"[0..prefix_len];
+        if (prefix.len != 0) try queue.enqueue(prefix, &.{});
+
+        var reservation = try queue.reserve(12);
+        try reservation.write("");
+        try reservation.write("abcdefgh");
+        try reservation.write("ijkl");
+        try reservation.write("");
+        try std.testing.expectEqual(prefix.len, queue.queuedBytes());
+        try reservation.commit(&.{});
+        try std.testing.expectError(error.ReservationOverflow, reservation.write(""));
+
+        var actual: [28]u8 = undefined;
+        var offset: usize = 0;
+        while (queue.queuedBytes() != 0) {
+            const snapshot_value = try queue.snapshot(&.{}, &.{});
+            for ([_][]const u8{ snapshot_value.first, snapshot_value.second }) |bytes| {
+                @memcpy(actual[offset..][0..bytes.len], bytes);
+                offset += bytes.len;
+            }
+            try queue.begin(snapshot_value);
+            try queue.complete(snapshot_value.byteCount());
+        }
+        try std.testing.expectEqual(prefix.len + 12, offset);
+        try std.testing.expectEqualStrings(prefix, actual[0..prefix.len]);
+        try std.testing.expectEqualStrings("abcdefghijkl", actual[prefix.len..offset]);
+    }
+}
+
+test "contiguous reservation rolls back when descriptor commit fails" {
+    const allocator = std.testing.allocator;
+    var blocks = try pools.SharedBlocks.init(allocator, 8, 1);
+    defer blocks.deinit(allocator);
+    var fds = try pools.SharedFds.init(allocator, 1);
+    defer fds.deinit(allocator);
+    var queue = Queue.init(&blocks, 8, &fds, 0);
+    defer queue.deinit();
+    const result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try expectSuccess(result);
+    const fd: linux.fd_t = @intCast(result);
+    defer _ = linux.close(fd);
+    try queue.enqueue("ab", &.{});
+
+    var reservation = try queue.reserve(2);
+    try reservation.write("cd");
+    try std.testing.expectError(error.DescriptorBudgetExceeded, reservation.commit(&.{fd}));
+    reservation.abort();
+    try std.testing.expectEqual(@as(usize, 2), queue.queuedBytes());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+    try queue.enqueue("XY", &.{});
+    const snapshot_value = try queue.snapshot(&.{}, &.{});
+    try std.testing.expectEqualStrings("abXY", snapshot_value.first);
 }
 
 test "aborting reservation restores shared capacity and queue state" {
