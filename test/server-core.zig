@@ -1142,6 +1142,12 @@ test "server endpoint owns filesystem listener and multishot shutdown" {
         else => unreachable,
     });
     try consume(&(try reactor.getActor(accepted_peers[0])).transmit);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(
+        accepted_peers[1],
+        registries[1],
+        initial_restricted.id,
+    ));
+    try runtime.ackGlobalRemove(accepted_peers[0], registries[0], initial_restricted.id);
     try std.testing.expectEqual(
         wayring.server.Runtime(protocol).PublishResult.complete,
         try runtime.publishNext(),
@@ -1644,6 +1650,279 @@ test "server driver recovers SQ pressure and drains protocol errors" {
     try std.testing.expectEqual(@as(usize, 2), handler.disconnected_count);
     try std.testing.expectEqual(@as(usize, 0), runtime.clients.reactor.slots.active_count);
     _ = linux.close(client_fds[1]);
+}
+
+test "wl_fixes ack decoding enforces version and registry type" {
+    const allocator = std.testing.allocator;
+    var server_objects = try wayring.objects.ServerObjects.init(allocator, 8, 2, &Core.Display.info, null);
+    defer server_objects.deinit(allocator);
+    const registry = try server_objects.insertClient(2, &Core.Registry.info, 1, null);
+    _ = try server_objects.insertClient(3, &protocol.wl_fixes.info, 1, null);
+    _ = try server_objects.insertClient(4, &protocol.wl_fixes.info, 2, null);
+    var blocks = try wayring.pool.SharedBlocks.init(allocator, 64, 2);
+    defer blocks.deinit(allocator);
+    var descriptors = try wayring.pool.SharedFds.init(allocator, 1);
+    defer descriptors.deinit(allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer queue.deinit();
+    var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    const ack: protocol.wl_fixes.Request = .{ .ack_global_remove = .{ .registry = registry.id, .name = 71 } };
+    try protocol.wl_fixes.encodeRequest(&queue, 3, ack);
+    try std.testing.expectError(error.UnsupportedVersion, wayring.server.decodeRequest(protocol.wl_fixes, &server_objects, try firstMessage(&queue), &fds));
+    try consume(&queue);
+    try protocol.wl_fixes.encodeRequest(&queue, 4, ack);
+    const decoded = try wayring.server.decodeRequest(protocol.wl_fixes, &server_objects, try firstMessage(&queue), &fds);
+    try std.testing.expectEqual(@as(u32, 71), decoded.value.ack_global_remove.name);
+    try std.testing.expectEqual(registry.id, decoded.value.ack_global_remove.registry);
+    try consume(&queue);
+    try protocol.wl_fixes.encodeRequest(&queue, 4, .{ .ack_global_remove = .{ .registry = 3, .name = 71 } });
+    try std.testing.expectError(error.WrongInterface, wayring.server.decodeRequest(protocol.wl_fixes, &server_objects, try firstMessage(&queue), &fds));
+}
+
+test "global names exhaust rather than alias removed names" {
+    var globals = try wayring.server.Globals.init(std.testing.allocator, 1);
+    defer globals.deinit(std.testing.allocator);
+    globals.next_name = std.math.maxInt(u32);
+    const last = try globals.add(&protocol.wp_wayring_test_v1.info, 1, null);
+    try std.testing.expectEqual(std.math.maxInt(u32), last.id);
+    _ = try globals.remove(last);
+    try std.testing.expectError(error.NameExhausted, globals.add(&protocol.wp_wayring_test_v1.info, 1, null));
+}
+
+test "removed globals wait for each registry ack or teardown and preserve racing binds" {
+    const Runtime = wayring.server.Runtime(protocol);
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+        .receive_buffer_size = 4096,
+        .receive_buffer_count = 4,
+        .receive_control_capacity = 64,
+        .fragment_block_size = 64,
+        .fragment_block_count = 2,
+        .transmit_block_size = 256,
+        .transmit_block_count = 2,
+        .descriptor_count = 4,
+        .send_descriptor_capacity = 1,
+    });
+    defer reactor.deinit(allocator);
+    var listener: [2]linux.fd_t = undefined;
+    try expectSocketPair(&listener);
+    defer _ = linux.close(listener[1]);
+    var runtime = try Runtime.init(allocator, &reactor, listener[0], .{
+        .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 256, .transmit_fd_budget = 1 },
+        .object_capacity = 16,
+        .object_quota = 16,
+        .buckets_per_client = 16,
+        .max_globals = 1,
+        .registry_capacity = 1,
+    });
+    defer runtime.deinit(allocator) catch unreachable;
+    var peers: [2]wayring.io_uring.Peer = undefined;
+    var remotes: [2]linux.fd_t = undefined;
+    for (&peers, &remotes) |*peer, *remote| {
+        var sockets: [2]linux.fd_t = undefined;
+        try expectSocketPair(&sockets);
+        peer.* = try runtime.clients.admit(.{ .fd = sockets[0], .more = true }, runtime.actor_config, null);
+        remote.* = sockets[1];
+    }
+    defer for (remotes) |remote| {
+        _ = linux.close(remote);
+    };
+    _ = try reactor.ring.submit();
+
+    var original: WithdrawalState = .{};
+    const global = try runtime.addGlobalWithBinder(&protocol.wp_wayring_test_v1.info, 1, &original, WithdrawalState.bind);
+    try drainPublications(&runtime);
+    const first = try createRegistry(&runtime, peers[0], 2);
+    const second = try createRegistry(&runtime, peers[0], 3);
+    const old_client = try createRegistry(&runtime, peers[1], 2);
+    try drainPublications(&runtime);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, global.id));
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, 999));
+    try std.testing.expectError(error.WrongInterface, runtime.ackGlobalRemove(
+        peers[0],
+        (try runtime.clients.get(peers[0])).namespace.lookupHandle(1).?,
+        global.id,
+    ));
+
+    try runtime.removeGlobalWithCallback(global, WithdrawalState.withdrawn);
+    try std.testing.expectEqual(@as(usize, 0), original.withdrawals);
+    const request: Core.Registry.Request = .{ .bind = .{
+        .name = global.id,
+        .id = .{ .interface = protocol.wp_wayring_test_v1.info.name, .version = 1, .id = 8 },
+    } };
+    const racing = try runtime.bindGlobal(peers[0], request);
+    try std.testing.expectEqual(global, original.last.?.global);
+    try std.testing.expectEqual(@as(usize, 1), original.binds);
+    try std.testing.expectEqual(@as(?*anyopaque, &original.resource), (try runtime.clients.get(peers[0])).namespace.resolve(racing).?.context);
+    _ = try (try runtime.clients.get(peers[0])).removeClient(racing);
+
+    // A registry created after removal never inherits a pending offer.
+    const late = try createRegistry(&runtime, peers[0], 4);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], late, global.id));
+    const actor = try reactor.getActor(peers[0]);
+    const full = [_]u8{0} ** 256;
+    try actor.transmit.enqueue(&full, &.{});
+    try std.testing.expectEqual(peers[0], (try runtime.publishNext()).blocked);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, global.id));
+    try consume(&actor.transmit);
+    try std.testing.expectEqual(peers[0], (try runtime.publishNext()).sent);
+    const event_message = try firstMessage(&actor.transmit);
+    try std.testing.expectEqual(first.id, event_message.header.object_id);
+    try std.testing.expectEqual(global.id, (try Core.Registry.decodeEvent(event_message, &actor.received_fds)).global_remove.name);
+    try consume(&actor.transmit);
+    try runtime.ackGlobalRemove(peers[0], first, global.id);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, global.id));
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], second, global.id));
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[1], old_client, global.id));
+    const still_racing = try runtime.bindGlobal(peers[0], request);
+    _ = try (try runtime.clients.get(peers[0])).removeClient(still_racing);
+    try drainPublications(&runtime);
+
+    // Teardown cannot release an offer if delete_id cannot be queued.
+    try actor.transmit.enqueue(&full, &.{});
+    try std.testing.expectError(error.ByteBudgetExceeded, runtime.removeRegistry(peers[0], second));
+    const blocked_racing = try runtime.bindGlobal(peers[0], request);
+    _ = try (try runtime.clients.get(peers[0])).removeClient(blocked_racing);
+    try consume(&actor.transmit);
+    _ = try runtime.removeRegistry(peers[0], second);
+    try consume(&actor.transmit);
+    try std.testing.expectError(error.UnknownGlobal, runtime.bindGlobal(peers[0], request));
+    try std.testing.expectEqual(@as(usize, 0), original.withdrawals);
+    const recycled = try createRegistry(&runtime, peers[0], second.id);
+    try std.testing.expect(recycled.generation != second.generation);
+    try std.testing.expectError(error.StaleHandle, runtime.ackGlobalRemove(peers[0], second, global.id));
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], recycled, global.id));
+
+    // Retired globals do not occupy active capacity or alias a replacement.
+    var replacement: WithdrawalState = .{};
+    const next = try runtime.addGlobalWithBinder(&protocol.wp_wayring_test_v1.info, 1, &replacement, WithdrawalState.bind);
+    try std.testing.expect(next.id != global.id);
+    try drainPublications(&runtime);
+    try std.testing.expectError(error.UnknownGlobal, runtime.removeGlobal(global));
+    var next_request = request;
+    next_request.bind.name = next.id;
+    const next_resource = try runtime.bindGlobal(peers[0], next_request);
+    try std.testing.expectEqual(next, replacement.last.?.global);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, global.id));
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], first, next.id));
+    const old_resource = try runtime.bindGlobal(peers[1], request);
+    try std.testing.expectEqual(global, original.last.?.global);
+    try std.testing.expectEqual(@as(?*anyopaque, &original.resource), (try runtime.clients.get(peers[1])).namespace.resolve(old_resource).?.context);
+
+    // Every offer, including ones never bound, must be acknowledged separately.
+    try runtime.removeGlobalWithCallback(next, WithdrawalState.withdrawn);
+    for ([_]wayring.objects.Handle{ first, late, recycled }) |registry| {
+        try std.testing.expectEqual(peers[0], (try runtime.publishNext()).sent);
+        try std.testing.expectEqual(registry.id, (try firstMessage(&actor.transmit)).header.object_id);
+        try consume(&actor.transmit);
+        try runtime.ackGlobalRemove(peers[0], registry, next.id);
+        try std.testing.expectEqual(@as(usize, 0), replacement.withdrawals);
+    }
+    try std.testing.expectEqual(peers[1], (try runtime.publishNext()).sent);
+    try consume(&(try reactor.getActor(peers[1])).transmit);
+    try runtime.ackGlobalRemove(peers[1], old_client, next.id);
+    try std.testing.expectEqual(@as(usize, 1), replacement.withdrawals);
+    try std.testing.expectEqual(next, replacement.withdrawn_handle.?);
+    // The final ack may collect the definition before publication's cursor ends.
+    try std.testing.expectEqual(Runtime.PublishResult.complete, try runtime.publishNext());
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[1], old_client, next.id));
+    try std.testing.expect((try runtime.clients.get(peers[0])).namespace.resolve(next_resource) != null);
+
+    // Registry destruction unlinks a paused removal cursor before node reuse.
+    var pending: WithdrawalState = .{};
+    const pending_global = try runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, &pending);
+    try drainPublications(&runtime);
+    try runtime.removeGlobalWithCallback(pending_global, WithdrawalState.withdrawn);
+    try actor.transmit.enqueue(&full, &.{});
+    try std.testing.expectEqual(peers[0], (try runtime.publishNext()).blocked);
+    try consume(&actor.transmit);
+    _ = try runtime.removeRegistry(peers[0], first);
+    try consume(&actor.transmit);
+    const recycled_first = try createRegistry(&runtime, peers[0], first.id);
+    try drainPublications(&runtime);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(peers[0], recycled_first, pending_global.id));
+    try runtime.ackGlobalRemove(peers[0], late, pending_global.id);
+    try runtime.ackGlobalRemove(peers[0], recycled, pending_global.id);
+    try std.testing.expectEqual(@as(usize, 0), pending.withdrawals);
+
+    // The v1/non-acknowledging client pins both removals until disconnect.
+    try stopPeers(&reactor, &peers);
+    try runtime.destroyClient(peers[0]);
+    try std.testing.expectEqual(@as(usize, 0), original.withdrawals);
+    try runtime.destroyClient(peers[1]);
+    try std.testing.expectEqual(@as(usize, 1), original.withdrawals);
+    try std.testing.expectEqual(@as(usize, 1), pending.withdrawals);
+    try std.testing.expectEqual(@as(usize, 1), replacement.withdrawals);
+
+    // No offers means synchronous reclamation, even before publishNext.
+    var unoffered: WithdrawalState = .{};
+    const unoffered_global = try runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, &unoffered);
+    try drainPublications(&runtime);
+    try runtime.removeGlobalWithCallback(unoffered_global, WithdrawalState.withdrawn);
+    try std.testing.expectEqual(@as(usize, 1), unoffered.withdrawals);
+    try drainPublications(&runtime);
+
+    // A reused peer slot cannot inherit offers. Destroying its sole registry
+    // releases the last offer, even while global_remove publication is pending.
+    var sockets: [2]linux.fd_t = undefined;
+    try expectSocketPair(&sockets);
+    defer _ = linux.close(sockets[1]);
+    const reused_peer = try runtime.clients.admit(.{ .fd = sockets[0], .more = true }, runtime.actor_config, null);
+    try std.testing.expect(reused_peer.slot == peers[0].slot or reused_peer.slot == peers[1].slot);
+    try std.testing.expect(!std.meta.eql(reused_peer, peers[0]) and !std.meta.eql(reused_peer, peers[1]));
+    _ = try reactor.ring.submit();
+    const sole_registry = try createRegistry(&runtime, reused_peer, 2);
+    try std.testing.expectError(error.InvalidAckRemove, runtime.ackGlobalRemove(reused_peer, sole_registry, global.id));
+    const stale_peer = if (reused_peer.slot == peers[0].slot) peers[0] else peers[1];
+    try std.testing.expectError(error.WrongGeneration, runtime.ackGlobalRemove(stale_peer, old_client, global.id));
+    var sole: WithdrawalState = .{};
+    const sole_global = try runtime.addGlobal(&protocol.wp_wayring_test_v1.info, 1, &sole);
+    try drainPublications(&runtime);
+    try runtime.removeGlobalWithCallback(sole_global, WithdrawalState.withdrawn);
+    _ = try runtime.removeRegistry(reused_peer, sole_registry);
+    try std.testing.expectEqual(@as(usize, 1), sole.withdrawals);
+    try consume(&(try reactor.getActor(reused_peer)).transmit);
+    try std.testing.expectEqual(Runtime.PublishResult.complete, try runtime.publishNext());
+    try stopPeers(&reactor, &.{reused_peer});
+    try runtime.destroyClient(reused_peer);
+}
+
+const WithdrawalState = struct {
+    binds: usize = 0,
+    withdrawals: usize = 0,
+    last: ?wayring.server.Binding = null,
+    withdrawn_handle: ?wayring.objects.Handle = null,
+    resource: u8 = 0,
+
+    fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
+        const state: *WithdrawalState = @ptrCast(@alignCast(context.?));
+        try std.testing.expectEqual(@as(usize, 0), state.withdrawals);
+        state.binds += 1;
+        state.last = binding;
+        return &state.resource;
+    }
+
+    fn withdrawn(context: ?*anyopaque, handle: wayring.objects.Handle) void {
+        const state: *WithdrawalState = @ptrCast(@alignCast(context.?));
+        state.withdrawals += 1;
+        state.withdrawn_handle = handle;
+    }
+};
+
+fn createRegistry(runtime: *wayring.server.Runtime(protocol), peer: wayring.io_uring.Peer, id: u32) !wayring.objects.Handle {
+    var bytes: [12]u8 = undefined;
+    try (wayring.wire.Header{ .object_id = 1, .opcode = 1, .size = bytes.len }).encode(bytes[0..8]);
+    std.mem.writeInt(u32, bytes[8..], id, @import("builtin").cpu.arch.endian());
+    return (try runtime.decodeDisplayRequest(peer, (try wayring.wire.Message.decode(&bytes)).?, &(try runtime.clients.reactor.getActor(peer)).received_fds, null)).get_registry;
+}
+
+fn drainPublications(runtime: *wayring.server.Runtime(protocol)) !void {
+    while (true) switch (try runtime.publishNext()) {
+        .sent => |peer| try consume(&(try runtime.clients.reactor.getActor(peer)).transmit),
+        .complete => return,
+        .blocked => return error.UnexpectedBackpressure,
+    };
 }
 
 const DriverHandler = struct {

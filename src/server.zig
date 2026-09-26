@@ -53,6 +53,11 @@ pub const Binding = struct {
 
 pub const BindFn = *const fn (?*anyopaque, Binding) anyerror!?*anyopaque;
 
+/// Called with the global's context once no registry can race a removed-global
+/// bind. Existing bound resources have independent lifetimes. The callback
+/// must not reenter the runtime.
+pub const GlobalWithdrawnFn = *const fn (?*anyopaque, objects.Handle) void;
+
 pub const Global = struct {
     interface: *const metadata.Interface,
     version: u32,
@@ -1310,11 +1315,17 @@ fn peerCredentials(fd: std.os.linux.fd_t) !Credentials {
 const RegistrySubscriptions = struct {
     const end = std.math.maxInt(u32);
 
+    const Offer = struct {
+        global: objects.Handle,
+        removal_sent: bool = false,
+    };
+
     const Node = struct {
         handle: objects.Handle = undefined,
         next: u32 = end,
         sequence: u64 = 0,
         initial: ?GlobalCursor = null,
+        offers: std.ArrayListUnmanaged(Offer) = .empty,
     };
 
     const Slot = struct {
@@ -1336,7 +1347,7 @@ const RegistrySubscriptions = struct {
         handle: objects.Handle,
         change: union(enum) {
             added: Global,
-            removed: Global,
+            removed,
         },
         sequence_limit: u64,
         slot_index: usize = 0,
@@ -1504,9 +1515,52 @@ const RegistrySubscriptions = struct {
         if (slot.tail == current) slot.tail = previous;
         slot.count -= 1;
         if (slot.count == 0) slot.* = .{};
+        node.offers.deinit(subscriptions.allocator);
+        node.offers = .empty;
         node.next = subscriptions.free_head;
         subscriptions.free_head = current;
         subscriptions.available_count += 1;
+    }
+
+    fn find(
+        subscriptions: *RegistrySubscriptions,
+        peer: io_uring.Peer,
+        registry: objects.Handle,
+    ) ?*Node {
+        if (peer.slot >= subscriptions.slots.items.len) return null;
+        const slot = subscriptions.slots.items[peer.slot];
+        if (slot.generation != peer.generation) return null;
+        var current = slot.head;
+        while (current != end) : (current = subscriptions.nodes.items[current].next) {
+            const node = &subscriptions.nodes.items[current];
+            if (std.meta.eql(node.handle, registry)) return node;
+        }
+        return null;
+    }
+
+    fn offer(node: *Node, name: u32) ?*Offer {
+        for (node.offers.items) |*entry| {
+            if (entry.global.id == name) return entry;
+        }
+        return null;
+    }
+
+    fn offeredToPeer(subscriptions: *RegistrySubscriptions, peer: io_uring.Peer, name: u32) bool {
+        if (peer.slot >= subscriptions.slots.items.len) return false;
+        const slot = subscriptions.slots.items[peer.slot];
+        if (slot.generation != peer.generation) return false;
+        var current = slot.head;
+        while (current != end) : (current = subscriptions.nodes.items[current].next) {
+            if (offer(&subscriptions.nodes.items[current], name) != null) return true;
+        }
+        return false;
+    }
+
+    fn hasOffers(subscriptions: *RegistrySubscriptions, name: u32) bool {
+        for (subscriptions.nodes.items) |*node| {
+            if (offer(node, name) != null) return true;
+        }
+        return false;
     }
 
     fn nextInitial(subscriptions: *RegistrySubscriptions) ?Candidate {
@@ -1570,11 +1624,10 @@ const RegistrySubscriptions = struct {
     fn updateRemoved(
         subscriptions: RegistrySubscriptions,
         handle: objects.Handle,
-        global: Global,
     ) Update {
         return .{
             .handle = handle,
-            .change = .{ .removed = global },
+            .change = .removed,
             .sequence_limit = subscriptions.next_sequence -% 1,
         };
     }
@@ -1784,11 +1837,18 @@ pub fn Runtime(comptime protocol: type) type {
         const ProtocolCore = Core(protocol);
         pub const Clients = SharedClients(protocol);
 
+        const RemovedGlobal = struct {
+            handle: objects.Handle,
+            global: Global,
+            withdrawn: ?GlobalWithdrawnFn,
+        };
+
         endpoint: Endpoint,
         clients: Clients,
         globals: Globals,
         registries: RegistrySubscriptions,
         sync_barriers: SyncBarriers,
+        removed_globals: std.ArrayListUnmanaged(RemovedGlobal) = .empty,
         global_update: ?RegistrySubscriptions.Update = null,
         actor_config: io_uring.ActorConfig,
         global_filter: ?GlobalFilter,
@@ -1961,7 +2021,8 @@ pub fn Runtime(comptime protocol: type) type {
 
         /// Inserts a decoded registry binding, then lets the global activate
         /// per-client resource state. Failed activation cancels the unpublished
-        /// object without invoking its removal hook.
+        /// object without invoking its removal hook. A removed global remains
+        /// bindable by a client while any of its registry offers is outstanding.
         pub fn bindGlobal(
             runtime: *Self,
             peer: io_uring.Peer,
@@ -1970,11 +2031,21 @@ pub fn Runtime(comptime protocol: type) type {
             const binding = switch (request) {
                 .bind => |value| value,
             };
-            const global_handle = runtime.globals.table.lookupHandle(binding.name) orelse
+            const definition: struct { objects.Handle, Global } = definition: {
+                if (runtime.globals.table.lookupHandle(binding.name)) |handle| {
+                    const global = runtime.globals.table.resolve(handle).?.*;
+                    if (!try runtime.globalVisible(peer, handle, global)) return error.UnknownGlobal;
+                    break :definition .{ handle, global };
+                }
+                if (runtime.registries.offeredToPeer(peer, binding.name)) {
+                    for (runtime.removed_globals.items) |removed| {
+                        if (removed.handle.id == binding.name)
+                            break :definition .{ removed.handle, removed.global };
+                    }
+                }
                 return error.UnknownGlobal;
-            const global = runtime.globals.table.resolve(global_handle) orelse unreachable;
-            if (!try runtime.globalVisible(peer, global_handle, global.*))
-                return error.UnknownGlobal;
+            };
+            const global_handle, const global = definition;
             const interface = global.interface;
             const advertised_version = global.version;
             const global_context = global.context;
@@ -2054,20 +2125,80 @@ pub fn Runtime(comptime protocol: type) type {
             try actor.transmit.ensureCapacity(delete_id_size, 0);
             const active_update = if (runtime.global_update) |*update| update else null;
             try runtime.registries.remove(peer, registry, active_update);
-            return ProtocolCore.deleteClient(
+            const removed = ProtocolCore.deleteClient(
                 server_objects,
                 &actor.transmit,
                 registry,
             ) catch unreachable;
+            runtime.collectRemovedGlobals();
+            return removed;
         }
 
-        /// Removes a global immediately and snapshots existing registries for
-        /// resumable global_remove publication.
+        /// Unpublishes a global. Its binder and context must remain usable until
+        /// all offers are acknowledged or their registries/clients disappear.
+        /// Use removeGlobalWithCallback to learn when that lifetime ends. Old
+        /// clients without wl_fixes v2 retain offers until registry/client teardown.
+        /// Runtime-owned globals must not be removed directly through Globals.
         pub fn removeGlobal(runtime: *Self, handle: objects.Handle) !void {
+            return runtime.removeGlobalWithCallback(handle, null);
+        }
+
+        /// The callback can run synchronously if there are no outstanding offers.
+        /// Removed definitions do not consume max_globals (the active-global bound).
+        pub fn removeGlobalWithCallback(
+            runtime: *Self,
+            handle: objects.Handle,
+            withdrawn: ?GlobalWithdrawnFn,
+        ) !void {
             if (runtime.global_update != null or runtime.registries.initial_count != 0)
                 return error.GlobalUpdateActive;
+            if (runtime.globals.table.resolve(handle) == null) return error.UnknownGlobal;
+            try runtime.removed_globals.ensureUnusedCapacity(runtime.clients.allocator, 1);
             const removed = try runtime.globals.remove(handle);
-            runtime.global_update = runtime.registries.updateRemoved(handle, removed);
+            runtime.removed_globals.appendAssumeCapacity(.{
+                .handle = handle,
+                .global = removed,
+                .withdrawn = withdrawn,
+            });
+            runtime.global_update = runtime.registries.updateRemoved(handle);
+            runtime.collectRemovedGlobals();
+        }
+
+        /// Applies a decoded wl_fixes v2 acknowledgment. The adapter must enforce
+        /// the wl_fixes object version and post wl_fixes.invalid_ack_remove on
+        /// error.InvalidAckRemove. Only a global_remove successfully queued on
+        /// this exact registry may be acknowledged, once.
+        pub fn ackGlobalRemove(
+            runtime: *Self,
+            peer: io_uring.Peer,
+            registry: objects.Handle,
+            name: u32,
+        ) !void {
+            const server_objects = try runtime.clients.get(peer);
+            const object = server_objects.namespace.resolve(registry) orelse return error.StaleHandle;
+            if (object.interface != &ProtocolCore.Registry.info) return error.WrongInterface;
+            const node = runtime.registries.find(peer, registry) orelse return error.StaleHandle;
+            for (node.offers.items, 0..) |entry, index| {
+                if (entry.global.id != name) continue;
+                if (!entry.removal_sent) return error.InvalidAckRemove;
+                _ = node.offers.swapRemove(index);
+                runtime.collectRemovedGlobals();
+                return;
+            }
+            return error.InvalidAckRemove;
+        }
+
+        fn collectRemovedGlobals(runtime: *Self) void {
+            var index: usize = 0;
+            while (index < runtime.removed_globals.items.len) {
+                const removed = runtime.removed_globals.items[index];
+                if (runtime.registries.hasOffers(removed.handle.id)) {
+                    index += 1;
+                    continue;
+                }
+                _ = runtime.removed_globals.swapRemove(index);
+                if (removed.withdrawn) |notify| notify(removed.global.context, removed.handle);
+            }
         }
 
         /// Queues at most one global event, finishing an active table mutation
@@ -2097,37 +2228,41 @@ pub fn Runtime(comptime protocol: type) type {
                         runtime.registries.advance(update, candidate.node);
                         continue;
                     }
-                    const visibility_global = switch (update.change) {
-                        .added => |value| value,
-                        .removed => |value| value,
-                    };
-                    if (!try runtime.globalVisible(
-                        candidate.peer,
-                        update.handle,
-                        visibility_global,
-                    )) {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    }
+                    const node = &runtime.registries.nodes.items[candidate.node];
                     switch (update.change) {
-                        .added => |global| ProtocolCore.sendGlobalEntry(
-                            server_objects,
-                            &actor.transmit,
-                            candidate.registry,
-                            update.handle.id,
-                            global,
-                        ) catch |err| switch (err) {
-                            error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                            else => return err,
+                        .added => |global| {
+                            if (!try runtime.globalVisible(candidate.peer, update.handle, global)) {
+                                runtime.registries.advance(update, candidate.node);
+                                continue;
+                            }
+                            try node.offers.ensureUnusedCapacity(runtime.clients.allocator, 1);
+                            ProtocolCore.sendGlobalEntry(
+                                server_objects,
+                                &actor.transmit,
+                                candidate.registry,
+                                update.handle.id,
+                                global,
+                            ) catch |err| switch (err) {
+                                error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
+                                else => return err,
+                            };
+                            node.offers.appendAssumeCapacity(.{ .global = update.handle });
                         },
-                        .removed => ProtocolCore.sendGlobalRemove(
-                            server_objects,
-                            &actor.transmit,
-                            candidate.registry,
-                            update.handle.id,
-                        ) catch |err| switch (err) {
-                            error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                            else => return err,
+                        .removed => {
+                            const offer = RegistrySubscriptions.offer(node, update.handle.id) orelse {
+                                runtime.registries.advance(update, candidate.node);
+                                continue;
+                            };
+                            ProtocolCore.sendGlobalRemove(
+                                server_objects,
+                                &actor.transmit,
+                                candidate.registry,
+                                update.handle.id,
+                            ) catch |err| switch (err) {
+                                error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
+                                else => return err,
+                            };
+                            offer.removal_sent = true;
                         },
                     }
                     runtime.registries.advance(update, candidate.node);
@@ -2169,6 +2304,8 @@ pub fn Runtime(comptime protocol: type) type {
                         cursor.pending = null;
                         continue;
                     }
+                    const offers = &runtime.registries.nodes.items[candidate.node].offers;
+                    try offers.ensureUnusedCapacity(runtime.clients.allocator, 1);
                     ProtocolCore.sendGlobalEntry(
                         server_objects,
                         &actor.transmit,
@@ -2179,6 +2316,7 @@ pub fn Runtime(comptime protocol: type) type {
                         error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
                         else => return err,
                     };
+                    offers.appendAssumeCapacity(.{ .global = entry.handle });
                     cursor.pending = null;
                     sent = true;
                 }
@@ -2234,6 +2372,7 @@ pub fn Runtime(comptime protocol: type) type {
             runtime.registries.removePeer(peer, active_update);
             runtime.sync_barriers.removePeer(peer);
             runtime.clients.destroy(peer) catch unreachable;
+            runtime.collectRemovedGlobals();
         }
 
         pub inline fn prepareEndpointClose(runtime: *Self) !bool {
@@ -2244,6 +2383,8 @@ pub fn Runtime(comptime protocol: type) type {
             if (!runtime.endpoint.listener.canDeinit()) return error.ListenerBusy;
             var peers = runtime.clients.iterator();
             if (peers.next() != null) return error.ClientsActive;
+            std.debug.assert(runtime.removed_globals.items.len == 0);
+            runtime.removed_globals.deinit(allocator);
             runtime.sync_barriers.deinit(allocator);
             runtime.registries.deinit(allocator);
             runtime.globals.deinit(allocator);

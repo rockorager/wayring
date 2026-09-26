@@ -78,6 +78,32 @@ Per-connection logical budgets still provide backpressure. Returned pool
 capacity is retained for reuse until teardown.
 `deinit` releases all grown capacity and closes runtime-owned descriptors.
 
+### Safe global removal
+
+`server.Runtime.removeGlobal` unpublishes a global, but retains its definition
+and binder while registry offers remain outstanding. Racing binds from those
+clients still invoke the original binder, which must create a valid (possibly
+inert) resource. Keep the global context alive until the callback passed to
+`removeGlobalWithCallback(handle, callback)` runs. The callback receives the
+global context and handle, may run synchronously, and must not reenter the
+runtime. Already-bound resources have independent lifetimes.
+
+A `wl_fixes` v2 adapter should decode requests with `server.decodeRequest`,
+resolve the registry argument in the requesting client's namespace, and call
+`runtime.ackGlobalRemove(peer, registry_handle, name)`. Map `InvalidAckRemove`
+to `wl_fixes.invalid_ack_remove` on the fixes object using `Core.postError`.
+Unknown, duplicate, unannounced, and not-yet-published removals are invalid.
+Destroy registries through `runtime.removeRegistry` and clients through
+`runtime.destroyClient`; both release their outstanding offers automatically.
+
+Each registry must acknowledge separately, even if it never bound the global.
+Clients without v2 support retain offers until registry destruction or
+disconnect: there is no unsafe timeout. Retired definitions do not consume
+`max_globals`, but can accumulate while old or non-acknowledging clients remain.
+Global names are never reused, even after collection; exhaustion returns
+`NameExhausted`. Use runtime publication/removal APIs once clients exist, not
+direct `Globals` mutations or manually encoded registry events.
+
 ## Generate protocol bindings
 
 The scanner accepts one or more XML files followed by the generated Zig output:

@@ -35,6 +35,19 @@
       <arg name="callback_data" type="uint"/>
     </event>
   </interface>
+  <interface name="wl_fixes" version="2">
+    <enum name="error">
+      <entry name="invalid_ack_remove" value="0"/>
+    </enum>
+    <request name="destroy" type="destructor"/>
+    <request name="destroy_registry">
+      <arg name="registry" type="object" interface="wl_registry"/>
+    </request>
+    <request name="ack_global_remove" since="2">
+      <arg name="registry" type="object" interface="wl_registry"/>
+      <arg name="name" type="uint"/>
+    </request>
+  </interface>
   <interface name="wl_shm" version="2">
     <enum name="error">
       <entry name="invalid_format" value="0"/>
