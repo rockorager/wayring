@@ -1312,19 +1312,34 @@ fn peerCredentials(fd: std.os.linux.fd_t) !Credentials {
     return credentials;
 }
 
+/// Per-registry global offers. An offer records one global's state for one
+/// registry, and pending offers are the events that registry is still owed.
+/// Every registry creation and global mutation advances one runtime-wide epoch;
+/// each peer receives its owed events in epoch order, independently of other
+/// peers, so one client's transmit backpressure never delays another client.
 const RegistrySubscriptions = struct {
     const end = std.math.maxInt(u32);
 
+    const OfferState = enum {
+        /// wl_registry.global is owed.
+        add_pending,
+        offered,
+        /// wl_registry.global_remove is owed.
+        remove_pending,
+        /// Retained until a wl_fixes acknowledgment or registry teardown.
+        removal_sent,
+    };
+
     const Offer = struct {
         global: objects.Handle,
-        removal_sent: bool = false,
+        state: OfferState,
+        /// Epoch at which the pending event became owed.
+        epoch: u64,
     };
 
     const Node = struct {
         handle: objects.Handle = undefined,
         next: u32 = end,
-        sequence: u64 = 0,
-        initial: ?GlobalCursor = null,
         offers: std.ArrayListUnmanaged(Offer) = .empty,
     };
 
@@ -1333,33 +1348,13 @@ const RegistrySubscriptions = struct {
         head: u32 = end,
         tail: u32 = end,
         count: u32 = 0,
-        initial_count: u32 = 0,
     };
 
-    const InitialUpdate = struct {
-        slot_index: usize = 0,
-        slot_generation: u32 = 0,
-        node: u32 = end,
-        slot_started: bool = false,
-    };
-
-    const Update = struct {
-        handle: objects.Handle,
-        change: union(enum) {
-            added: Global,
-            removed,
-        },
-        sequence_limit: u64,
-        slot_index: usize = 0,
-        slot_generation: u32 = 0,
-        node: u32 = end,
-        slot_started: bool = false,
-    };
-
-    const Candidate = struct {
-        peer: io_uring.Peer,
-        registry: objects.Handle,
+    /// The next event owed to one peer.
+    const Pending = struct {
         node: u32,
+        offer: u32,
+        epoch: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -1367,9 +1362,7 @@ const RegistrySubscriptions = struct {
     slots: std.ArrayListUnmanaged(Slot) = .empty,
     free_head: u32,
     available_count: usize,
-    initial_count: usize = 0,
-    initial_update: InitialUpdate = .{},
-    next_sequence: u64 = 1,
+    epoch: u64 = 0,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -1387,19 +1380,18 @@ const RegistrySubscriptions = struct {
 
     fn deinit(subscriptions: *RegistrySubscriptions, allocator: std.mem.Allocator) void {
         std.debug.assert(subscriptions.available_count == subscriptions.nodes.items.len);
-        std.debug.assert(subscriptions.initial_count == 0);
         for (subscriptions.slots.items) |slot| std.debug.assert(slot.generation == 0);
         subscriptions.slots.deinit(allocator);
         subscriptions.nodes.deinit(allocator);
         subscriptions.* = undefined;
     }
 
+    /// Links a registry with no offers and returns its node index.
     fn add(
         subscriptions: *RegistrySubscriptions,
         peer: io_uring.Peer,
         registry: objects.Handle,
-        initial: ?GlobalCursor,
-    ) !void {
+    ) !u32 {
         if (peer.slot >= subscriptions.slots.items.len) {
             const previous_len = subscriptions.slots.items.len;
             try subscriptions.slots.resize(subscriptions.allocator, peer.slot + 1);
@@ -1425,43 +1417,71 @@ const RegistrySubscriptions = struct {
             subscriptions.available_count -= 1;
             break :index recycled;
         };
-        const sequence = subscriptions.next_sequence;
-        subscriptions.next_sequence +%= 1;
-        if (subscriptions.next_sequence == 0) subscriptions.next_sequence = 1;
-        subscriptions.nodes.items[index] = .{
-            .handle = registry,
-            .sequence = sequence,
-            .initial = initial,
-        };
+        subscriptions.nodes.items[index] = .{ .handle = registry };
         if (slot.tail == end)
             slot.head = index
         else
             subscriptions.nodes.items[slot.tail].next = index;
         slot.tail = index;
         slot.count += 1;
-        if (initial != null) {
-            slot.initial_count += 1;
-            subscriptions.initial_count += 1;
-            subscriptions.initial_update = .{};
+        return index;
+    }
+
+    fn advanceEpoch(subscriptions: *RegistrySubscriptions) u64 {
+        subscriptions.epoch += 1;
+        return subscriptions.epoch;
+    }
+
+    /// Reserves one offer on every registry so a global addition cannot fail
+    /// after the global table has changed.
+    fn reserveOffers(subscriptions: *RegistrySubscriptions) !void {
+        for (subscriptions.slots.items) |slot| {
+            if (slot.generation == 0) continue;
+            var current = slot.head;
+            while (current != end) : (current = subscriptions.nodes.items[current].next)
+                try subscriptions.nodes.items[current].offers.ensureUnusedCapacity(subscriptions.allocator, 1);
         }
     }
 
-    fn removePeer(
-        subscriptions: *RegistrySubscriptions,
-        peer: io_uring.Peer,
-        update: ?*Update,
-    ) void {
+    /// Converts every offer of a removed global into its owed removal. A
+    /// registry that was never told about the global simply forgets it.
+    fn retract(subscriptions: *RegistrySubscriptions, name: u32) void {
+        const epoch = subscriptions.advanceEpoch();
+        for (subscriptions.nodes.items) |*node| {
+            var index: usize = 0;
+            while (index < node.offers.items.len) {
+                const entry = &node.offers.items[index];
+                if (entry.global.id != name) {
+                    index += 1;
+                    continue;
+                }
+                switch (entry.state) {
+                    .add_pending => {
+                        _ = node.offers.orderedRemove(index);
+                        continue;
+                    },
+                    .offered => {
+                        entry.state = .remove_pending;
+                        entry.epoch = epoch;
+                    },
+                    .remove_pending, .removal_sent => unreachable,
+                }
+                index += 1;
+            }
+        }
+    }
+
+    fn removePeer(subscriptions: *RegistrySubscriptions, peer: io_uring.Peer) void {
         if (peer.slot >= subscriptions.slots.items.len) return;
         const slot = &subscriptions.slots.items[peer.slot];
         if (slot.generation != peer.generation) return;
-        while (slot.head != end) subscriptions.removeNode(peer, end, slot.head, update);
+        while (slot.head != end) subscriptions.removeNode(peer, end, slot.head);
     }
 
     fn remove(
         subscriptions: *RegistrySubscriptions,
         peer: io_uring.Peer,
         registry: objects.Handle,
-        update: ?*Update,
     ) !void {
         if (peer.slot >= subscriptions.slots.items.len or
             subscriptions.slots.items[peer.slot].generation != peer.generation)
@@ -1472,7 +1492,7 @@ const RegistrySubscriptions = struct {
         while (current != end) : (current = subscriptions.nodes.items[current].next) {
             const handle = subscriptions.nodes.items[current].handle;
             if (handle.id == registry.id and handle.generation == registry.generation) {
-                subscriptions.removeNode(peer, previous, current, update);
+                subscriptions.removeNode(peer, previous, current);
                 return;
             }
             previous = current;
@@ -1480,34 +1500,15 @@ const RegistrySubscriptions = struct {
         return error.StaleHandle;
     }
 
-    /// Unlinks before recycling so resumable cursors can never observe a node
-    /// after its storage has been returned to the free list.
     fn removeNode(
         subscriptions: *RegistrySubscriptions,
         peer: io_uring.Peer,
         previous: u32,
         current: u32,
-        update: ?*Update,
     ) void {
         const slot = &subscriptions.slots.items[peer.slot];
         const node = &subscriptions.nodes.items[current];
         const next_node = node.next;
-        if (subscriptions.initial_update.slot_started and
-            subscriptions.initial_update.slot_index == peer.slot and
-            subscriptions.initial_update.slot_generation == peer.generation and
-            subscriptions.initial_update.node == current)
-            subscriptions.initial_update.node = next_node;
-        if (update) |active| {
-            if (active.slot_started and
-                active.slot_index == peer.slot and
-                active.slot_generation == peer.generation and
-                active.node == current)
-                active.node = next_node;
-        }
-        if (node.initial != null) {
-            slot.initial_count -= 1;
-            subscriptions.initial_count -= 1;
-        }
         if (previous == end)
             slot.head = next_node
         else
@@ -1538,161 +1539,49 @@ const RegistrySubscriptions = struct {
         return null;
     }
 
-    fn offer(node: *Node, name: u32) ?*Offer {
-        for (node.offers.items) |*entry| {
-            if (entry.global.id == name) return entry;
+    fn offerIndex(node: *const Node, name: u32) ?usize {
+        for (node.offers.items, 0..) |entry, index| {
+            if (entry.global.id == name) return index;
         }
         return null;
     }
 
+    /// True while a removed global may still be bound through this peer's
+    /// registries. Removed globals never have add_pending offers.
     fn offeredToPeer(subscriptions: *RegistrySubscriptions, peer: io_uring.Peer, name: u32) bool {
         if (peer.slot >= subscriptions.slots.items.len) return false;
         const slot = subscriptions.slots.items[peer.slot];
         if (slot.generation != peer.generation) return false;
         var current = slot.head;
         while (current != end) : (current = subscriptions.nodes.items[current].next) {
-            if (offer(&subscriptions.nodes.items[current], name) != null) return true;
+            if (offerIndex(&subscriptions.nodes.items[current], name) != null) return true;
         }
         return false;
     }
 
     fn hasOffers(subscriptions: *RegistrySubscriptions, name: u32) bool {
         for (subscriptions.nodes.items) |*node| {
-            if (offer(node, name) != null) return true;
+            if (offerIndex(node, name) != null) return true;
         }
         return false;
     }
 
-    fn nextInitial(subscriptions: *RegistrySubscriptions) ?Candidate {
-        const update = &subscriptions.initial_update;
-        while (update.slot_index < subscriptions.slots.items.len) {
-            const slot = &subscriptions.slots.items[update.slot_index];
-            if (!update.slot_started) {
-                update.slot_started = true;
-                update.slot_generation = slot.generation;
-                update.node = slot.head;
-            }
-            if (slot.generation == 0 or
-                slot.generation != update.slot_generation or
-                update.node == end)
-            {
-                update.slot_index += 1;
-                update.slot_started = false;
-                continue;
-            }
-            const index = update.node;
-            const node = &subscriptions.nodes.items[index];
-            if (node.initial == null) {
-                update.node = node.next;
-                continue;
-            }
-            return .{
-                .peer = .{
-                    .slot = @intCast(update.slot_index),
-                    .generation = update.slot_generation,
-                },
-                .registry = node.handle,
-                .node = index,
-            };
-        }
-        std.debug.assert(subscriptions.initial_count == 0);
-        return null;
-    }
-
-    fn completeInitial(subscriptions: *RegistrySubscriptions, candidate: Candidate) void {
-        const node = &subscriptions.nodes.items[candidate.node];
-        std.debug.assert(node.initial != null);
-        node.initial = null;
-        const slot = &subscriptions.slots.items[candidate.peer.slot];
-        slot.initial_count -= 1;
-        subscriptions.initial_count -= 1;
-        subscriptions.initial_update.node = node.next;
-    }
-
-    fn updateAdded(
-        subscriptions: RegistrySubscriptions,
-        handle: objects.Handle,
-        global: Global,
-    ) Update {
-        return .{
-            .handle = handle,
-            .change = .{ .added = global },
-            .sequence_limit = subscriptions.next_sequence -% 1,
-        };
-    }
-
-    fn updateRemoved(
-        subscriptions: RegistrySubscriptions,
-        handle: objects.Handle,
-    ) Update {
-        return .{
-            .handle = handle,
-            .change = .removed,
-            .sequence_limit = subscriptions.next_sequence -% 1,
-        };
-    }
-
-    fn next(
-        subscriptions: *RegistrySubscriptions,
-        update: *Update,
-    ) ?Candidate {
-        while (update.slot_index < subscriptions.slots.items.len) {
-            const slot = &subscriptions.slots.items[update.slot_index];
-            if (!update.slot_started) {
-                update.slot_started = true;
-                update.slot_generation = slot.generation;
-                update.node = slot.head;
-            }
-            if (slot.generation == 0 or
-                slot.generation != update.slot_generation or
-                update.node == end)
-            {
-                update.slot_index += 1;
-                update.slot_started = false;
-                continue;
-            }
-            const index = update.node;
-            const node = &subscriptions.nodes.items[index];
-            if (node.sequence > update.sequence_limit) {
-                update.node = node.next;
-                continue;
-            }
-            return .{
-                .peer = .{
-                    .slot = @intCast(update.slot_index),
-                    .generation = update.slot_generation,
-                },
-                .registry = node.handle,
-                .node = index,
-            };
-        }
-        return null;
-    }
-
-    fn advance(subscriptions: RegistrySubscriptions, update: *Update, node: u32) void {
-        std.debug.assert(update.node == node);
-        update.node = subscriptions.nodes.items[node].next;
-    }
-
-    fn sequenceLimit(subscriptions: RegistrySubscriptions) u64 {
-        return subscriptions.next_sequence -% 1;
-    }
-
-    fn initialPendingThrough(
-        subscriptions: RegistrySubscriptions,
-        peer: io_uring.Peer,
-        sequence_limit: u64,
-    ) bool {
-        if (peer.slot >= subscriptions.slots.items.len) return false;
+    /// Returns the peer's earliest owed event. Equal epochs keep registry and
+    /// offer order, so an initial listing follows global table order.
+    fn nextPending(subscriptions: RegistrySubscriptions, peer: io_uring.Peer) ?Pending {
+        if (peer.slot >= subscriptions.slots.items.len) return null;
         const slot = subscriptions.slots.items[peer.slot];
-        if (slot.generation != peer.generation) return false;
+        if (slot.generation != peer.generation) return null;
+        var best: ?Pending = null;
         var current = slot.head;
         while (current != end) : (current = subscriptions.nodes.items[current].next) {
-            const node = subscriptions.nodes.items[current];
-            if (node.sequence > sequence_limit) break;
-            if (node.initial != null) return true;
+            for (subscriptions.nodes.items[current].offers.items, 0..) |entry, index| {
+                if (entry.state != .add_pending and entry.state != .remove_pending) continue;
+                if (best != null and entry.epoch >= best.?.epoch) continue;
+                best = .{ .node = current, .offer = @intCast(index), .epoch = entry.epoch };
+            }
         }
-        return false;
+        return best;
     }
 };
 
@@ -1702,7 +1591,8 @@ const SyncBarriers = struct {
     const Node = struct {
         callback: objects.Handle = undefined,
         callback_data: u32 = 0,
-        sequence_limit: u64 = 0,
+        /// Registry epoch when the sync arrived; earlier events precede done.
+        epoch_limit: u64 = 0,
         next: u32 = end,
     };
 
@@ -1717,6 +1607,7 @@ const SyncBarriers = struct {
         node: u32,
         callback: objects.Handle,
         callback_data: u32,
+        epoch_limit: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -1745,7 +1636,7 @@ const SyncBarriers = struct {
         peer: io_uring.Peer,
         callback: objects.Handle,
         callback_data: u32,
-        sequence_limit: u64,
+        epoch_limit: u64,
     ) !void {
         if (peer.slot >= barriers.slots.items.len) {
             const previous_len = barriers.slots.items.len;
@@ -1769,7 +1660,7 @@ const SyncBarriers = struct {
         barriers.nodes.items[index] = .{
             .callback = callback,
             .callback_data = callback_data,
-            .sequence_limit = sequence_limit,
+            .epoch_limit = epoch_limit,
         };
         if (slot.tail == end)
             slot.head = index
@@ -1778,26 +1669,19 @@ const SyncBarriers = struct {
         slot.tail = index;
     }
 
-    fn nextReady(
-        barriers: SyncBarriers,
-        registries: RegistrySubscriptions,
-    ) ?Candidate {
-        for (barriers.slots.items, 0..) |slot, slot_index| {
-            if (slot.generation == 0 or slot.head == end) continue;
-            const node = barriers.nodes.items[slot.head];
-            const peer: io_uring.Peer = .{
-                .slot = @intCast(slot_index),
-                .generation = slot.generation,
-            };
-            if (registries.initialPendingThrough(peer, node.sequence_limit)) continue;
-            return .{
-                .peer = peer,
-                .node = slot.head,
-                .callback = node.callback,
-                .callback_data = node.callback_data,
-            };
-        }
-        return null;
+    /// Returns the peer's oldest outstanding sync.
+    fn head(barriers: SyncBarriers, peer: io_uring.Peer) ?Candidate {
+        if (peer.slot >= barriers.slots.items.len) return null;
+        const slot = barriers.slots.items[peer.slot];
+        if (slot.generation != peer.generation or slot.head == end) return null;
+        const node = barriers.nodes.items[slot.head];
+        return .{
+            .peer = peer,
+            .node = slot.head,
+            .callback = node.callback,
+            .callback_data = node.callback_data,
+            .epoch_limit = node.epoch_limit,
+        };
     }
 
     fn complete(barriers: *SyncBarriers, candidate: Candidate) void {
@@ -1849,7 +1733,11 @@ pub fn Runtime(comptime protocol: type) type {
         registries: RegistrySubscriptions,
         sync_barriers: SyncBarriers,
         removed_globals: std.ArrayListUnmanaged(RemovedGlobal) = .empty,
-        global_update: ?RegistrySubscriptions.Update = null,
+        /// Next peer slot publication visits; peers are served round-robin.
+        publish_cursor: usize = 0,
+        /// Per slot, the generation of a peer that reported backpressure in the
+        /// current publication pass. Sized when subscriptions or syncs are added.
+        publish_blocked: std.ArrayListUnmanaged(u32) = .empty,
         actor_config: io_uring.ActorConfig,
         global_filter: ?GlobalFilter,
 
@@ -1971,14 +1859,7 @@ pub fn Runtime(comptime protocol: type) type {
             );
             switch (action) {
                 .sync => {},
-                .get_registry => |registry| runtime.registries.add(
-                    peer,
-                    registry,
-                    if (runtime.globals.table.len() == 0)
-                        null
-                    else
-                        runtime.globals.cursor(),
-                ) catch |err| {
+                .get_registry => |registry| runtime.subscribe(peer, registry) catch |err| {
                     _ = server_objects.cancelClient(registry) catch unreachable;
                     return err;
                 },
@@ -1986,8 +1867,35 @@ pub fn Runtime(comptime protocol: type) type {
             return action;
         }
 
-        /// Adds a global and snapshots the registry subscriptions that must be
-        /// notified. Registries created later receive it through initial listing.
+        /// Subscribes a new registry and owes it every visible live global.
+        fn subscribe(runtime: *Self, peer: io_uring.Peer, registry: objects.Handle) !void {
+            try runtime.reservePublishSlot(peer.slot);
+            const index = try runtime.registries.add(peer, registry);
+            errdefer runtime.registries.remove(peer, registry) catch unreachable;
+            const offers = &runtime.registries.nodes.items[index].offers;
+            try offers.ensureTotalCapacity(runtime.clients.allocator, runtime.globals.table.len());
+            const epoch = runtime.registries.advanceEpoch();
+            var iterator = runtime.globals.iterator();
+            while (iterator.next()) |entry| {
+                if (!runtime.visibleTo(peer, entry.handle, entry.value.*)) continue;
+                offers.appendAssumeCapacity(.{ .global = entry.handle, .state = .add_pending, .epoch = epoch });
+            }
+        }
+
+        /// Visibility for an existing subscription. Subscriptions are removed
+        /// before their client, so a stale peer can only mean no delivery.
+        fn visibleTo(runtime: *Self, peer: io_uring.Peer, handle: objects.Handle, global: Global) bool {
+            return runtime.globalVisible(peer, handle, global) catch false;
+        }
+
+        fn reservePublishSlot(runtime: *Self, slot: u32) !void {
+            const blocked = &runtime.publish_blocked;
+            if (slot < blocked.items.len) return;
+            try blocked.appendNTimes(runtime.clients.allocator, 0, slot + 1 - blocked.items.len);
+        }
+
+        /// Adds a global and owes it to every registry that can see it.
+        /// Registries created later receive it in their initial listing.
         pub fn addGlobal(
             runtime: *Self,
             interface: *const metadata.Interface,
@@ -2004,18 +1912,27 @@ pub fn Runtime(comptime protocol: type) type {
             context: ?*anyopaque,
             bind: ?BindFn,
         ) !objects.Handle {
-            if (runtime.global_update != null or runtime.registries.initial_count != 0)
-                return error.GlobalUpdateActive;
+            try runtime.registries.reserveOffers();
             const handle = try runtime.globals.addWithBinder(
                 interface,
                 version,
                 context,
                 bind,
             );
-            runtime.global_update = runtime.registries.updateAdded(
-                handle,
-                (try runtime.globals.get(handle.id)).*,
-            );
+            const global = (try runtime.globals.get(handle.id)).*;
+            const epoch = runtime.registries.advanceEpoch();
+            const subscriptions = &runtime.registries;
+            for (subscriptions.slots.items, 0..) |slot, slot_index| {
+                if (slot.generation == 0) continue;
+                const peer: io_uring.Peer = .{ .slot = @intCast(slot_index), .generation = slot.generation };
+                if (!runtime.visibleTo(peer, handle, global)) continue;
+                var current = slot.head;
+                while (current != RegistrySubscriptions.end) : (current = subscriptions.nodes.items[current].next) {
+                    subscriptions.nodes.items[current].offers.appendAssumeCapacity(
+                        .{ .global = handle, .state = .add_pending, .epoch = epoch },
+                    );
+                }
+            }
             return handle;
         }
 
@@ -2082,9 +1999,10 @@ pub fn Runtime(comptime protocol: type) type {
             server_objects.setRemovalHook(hook);
         }
 
-        /// Defers a wl_display.sync completion behind every initial registry
-        /// entry created by earlier requests on the same connection. The
-        /// callback remains runtime-owned across transmit backpressure.
+        /// Defers a wl_display.sync completion behind every registry event the
+        /// connection was owed when it arrived, including initial listings of
+        /// earlier registries. The callback remains runtime-owned across
+        /// transmit backpressure.
         pub fn completeSync(
             runtime: *Self,
             peer: io_uring.Peer,
@@ -2096,11 +2014,12 @@ pub fn Runtime(comptime protocol: type) type {
                 return error.StaleHandle;
             if (object.interface != &ProtocolCore.Callback.info)
                 return error.WrongInterface;
+            try runtime.reservePublishSlot(peer.slot);
             try runtime.sync_barriers.add(
                 peer,
                 callback,
                 callback_data,
-                runtime.registries.sequenceLimit(),
+                runtime.registries.epoch,
             );
         }
 
@@ -2123,8 +2042,7 @@ pub fn Runtime(comptime protocol: type) type {
                 .delete_id = .{ .id = registry.id },
             });
             try actor.transmit.ensureCapacity(delete_id_size, 0);
-            const active_update = if (runtime.global_update) |*update| update else null;
-            try runtime.registries.remove(peer, registry, active_update);
+            try runtime.registries.remove(peer, registry);
             const removed = ProtocolCore.deleteClient(
                 server_objects,
                 &actor.transmit,
@@ -2150,8 +2068,6 @@ pub fn Runtime(comptime protocol: type) type {
             handle: objects.Handle,
             withdrawn: ?GlobalWithdrawnFn,
         ) !void {
-            if (runtime.global_update != null or runtime.registries.initial_count != 0)
-                return error.GlobalUpdateActive;
             if (runtime.globals.table.resolve(handle) == null) return error.UnknownGlobal;
             try runtime.removed_globals.ensureUnusedCapacity(runtime.clients.allocator, 1);
             const removed = try runtime.globals.remove(handle);
@@ -2160,7 +2076,7 @@ pub fn Runtime(comptime protocol: type) type {
                 .global = removed,
                 .withdrawn = withdrawn,
             });
-            runtime.global_update = runtime.registries.updateRemoved(handle);
+            runtime.registries.retract(handle.id);
             runtime.collectRemovedGlobals();
         }
 
@@ -2178,14 +2094,10 @@ pub fn Runtime(comptime protocol: type) type {
             const object = server_objects.namespace.resolve(registry) orelse return error.StaleHandle;
             if (object.interface != &ProtocolCore.Registry.info) return error.WrongInterface;
             const node = runtime.registries.find(peer, registry) orelse return error.StaleHandle;
-            for (node.offers.items, 0..) |entry, index| {
-                if (entry.global.id != name) continue;
-                if (!entry.removal_sent) return error.InvalidAckRemove;
-                _ = node.offers.swapRemove(index);
-                runtime.collectRemovedGlobals();
-                return;
-            }
-            return error.InvalidAckRemove;
+            const index = RegistrySubscriptions.offerIndex(node, name) orelse return error.InvalidAckRemove;
+            if (node.offers.items[index].state != .removal_sent) return error.InvalidAckRemove;
+            _ = node.offers.orderedRemove(index);
+            runtime.collectRemovedGlobals();
         }
 
         fn collectRemovedGlobals(runtime: *Self) void {
@@ -2201,166 +2113,115 @@ pub fn Runtime(comptime protocol: type) type {
             }
         }
 
-        /// Queues at most one global event, finishing an active table mutation
-        /// before runtime-owned initial registry listings. Backpressure leaves
-        /// the cursor on the same event; successful publication returns the
-        /// affected peer so callers can prepare its send SQE without scanning.
+        /// Queues at most one owed registry event or sync completion. Peers are
+        /// visited round-robin and each receives its events in epoch order. A
+        /// peer whose transmit queue is full is reported once as `.blocked` and
+        /// skipped for the rest of the pass, so it never delays other peers.
+        /// `.complete` ends the pass: nothing is owed except to peers reported
+        /// blocked since the previous `.complete`. The next call retries them.
         pub fn publishNext(runtime: *Self) !PublishResult {
-            if (runtime.global_update) |*update| {
-                while (runtime.registries.next(update)) |candidate| {
-                    const actor = runtime.clients.reactor.getActor(candidate.peer) catch {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    };
-                    if (!actor.canDispatch()) {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    }
-                    const server_objects = runtime.clients.get(candidate.peer) catch {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    };
-                    const registry_object = server_objects.namespace.resolve(candidate.registry) orelse {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    };
-                    if (registry_object.interface != &ProtocolCore.Registry.info) {
-                        runtime.registries.advance(update, candidate.node);
-                        continue;
-                    }
-                    const node = &runtime.registries.nodes.items[candidate.node];
-                    switch (update.change) {
-                        .added => |global| {
-                            if (!try runtime.globalVisible(candidate.peer, update.handle, global)) {
-                                runtime.registries.advance(update, candidate.node);
-                                continue;
-                            }
-                            try node.offers.ensureUnusedCapacity(runtime.clients.allocator, 1);
-                            ProtocolCore.sendGlobalEntry(
-                                server_objects,
-                                &actor.transmit,
-                                candidate.registry,
-                                update.handle.id,
-                                global,
-                            ) catch |err| switch (err) {
-                                error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                                else => return err,
-                            };
-                            node.offers.appendAssumeCapacity(.{ .global = update.handle });
-                        },
-                        .removed => {
-                            const offer = RegistrySubscriptions.offer(node, update.handle.id) orelse {
-                                runtime.registries.advance(update, candidate.node);
-                                continue;
-                            };
-                            ProtocolCore.sendGlobalRemove(
-                                server_objects,
-                                &actor.transmit,
-                                candidate.registry,
-                                update.handle.id,
-                            ) catch |err| switch (err) {
-                                error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                                else => return err,
-                            };
-                            offer.removal_sent = true;
-                        },
-                    }
-                    runtime.registries.advance(update, candidate.node);
-                    return .{ .sent = candidate.peer };
+            const slot_count = @max(
+                runtime.registries.slots.items.len,
+                runtime.sync_barriers.slots.items.len,
+            );
+            for (0..slot_count) |_| {
+                if (runtime.publish_cursor >= slot_count) runtime.publish_cursor = 0;
+                const slot_index = runtime.publish_cursor;
+                runtime.publish_cursor += 1;
+                const peer = runtime.publicationPeer(slot_index) orelse continue;
+                if (runtime.publish_blocked.items[slot_index] == peer.generation) continue;
+                switch (try runtime.publishPeer(peer)) {
+                    .idle => {},
+                    .sent => return .{ .sent = peer },
+                    .blocked => {
+                        runtime.publish_blocked.items[slot_index] = peer.generation;
+                        return .{ .blocked = peer };
+                    },
                 }
-                runtime.global_update = null;
             }
-
-            if (try runtime.publishReadySync()) |result| return result;
-
-            while (runtime.registries.nextInitial()) |candidate| {
-                const actor = runtime.clients.reactor.getActor(candidate.peer) catch {
-                    runtime.registries.completeInitial(candidate);
-                    continue;
-                };
-                if (!actor.canDispatch()) {
-                    runtime.registries.completeInitial(candidate);
-                    continue;
-                }
-                const server_objects = runtime.clients.get(candidate.peer) catch {
-                    runtime.registries.completeInitial(candidate);
-                    continue;
-                };
-                const registry_object = server_objects.namespace.resolve(candidate.registry) orelse {
-                    runtime.registries.completeInitial(candidate);
-                    continue;
-                };
-                if (registry_object.interface != &ProtocolCore.Registry.info) {
-                    runtime.registries.completeInitial(candidate);
-                    continue;
-                }
-                const cursor = &runtime.registries.nodes.items[candidate.node].initial.?;
-                var sent = false;
-                while (!sent) {
-                    if (cursor.pending == null)
-                        cursor.pending = cursor.iterator.next() orelse break;
-                    const entry = cursor.pending.?;
-                    if (!try runtime.globalVisible(candidate.peer, entry.handle, entry.value.*)) {
-                        cursor.pending = null;
-                        continue;
-                    }
-                    const offers = &runtime.registries.nodes.items[candidate.node].offers;
-                    try offers.ensureUnusedCapacity(runtime.clients.allocator, 1);
-                    ProtocolCore.sendGlobalEntry(
-                        server_objects,
-                        &actor.transmit,
-                        candidate.registry,
-                        entry.handle.id,
-                        entry.value.*,
-                    ) catch |err| switch (err) {
-                        error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                        else => return err,
-                    };
-                    offers.appendAssumeCapacity(.{ .global = entry.handle });
-                    cursor.pending = null;
-                    sent = true;
-                }
-                if (!sent) {
-                    runtime.registries.completeInitial(candidate);
-                    if (try runtime.publishReadySync()) |result| return result;
-                    continue;
-                }
-                return .{ .sent = candidate.peer };
-            }
+            @memset(runtime.publish_blocked.items, 0);
             return .complete;
         }
 
-        fn publishReadySync(runtime: *Self) !?PublishResult {
-            while (runtime.sync_barriers.nextReady(runtime.registries)) |candidate| {
-                const actor = runtime.clients.reactor.getActor(candidate.peer) catch {
-                    runtime.sync_barriers.complete(candidate);
-                    continue;
-                };
-                if (!actor.canDispatch()) {
-                    runtime.sync_barriers.complete(candidate);
-                    continue;
-                }
-                const server_objects = runtime.clients.get(candidate.peer) catch {
-                    runtime.sync_barriers.complete(candidate);
-                    continue;
-                };
-                if (server_objects.namespace.resolve(candidate.callback) == null) {
-                    runtime.sync_barriers.complete(candidate);
-                    continue;
-                }
-                ProtocolCore.completeSync(
-                    server_objects,
-                    &actor.transmit,
-                    candidate.callback,
-                    candidate.callback_data,
-                ) catch |err| switch (err) {
-                    error.ByteBudgetExceeded, error.Exhausted => return .{ .blocked = candidate.peer },
-                    else => return err,
-                };
-                runtime.sync_barriers.complete(candidate);
-                return .{ .sent = candidate.peer };
-            }
+        fn publicationPeer(runtime: *Self, slot_index: usize) ?io_uring.Peer {
+            const registry_slots = runtime.registries.slots.items;
+            if (slot_index < registry_slots.len and registry_slots[slot_index].generation != 0)
+                return .{ .slot = @intCast(slot_index), .generation = registry_slots[slot_index].generation };
+            const barrier_slots = runtime.sync_barriers.slots.items;
+            if (slot_index < barrier_slots.len and barrier_slots[slot_index].generation != 0)
+                return .{ .slot = @intCast(slot_index), .generation = barrier_slots[slot_index].generation };
             return null;
+        }
+
+        /// Sends one peer's earliest owed event. A sync completes once no event
+        /// owed before its arrival is still pending, ahead of later events.
+        fn publishPeer(runtime: *Self, peer: io_uring.Peer) !enum { idle, sent, blocked } {
+            const actor = runtime.clients.reactor.getActor(peer) catch return .idle;
+            if (!actor.canDispatch()) return .idle;
+            const server_objects = runtime.clients.get(peer) catch return .idle;
+            while (true) {
+                const pending = runtime.registries.nextPending(peer);
+                if (runtime.sync_barriers.head(peer)) |barrier| {
+                    if (pending == null or pending.?.epoch > barrier.epoch_limit) {
+                        if (server_objects.namespace.resolve(barrier.callback) == null) {
+                            runtime.sync_barriers.complete(barrier);
+                            continue;
+                        }
+                        ProtocolCore.completeSync(
+                            server_objects,
+                            &actor.transmit,
+                            barrier.callback,
+                            barrier.callback_data,
+                        ) catch |err| switch (err) {
+                            error.ByteBudgetExceeded, error.Exhausted => return .blocked,
+                            else => return err,
+                        };
+                        runtime.sync_barriers.complete(barrier);
+                        return .sent;
+                    }
+                }
+                const next = pending orelse return .idle;
+                const node = &runtime.registries.nodes.items[next.node];
+                const registry_object = server_objects.namespace.resolve(node.handle);
+                if (registry_object == null or registry_object.?.interface != &ProtocolCore.Registry.info) {
+                    // The registry object disappeared without removeRegistry;
+                    // drop its subscription so later events are not starved.
+                    runtime.registries.remove(peer, node.handle) catch unreachable;
+                    runtime.collectRemovedGlobals();
+                    continue;
+                }
+                const entry = &node.offers.items[next.offer];
+                switch (entry.state) {
+                    .add_pending => {
+                        const global = runtime.globals.table.resolve(entry.global).?.*;
+                        ProtocolCore.sendGlobalEntry(
+                            server_objects,
+                            &actor.transmit,
+                            node.handle,
+                            entry.global.id,
+                            global,
+                        ) catch |err| switch (err) {
+                            error.ByteBudgetExceeded, error.Exhausted => return .blocked,
+                            else => return err,
+                        };
+                        entry.state = .offered;
+                    },
+                    .remove_pending => {
+                        ProtocolCore.sendGlobalRemove(
+                            server_objects,
+                            &actor.transmit,
+                            node.handle,
+                            entry.global.id,
+                        ) catch |err| switch (err) {
+                            error.ByteBudgetExceeded, error.Exhausted => return .blocked,
+                            else => return err,
+                        };
+                        entry.state = .removal_sent;
+                    },
+                    .offered, .removal_sent => unreachable,
+                }
+                return .sent;
+            }
         }
 
         /// Releases registry subscriptions and then the fully quiesced client.
@@ -2368,8 +2229,7 @@ pub fn Runtime(comptime protocol: type) type {
             const actor = try runtime.clients.reactor.getActor(peer);
             if (!actor.canDeinit()) return error.ActorBusy;
             _ = try runtime.clients.get(peer);
-            const active_update = if (runtime.global_update) |*update| update else null;
-            runtime.registries.removePeer(peer, active_update);
+            runtime.registries.removePeer(peer);
             runtime.sync_barriers.removePeer(peer);
             runtime.clients.destroy(peer) catch unreachable;
             runtime.collectRemovedGlobals();
@@ -2385,6 +2245,7 @@ pub fn Runtime(comptime protocol: type) type {
             if (peers.next() != null) return error.ClientsActive;
             std.debug.assert(runtime.removed_globals.items.len == 0);
             runtime.removed_globals.deinit(allocator);
+            runtime.publish_blocked.deinit(allocator);
             runtime.sync_barriers.deinit(allocator);
             runtime.registries.deinit(allocator);
             runtime.globals.deinit(allocator);
@@ -2638,10 +2499,9 @@ pub fn Driver(comptime protocol: type) type {
                         _ = try driver.schedule(peer);
                         progress.published += 1;
                     },
-                    .blocked => |peer| {
-                        _ = try driver.schedule(peer);
-                        break;
-                    },
+                    // A blocked peer resumes after its sends drain; keep
+                    // serving every other peer in this pass.
+                    .blocked => |peer| _ = try driver.schedule(peer),
                     .complete => break,
                 };
             while (driver.pending_head != queue_end) {
@@ -2826,7 +2686,7 @@ pub fn Driver(comptime protocol: type) type {
     };
 }
 
-test "registry removal retires active cursors and reuses capacity generation-safely" {
+test "registry offers keep epoch order, retract unsent adds, and reuse nodes safely" {
     const allocator = std.testing.allocator;
     var subscriptions = try RegistrySubscriptions.init(allocator, 1);
     defer subscriptions.deinit(allocator);
@@ -2837,39 +2697,62 @@ test "registry removal retires active cursors and reuses capacity generation-saf
     const first: objects.Handle = .{ .id = 2, .generation = 11 };
     const second: objects.Handle = .{ .id = 3, .generation = 12 };
     const replacement: objects.Handle = .{ .id = 2, .generation = 13 };
+    const old_global: objects.Handle = .{ .id = 1, .generation = 1 };
+    const new_global: objects.Handle = .{ .id = 2, .generation = 1 };
 
-    try subscriptions.add(first_peer, first, @as(GlobalCursor, undefined));
-    const initial = subscriptions.nextInitial().?;
-    try std.testing.expectEqual(first, initial.registry);
-    try subscriptions.remove(first_peer, first, null);
-    try std.testing.expectEqual(@as(usize, 0), subscriptions.initial_count);
-    try std.testing.expectEqual(@as(?RegistrySubscriptions.Candidate, null), subscriptions.nextInitial());
-    try std.testing.expectEqual(@as(usize, 1), subscriptions.available_count);
+    // Two registries: the earlier one owes an add from an earlier epoch.
+    const first_node = try subscriptions.add(first_peer, first);
+    try subscriptions.nodes.items[first_node].offers.append(allocator, .{
+        .global = old_global,
+        .state = .offered,
+        .epoch = subscriptions.advanceEpoch(),
+    });
+    const second_node = try subscriptions.add(first_peer, second);
+    try subscriptions.reserveOffers();
+    const added_epoch = subscriptions.advanceEpoch();
+    for ([_]u32{ first_node, second_node }) |node|
+        subscriptions.nodes.items[node].offers.appendAssumeCapacity(
+            .{ .global = new_global, .state = .add_pending, .epoch = added_epoch },
+        );
 
-    // The same physical node is safe to reuse after the initial cursor was on it.
-    try subscriptions.add(first_peer, second, null);
-    try std.testing.expectEqual(@as(usize, 1), subscriptions.nodes.items.len);
-    var update = subscriptions.updateAdded(.{ .id = 1, .generation = 1 }, undefined);
-    const current = subscriptions.next(&update).?;
-    try std.testing.expectEqual(second, current.registry);
-    try subscriptions.remove(first_peer, second, &update);
-    try subscriptions.add(first_peer, first, null);
-    try std.testing.expectEqual(@as(?RegistrySubscriptions.Candidate, null), subscriptions.next(&update));
-    try subscriptions.remove(first_peer, first, null);
+    // Removing the offered global owes a removal after the pending adds.
+    subscriptions.retract(old_global.id);
+    var pending = subscriptions.nextPending(first_peer).?;
+    try std.testing.expectEqual(first_node, pending.node);
+    try std.testing.expectEqual(added_epoch, pending.epoch);
+    subscriptions.nodes.items[pending.node].offers.items[pending.offer].state = .offered;
+    pending = subscriptions.nextPending(first_peer).?;
+    try std.testing.expectEqual(second_node, pending.node);
+    subscriptions.nodes.items[pending.node].offers.items[pending.offer].state = .offered;
+    pending = subscriptions.nextPending(first_peer).?;
+    try std.testing.expectEqual(RegistrySubscriptions.OfferState.remove_pending, subscriptions.nodes.items[pending.node].offers.items[pending.offer].state);
+    try std.testing.expectEqual(old_global, subscriptions.nodes.items[pending.node].offers.items[pending.offer].global);
+    try std.testing.expect(subscriptions.offeredToPeer(first_peer, old_global.id));
+    try std.testing.expect(!subscriptions.offeredToPeer(other_peer, old_global.id));
 
-    try subscriptions.add(next_peer, replacement, null);
-    try std.testing.expectError(
-        error.StaleHandle,
-        subscriptions.remove(first_peer, replacement, null),
+    // A global removed before its add was sent is forgotten, not announced.
+    const unsent: objects.Handle = .{ .id = 3, .generation = 1 };
+    try subscriptions.reserveOffers();
+    const unsent_epoch = subscriptions.advanceEpoch();
+    subscriptions.nodes.items[second_node].offers.appendAssumeCapacity(
+        .{ .global = unsent, .state = .add_pending, .epoch = unsent_epoch },
     );
-    try std.testing.expectError(
-        error.StaleHandle,
-        subscriptions.remove(other_peer, replacement, null),
-    );
-    try std.testing.expectError(
-        error.StaleHandle,
-        subscriptions.remove(next_peer, first, null),
-    );
+    subscriptions.retract(unsent.id);
+    try std.testing.expect(!subscriptions.hasOffers(unsent.id));
+
+    try subscriptions.remove(first_peer, first);
+    try subscriptions.remove(first_peer, second);
+    try std.testing.expect(!subscriptions.hasOffers(old_global.id));
+    try std.testing.expectEqual(@as(?RegistrySubscriptions.Pending, null), subscriptions.nextPending(first_peer));
+    try std.testing.expectEqual(@as(usize, 2), subscriptions.available_count);
+
+    // Recycled nodes start empty and stay bound to their peer generation.
+    _ = try subscriptions.add(next_peer, replacement);
+    try std.testing.expectEqual(@as(usize, 2), subscriptions.nodes.items.len);
+    try std.testing.expectError(error.StaleHandle, subscriptions.remove(first_peer, replacement));
+    try std.testing.expectError(error.StaleHandle, subscriptions.remove(other_peer, replacement));
+    try std.testing.expectError(error.StaleHandle, subscriptions.remove(next_peer, first));
+    try std.testing.expectEqual(@as(?RegistrySubscriptions.Pending, null), subscriptions.nextPending(next_peer));
     try std.testing.expectEqual(@as(u32, 1), subscriptions.slots.items[0].count);
-    try subscriptions.remove(next_peer, replacement, null);
+    try subscriptions.remove(next_peer, replacement);
 }

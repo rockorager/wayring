@@ -387,32 +387,39 @@ repeated syscalls. Active-peer iteration supports batched shutdown, while
 connection CQE switches and protocol dispatch remain visible to the application.
 Registry subscriptions lease entries from one configurable reactor-wide pool;
 idle clients reserve none, and disconnect returns each client's chain in O(1).
-Each subscription also owns its initial global-listing cursor. The runtime's
-publication driver persists that cursor across TX backpressure, so applications
-do not retain per-registry iteration state. Global-table mutation remains
-serialized until all live initial listings finish, keeping their iterators valid
-and ensuring older globals are queued before later changes. Disconnect releases
-pending listings with the subscription chain in O(1).
-Runtime-owned `wl_display.sync` barriers snapshot the calling peer's registry
-sequence. Their `done` and `delete_id` events are published only after every
-earlier initial listing for that peer. Both the barrier and callback ownership
-survive TX backpressure, so a roundtrip cannot observe `done` ahead of the
-globals requested before it.
-Adding or removing a global snapshots the subscriptions that existed at that
-point into one runtime-owned resumable publication cursor. A second mutation is
-rejected until the first completes, preserving registry event order. Publication
-queues at most one event per step, preserves its position under TX or shared-
-block backpressure, and reports the affected peer for explicit send preparation.
-Registries created while an update is pending use the current initial global
-listing and are sequence-filtered from that update, preventing duplicate
-announcements.
+Each subscription keeps one offer per global it can see, and the offer's state
+says what that registry is owed: `add_pending`, then `offered` once
+`wl_registry.global` is queued, `remove_pending` after removal, and
+`removal_sent` until a `wl_fixes` acknowledgment or registry teardown. A new
+registry is owed every visible live global as its initial listing; adding a
+global owes it to every registry that can see it; removing one turns each
+`offered` entry into an owed removal and simply forgets `add_pending` entries,
+so a registry never told about a global is never told it left. Registry
+creation and every global mutation advance one runtime-wide epoch stamped on
+each owed event, and each peer receives its owed events in epoch order.
+Global mutations therefore never wait for clients, and pending events per
+registry stay bounded by its live and retained globals however long a client
+stalls.
+Publication queues at most one event per step and visits peers round-robin. A
+peer whose transmit queue is full is reported once as blocked and skipped for
+the rest of the pass, so one client that stops reading never delays registry
+events or roundtrips for another. A pass completes when nothing is owed except
+to peers already reported blocked; the next pass retries them.
+Runtime-owned `wl_display.sync` barriers record the epoch at which the request
+arrived. Their `done` and `delete_id` events are published after every event the
+peer was owed at that point, including earlier initial listings, and before any
+event that became owed later. Both the barrier and callback ownership survive TX
+backpressure, so a roundtrip cannot observe `done` ahead of the globals
+requested before it.
 A bounded model check in the server tests replays every sequence of up to six
 global, registry, bind, ack, sync, publication, and client-teardown operations
 on a real runtime with small transmit budgets. Each queued registry event must
-be owed to its registry, binds and acknowledgments must match offer state,
-`sync` completes only after every event owed when it was requested, removed
-globals are withdrawn exactly when their last offer ends, and draining from
-every state delivers all owed events and reclaims every removed global.
+be the peer's earliest owed event, binds and acknowledgments must match offer
+state, `sync` completes after earlier events and before later ones, removed
+globals are withdrawn exactly when their last offer ends, a client that is the
+only one reading receives everything it is owed while the other stalls, and
+draining from every state delivers all owed events and reclaims every removed
+global.
 The optional server driver owns only allocation-free scheduling policy over a
 borrowed runtime. It allocates one intrusive work node per reactor connection
 slot at initialization, deduplicates peers needing send or close preparation,
@@ -422,9 +429,10 @@ Application handlers receive the peer, resolved target, message, and descriptor
 queue directly; optional connection, disconnection, and protocol-error hooks
 remain statically dispatched. The disconnection hook runs while client metadata
 is live and must not destroy the client or reenter the driver; the driver owns
-client destruction after the hook returns. The driver advances the runtime's
-initial and incremental global-publication cursors and schedules each affected
-peer, so registry backpressure resumes on later send completions. External producers of
+client destruction after the hook returns. The driver runs each publication
+pass to completion and schedules every peer that received or was blocked on an
+event, so registry backpressure resumes on later send completions without
+pausing other peers. External producers of
 other events explicitly schedule the affected peer. Borrowed-ring users must
 filter unrelated CQEs before dispatch and retain control of `submit`; if a
 batch reports pending work because the SQ filled, they submit and call

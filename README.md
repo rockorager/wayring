@@ -97,6 +97,8 @@ Destroy registries through `runtime.removeRegistry` and clients through
 `runtime.destroyClient`; both release their outstanding offers automatically.
 
 Each registry must acknowledge separately, even if it never bound the global.
+A registry that had not yet been sent the global when it was removed is never
+told about it and holds no offer.
 Clients without v2 support retain offers until registry destruction or
 disconnect: there is no unsafe timeout. Retired definitions do not consume
 `max_globals`, but can accumulate while old or non-acknowledging clients remain.
