@@ -99,6 +99,10 @@ pub fn Connection(comptime protocol: type) type {
             max_objects: usize,
             max_client_ids: usize,
             display_context: ?*anyopaque = null,
+            /// When set, `max_objects` and `max_client_ids` are starting
+            /// sizes: the object table and client ID table double when full
+            /// instead of failing. Only that growth allocates.
+            growable: bool = false,
         };
 
         /// Consumes `socket_fd`, initializes wl_display, and queues the initial
@@ -113,7 +117,11 @@ pub fn Connection(comptime protocol: type) type {
         ) !Self {
             const peer = try reactor.attach(socket_fd, actor_config);
             errdefer reactor.destroyPeer(peer) catch unreachable;
-            var client_objects = try objects.ClientObjects.init(
+            const init_objects = if (object_config.growable)
+                &objects.ClientObjects.initGrowable
+            else
+                &objects.ClientObjects.init;
+            var client_objects = try init_objects(
                 allocator,
                 object_config.max_objects,
                 object_config.max_client_ids,
