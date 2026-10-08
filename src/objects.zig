@@ -1,4 +1,5 @@
-//! Bounded object-ID lookup with no steady-state allocation.
+//! Object-ID lookup with no steady-state allocation. Tables are bounded by
+//! default; a growable table doubles when full, so only growth allocates.
 
 const std = @import("std");
 const metadata = @import("metadata.zig");
@@ -57,6 +58,15 @@ pub const Namespace = struct {
         max_objects: usize,
     ) NamespaceError!Namespace {
         return .{ .table = try Table(Object).init(allocator, max_objects) };
+    }
+
+    /// `initial_objects` is a starting size, not a limit: the table doubles
+    /// when full. Insertion may then move entries, as removal always could.
+    pub fn initGrowable(
+        allocator: std.mem.Allocator,
+        initial_objects: usize,
+    ) NamespaceError!Namespace {
+        return .{ .table = try Table(Object).initGrowable(allocator, initial_objects) };
     }
 
     pub fn deinit(namespace: *Namespace, allocator: std.mem.Allocator) void {
@@ -143,9 +153,10 @@ pub const ClientIdError = std.mem.Allocator.Error || error{
     InvalidTransition,
 };
 
-/// Tracks the reuse protocol for IDs created by a Wayland client. Storage is
-/// allocated once; an ID retired locally is not reusable until delete_id is
-/// received from the server.
+/// Tracks the reuse protocol for IDs created by a Wayland client. Bounded
+/// storage is allocated once; growable storage doubles when every ID is in
+/// use. An ID retired locally is not reusable until delete_id is received from
+/// the server.
 pub const ClientIds = struct {
     const never_used = std.math.maxInt(u32);
     const active = never_used - 1;
@@ -154,16 +165,26 @@ pub const ClientIds = struct {
 
     /// Each active slot contains a state sentinel. Each free slot contains the
     /// index of the next free slot, making the free list intrusive.
+    const id_space = @as(usize, server_id_start) - 2;
+
     entries: []u32,
     next_index: usize = 0,
     free_head: u32 = no_free_id,
+    /// Set for growable storage; the free list holds indexes, so entries may move.
+    growth: ?std.mem.Allocator = null,
 
     pub fn init(allocator: std.mem.Allocator, max_ids: usize) ClientIdError!ClientIds {
-        const id_space = @as(usize, server_id_start) - 2;
         if (max_ids == 0 or max_ids > id_space) return error.InvalidConfig;
         const entries = try allocator.alloc(u32, max_ids);
         @memset(entries, never_used);
         return .{ .entries = entries };
+    }
+
+    /// `initial_ids` is a starting size; the client ID range is the only limit.
+    pub fn initGrowable(allocator: std.mem.Allocator, initial_ids: usize) ClientIdError!ClientIds {
+        var ids = try init(allocator, initial_ids);
+        ids.growth = allocator;
+        return ids;
     }
 
     pub fn deinit(ids: *ClientIds, allocator: std.mem.Allocator) void {
@@ -178,7 +199,7 @@ pub const ClientIds = struct {
             ids.entries[index] = active;
             return index + 2;
         }
-        if (ids.next_index == ids.entries.len) return error.Exhausted;
+        if (ids.next_index == ids.entries.len) try ids.grow();
         const index = ids.next_index;
         ids.next_index += 1;
         ids.entries[index] = active;
@@ -210,6 +231,14 @@ pub const ClientIds = struct {
     pub fn isActive(ids: ClientIds, id: u32) bool {
         const index = ids.usedIndex(id) orelse return false;
         return ids.entries[index] == active;
+    }
+
+    fn grow(ids: *ClientIds) ClientIdError!void {
+        const allocator = ids.growth orelse return error.Exhausted;
+        if (ids.entries.len == id_space) return error.Exhausted;
+        const old_len = ids.entries.len;
+        ids.entries = try allocator.realloc(ids.entries, @min(old_len * 2, id_space));
+        @memset(ids.entries[old_len..], never_used);
     }
 
     fn usedIndex(ids: ClientIds, id: u32) ?usize {
@@ -252,6 +281,29 @@ pub const ClientObjects = struct {
         var namespace = try Namespace.init(allocator, max_objects);
         errdefer namespace.deinit(allocator);
         var ids = try ClientIds.init(allocator, max_client_ids);
+        errdefer ids.deinit(allocator);
+        _ = try namespace.insert(
+            display_id,
+            display_interface,
+            1,
+            display_context,
+        );
+        return .{ .namespace = namespace, .ids = ids };
+    }
+
+    /// Like `init`, but both sizes are starting points: the namespace and the
+    /// client ID table double when full. Object pointers then stay valid only
+    /// until the next insertion or removal, as the table documents.
+    pub fn initGrowable(
+        allocator: std.mem.Allocator,
+        initial_objects: usize,
+        initial_client_ids: usize,
+        display_interface: *const metadata.Interface,
+        display_context: ?*anyopaque,
+    ) ClientObjectsError!ClientObjects {
+        var namespace = try Namespace.initGrowable(allocator, initial_objects);
+        errdefer namespace.deinit(allocator);
+        var ids = try ClientIds.initGrowable(allocator, initial_client_ids);
         errdefer ids.deinit(allocator);
         _ = try namespace.insert(
             display_id,
@@ -1110,6 +1162,8 @@ pub fn Table(comptime Value: type) type {
         max_entries: usize,
         count: usize = 0,
         next_generation: u32 = 1,
+        /// Set for growable tables, which double `max_entries` when full.
+        growth: ?std.mem.Allocator = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -1117,19 +1171,51 @@ pub fn Table(comptime Value: type) type {
         ) Error!Self {
             if (max_entries == 0 or max_entries > std.math.maxInt(u32))
                 return error.InvalidConfig;
-            const scaled = std.math.mul(usize, max_entries, 4) catch
-                return error.CapacityOverflow;
-            const minimum_slots = std.math.divCeil(usize, scaled, 3) catch unreachable;
-            const slot_count = std.math.ceilPowerOfTwo(
-                usize,
-                @max(minimum_slots, 2),
-            ) catch return error.CapacityOverflow;
-            const slots = try allocator.alloc(Slot, slot_count);
+            const slots = try allocator.alloc(Slot, try slotCount(max_entries));
             for (slots) |*slot| slot.id = 0;
             return .{
                 .slots = slots,
                 .max_entries = max_entries,
             };
+        }
+
+        /// `initial_entries` is a starting size. A full table doubles on
+        /// insertion, the only operation that allocates.
+        pub fn initGrowable(
+            allocator: std.mem.Allocator,
+            initial_entries: usize,
+        ) Error!Self {
+            var table = try init(allocator, initial_entries);
+            table.growth = allocator;
+            return table;
+        }
+
+        fn slotCount(max_entries: usize) Error!usize {
+            const scaled = std.math.mul(usize, max_entries, 4) catch
+                return error.CapacityOverflow;
+            const minimum_slots = std.math.divCeil(usize, scaled, 3) catch unreachable;
+            return std.math.ceilPowerOfTwo(
+                usize,
+                @max(minimum_slots, 2),
+            ) catch return error.CapacityOverflow;
+        }
+
+        /// Rehashes into a table of twice the logical capacity. Handles keep
+        /// their generations; value pointers move.
+        fn grow(table: *Self, allocator: std.mem.Allocator) Error!void {
+            if (table.max_entries == std.math.maxInt(u32)) return error.Full;
+            const max_entries = @min(table.max_entries * 2, std.math.maxInt(u32));
+            const slots = try allocator.alloc(Slot, try slotCount(max_entries));
+            for (slots) |*slot| slot.id = 0;
+            const old = table.slots;
+            table.slots = slots;
+            for (old) |slot| if (slot.id != 0) {
+                var index = table.home(slot.id);
+                while (table.slots[index].id != 0) index = table.next(index);
+                table.slots[index] = slot;
+            };
+            allocator.free(old);
+            table.max_entries = max_entries;
         }
 
         pub fn deinit(table: *Self, allocator: std.mem.Allocator) void {
@@ -1151,6 +1237,8 @@ pub fn Table(comptime Value: type) type {
         }
 
         /// Returned pointers remain valid until the next insertion or removal.
+        /// Removal can move entries, and so can insertion into a full
+        /// growable table.
         pub fn get(table: *Self, id: u32) ?*Value {
             const index = table.find(id) orelse return null;
             return &table.slots[index].value;
@@ -1181,7 +1269,11 @@ pub fn Table(comptime Value: type) type {
                 if (table.slots[index].id == id) return error.DuplicateId;
                 index = table.next(index);
             }
-            if (table.count == table.max_entries) return error.Full;
+            if (table.count == table.max_entries) {
+                try table.grow(table.growth orelse return error.Full);
+                index = table.home(id);
+                while (table.slots[index].id != 0) index = table.next(index);
+            }
             const generation = table.takeGeneration();
             table.slots[index] = .{
                 .id = id,
@@ -1740,4 +1832,59 @@ fn initAndDeinit(allocator: std.mem.Allocator, capacity: usize) !void {
 fn initClientIdsAndDeinit(allocator: std.mem.Allocator, capacity: usize) !void {
     var ids = try ClientIds.init(allocator, capacity);
     ids.deinit(allocator);
+}
+
+test "growable tables double when full and keep handles and generations" {
+    const SampleObject = struct { version: u32 };
+    var table = try Table(SampleObject).initGrowable(std.testing.allocator, 2);
+    defer table.deinit(std.testing.allocator);
+    var handles: [100]Handle = undefined;
+    for (&handles, 0..) |*handle, index|
+        handle.* = try table.insert(@intCast(index + 1), .{ .version = @intCast(index) });
+    try std.testing.expectEqual(@as(usize, 100), table.len());
+    try std.testing.expect(table.capacity() >= 100);
+    for (handles, 0..) |handle, index|
+        try std.testing.expectEqual(@as(u32, @intCast(index)), table.resolve(handle).?.version);
+    try std.testing.expectError(error.DuplicateId, table.insert(50, .{ .version = 0 }));
+    for (handles) |handle| _ = table.removeHandle(handle).?;
+    try std.testing.expectEqual(@as(usize, 0), table.len());
+    // A bounded table still reports Full.
+    var bounded = try Table(SampleObject).init(std.testing.allocator, 1);
+    defer bounded.deinit(std.testing.allocator);
+    _ = try bounded.insert(1, .{ .version = 0 });
+    try std.testing.expectError(error.Full, bounded.insert(2, .{ .version = 0 }));
+}
+
+test "growable client IDs extend the dense range and keep the delete_id protocol" {
+    var ids = try ClientIds.initGrowable(std.testing.allocator, 1);
+    defer ids.deinit(std.testing.allocator);
+    for (0..40) |index| try std.testing.expectEqual(@as(u32, @intCast(index + 2)), try ids.acquire());
+    try ids.retire(7);
+    // Retired IDs stay held until delete_id, even after growth.
+    try std.testing.expectEqual(@as(u32, 42), try ids.acquire());
+    try ids.deleted(7);
+    try std.testing.expectEqual(@as(u32, 7), try ids.acquire());
+
+    var bounded = try ClientIds.init(std.testing.allocator, 1);
+    defer bounded.deinit(std.testing.allocator);
+    _ = try bounded.acquire();
+    try std.testing.expectError(error.Exhausted, bounded.acquire());
+}
+
+test "growable client objects create far more locals and peers than their initial size" {
+    const interface = metadata.Interface{ .name = "test_object", .version = 1, .requests = &.{}, .events = &.{} };
+    var client_objects = try ClientObjects.initGrowable(std.testing.allocator, 2, 1, &interface, null);
+    defer client_objects.deinit(std.testing.allocator);
+    var locals: [64]Handle = undefined;
+    for (&locals) |*handle| handle.* = try client_objects.createLocal(&interface, 1, null);
+    var peers: [64]Handle = undefined;
+    for (&peers, 0..) |*handle, index|
+        handle.* = try client_objects.insertPeer(server_id_start + @as(u32, @intCast(index)), &interface, 1, null);
+    for (locals) |handle| try std.testing.expect(client_objects.namespace.resolve(handle) != null);
+    for (peers) |handle| _ = try client_objects.removePeer(handle);
+    for (locals) |handle| {
+        _ = try client_objects.retireLocal(handle);
+        try client_objects.deleted(handle.id);
+    }
+    try std.testing.expectEqual(@as(usize, 1), client_objects.namespace.table.len());
 }

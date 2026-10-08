@@ -89,6 +89,38 @@ test "core client operations transact IDs and generated wire messages" {
     try std.testing.expectEqual(@as(u32, 1), dynamic_id.version);
 }
 
+test "growable client objects keep generated constructors working past their initial size" {
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+    defer queue.deinit();
+    var client_objects = try wayring.objects.ClientObjects.initGrowable(
+        std.testing.allocator,
+        2,
+        1,
+        &Core.Display.info,
+        null,
+    );
+    defer client_objects.deinit(std.testing.allocator);
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    var callbacks: [40]wayring.objects.Handle = undefined;
+    for (&callbacks, 0..) |*callback, index| {
+        callback.* = try Core.sync(&client_objects, &queue, null);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 2)), callback.id);
+        const message = try firstMessage(&queue);
+        const request = try Core.Display.decodeRequest(message, &received_fds);
+        try std.testing.expectEqual(callback.id, switch (request) {
+            .sync => |value| value.callback,
+            else => unreachable,
+        });
+        try consume(&queue);
+    }
+    for (callbacks) |callback| try std.testing.expect(client_objects.namespace.resolve(callback) != null);
+    try std.testing.expect(client_objects.namespace.table.capacity() >= 41);
+}
+
 test "generic client helpers apply generated destructor lifecycle" {
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
     defer blocks.deinit(std.testing.allocator);

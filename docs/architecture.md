@@ -263,9 +263,14 @@ teardown unregisters Wayring's provided-buffer group and frees its pools without
 closing the ring. Both the external ring and reactor must remain at stable
 addresses while registered operations can reference them.
 
-Client object lookup uses fixed-capacity open addressing with a 75% maximum load
-and backshift deletion, avoiding allocator traffic and long-lived tombstones on
-the dispatch path. Server clients instead lease nodes from one reactor-wide
+Client object lookup uses open addressing with a 75% maximum load and
+backshift deletion, avoiding allocator traffic and long-lived tombstones on
+the dispatch path. The table is fixed-capacity by default. With
+`ObjectConfig.growable`, `max_objects` and `max_client_ids` are starting sizes:
+inserting into a full table rehashes it at twice the capacity and the dense
+client ID table doubles, so only that growth allocates. Handles keep their
+generations across growth; object pointers stay valid only until the next
+insertion or removal, as removal already moved entries. Server clients instead lease nodes from one reactor-wide
 growable physical object pool, so idle clients do not reserve their entire
 logical object quota. Admission allocates a small power-of-two bucket slab for
 each connection, with heads stamped with its reactor generation. Nodes also
@@ -289,7 +294,7 @@ Logical per-client quotas bound live objects independently of shared pool
 growth. Admission obtains a node for `wl_display`, initializes the namespace,
 and queues the first receive transactionally. Allocation failure rolls back
 the namespace and peer rather than publishing a partially initialized client.
-Client-created IDs have a separate bounded lifecycle tracker: destructor
+Client-created IDs have a separate lifecycle tracker, bounded unless growable: destructor
 publication moves an ID into an awaiting-delete state, and only
 `wl_display.delete_id` makes it reusable.
 Creation failures that never reached the wire can be rolled back immediately.
@@ -334,7 +339,7 @@ The client also provides a composable asynchronous roundtrip adapter rather
 than a blocking `wl_display_roundtrip` call. It owns one internal callback,
 intercepts `callback.done` and the matching `display.delete_id`, forwards all
 unrelated events and driver hooks, and performs no allocation beyond the
-connection's existing bounded object table. Sending and waiting remain under
+connection's existing object table. Sending and waiting remain under
 the caller's ring loop, so a roundtrip cannot hide a syscall or deadlock another
 consumer sharing the ring.
 
