@@ -177,7 +177,9 @@ sites fold to the same field tests as handwritten flags; the 8- and
 32-connection benchmark medians were unchanged within noise. Because the chart
 is a pure value, a unit test exhaustively explores it: all twelve states are
 reachable, `closing` is never left, receives arm only while `open`, and
-teardown inputs alone reach a deinit-safe state from every state.
+teardown inputs alone reach a deinit-safe state from every state. The
+listener uses the same pattern (`io_uring.Listener.State`), and both charts
+share the test-only explorer in `src/statechart.zig`.
 Connections occupy generation-tagged reactor slots, so completions from a
 closed or reused slot are discarded before actor storage is accessed. Inactive
 eight-byte slots are their own intrusive free list, giving slot recycling O(1)

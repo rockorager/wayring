@@ -793,18 +793,14 @@ test "SQE preparation failures preserve ring and operation state" {
     );
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
     try std.testing.expectEqual(@as(u32, 0), listener.generation);
-    try std.testing.expect(!listener.accept_active);
-    try std.testing.expect(!listener.cancel_active);
-    try std.testing.expect(!listener.closing);
+    try std.testing.expectEqual(Listener.State{}, listener.state);
 
     listener.generation = 1;
     listener.accept_tag = Listener.token(1, .accept);
-    listener.accept_active = true;
+    listener.state.accepting = true;
     try std.testing.expectError(error.SubmissionQueueFull, listener.prepareStop(owner.ring));
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
-    try std.testing.expect(listener.accept_active);
-    try std.testing.expect(!listener.cancel_active);
-    try std.testing.expect(!listener.closing);
+    try std.testing.expectEqual(Listener.State{ .accepting = true }, listener.state);
 
     try owner.destroyPeer(peer);
     try std.testing.expectEqual(
@@ -1004,9 +1000,71 @@ test "selected recvmsg detects stream EOF behind its metadata prefix" {
 pub const Listener = struct {
     generation: u32 = 0,
     accept_tag: u64 = undefined,
-    accept_active: bool = false,
-    cancel_active: bool = false,
-    closing: bool = false,
+    state: State = .{},
+
+    /// Listener statechart with two orthogonal regions in one byte:
+    ///
+    ///     phase:  open ─▶ closing ⇄ canceling   (closing is never left)
+    ///     accept: idle ⇄ active, armed only while open
+    ///
+    /// A completed cancel returns to `closing`, so a stop can be retried while
+    /// a multishot accept outlives an earlier cancel.
+    pub const State = packed struct(u8) {
+        phase: Phase = .open,
+        accepting: bool = false,
+        _padding: u5 = 0,
+
+        pub const Phase = enum(u2) { open, closing, canceling };
+
+        pub const Input = enum {
+            arm,
+            begin_close,
+            request_cancel,
+            /// Multishot accept delivered a descriptor and remains armed.
+            accept_continues,
+            /// Accept terminated by its final CQE, cancellation, or failure.
+            accept_stops,
+            cancel_completes,
+        };
+
+        pub const TransitionError = error{
+            Closing,
+            AcceptAlreadyActive,
+            AcceptNotActive,
+            CancelAlreadyActive,
+            CancelNotActive,
+        };
+
+        pub inline fn step(state: State, comptime input: Input) TransitionError!State {
+            var next = state;
+            switch (input) {
+                .arm => {
+                    if (state.phase != .open) return error.Closing;
+                    if (state.accepting) return error.AcceptAlreadyActive;
+                    next.accepting = true;
+                },
+                .begin_close => if (state.phase == .open) {
+                    next.phase = .closing;
+                },
+                .request_cancel => {
+                    if (state.phase == .canceling) return error.CancelAlreadyActive;
+                    next.phase = .canceling;
+                },
+                .accept_continues => {
+                    if (!state.accepting) return error.AcceptNotActive;
+                },
+                .accept_stops => {
+                    if (!state.accepting) return error.AcceptNotActive;
+                    next.accepting = false;
+                },
+                .cancel_completes => {
+                    if (state.phase != .canceling) return error.CancelNotActive;
+                    next.phase = .closing;
+                },
+            }
+            return next;
+        }
+    };
 
     pub const Accepted = struct {
         fd: linux.fd_t,
@@ -1024,9 +1082,7 @@ pub const Listener = struct {
         ring: *linux.IoUring,
         fd: linux.fd_t,
     ) !void {
-        if (listener.closing) return error.Closing;
-        if (listener.accept_active) return error.AcceptAlreadyActive;
-        if (listener.cancel_active) return error.CancelActive;
+        const next = try listener.state.step(.arm);
         const generation = completions.nextGeneration(listener.generation);
         const tag = token(generation, .accept);
         _ = try ring.accept_multishot(
@@ -1038,7 +1094,7 @@ pub const Listener = struct {
         );
         listener.generation = generation;
         listener.accept_tag = tag;
-        listener.accept_active = true;
+        listener.state = next;
     }
 
     pub inline fn arm(
@@ -1053,18 +1109,17 @@ pub const Listener = struct {
     /// Queues cancellation without submitting so it can be batched with other
     /// reactor teardown operations. Returns false when no accept is active.
     pub fn prepareStop(listener: *Listener, ring: *linux.IoUring) !bool {
-        if (!listener.accept_active) {
-            listener.closing = true;
+        if (!listener.state.accepting) {
+            listener.state = listener.state.step(.begin_close) catch unreachable;
             return false;
         }
-        if (listener.cancel_active) return error.CancelAlreadyActive;
+        const next = try listener.state.step(.request_cancel);
         _ = try ring.cancel(
             token(listener.generation, .accept_cancel),
             listener.accept_tag,
             0,
         );
-        listener.closing = true;
-        listener.cancel_active = true;
+        listener.state = next;
         return true;
     }
 
@@ -1087,27 +1142,31 @@ pub const Listener = struct {
     }
 
     pub fn canDeinit(listener: Listener) bool {
-        return !listener.accept_active and !listener.cancel_active;
+        return !listener.state.accepting and listener.state.phase != .canceling;
+    }
+
+    pub inline fn closing(listener: Listener) bool {
+        return listener.state.phase != .open;
     }
 
     fn completeAccept(listener: *Listener, cqe: linux.io_uring_cqe) !Event {
-        if (!listener.accept_active) {
+        const more = cqe.res >= 0 and cqe.flags & linux.IORING_CQE_F_MORE != 0;
+        listener.state = (if (more)
+            listener.state.step(.accept_continues)
+        else
+            listener.state.step(.accept_stops)) catch |err| {
             closeAccepted(cqe);
-            return error.AcceptNotActive;
-        }
-        const more = cqe.flags & linux.IORING_CQE_F_MORE != 0;
-        listener.accept_active = more;
+            return err;
+        };
         if (cqe.res < 0) {
-            listener.accept_active = false;
-            if (listener.closing and cqe.err() == .CANCELED) return .accept_stopped;
+            if (listener.closing() and cqe.err() == .CANCELED) return .accept_stopped;
             return error.IoFailure;
         }
         return .{ .accepted = .{ .fd = @intCast(cqe.res), .more = more } };
     }
 
     fn completeCancel(listener: *Listener, cqe: linux.io_uring_cqe) !Event {
-        if (!listener.cancel_active) return error.CancelNotActive;
-        listener.cancel_active = false;
+        listener.state = try listener.state.step(.cancel_completes);
         if (cqe.res < 0 and cqe.err() != .NOENT and cqe.err() != .ALREADY)
             return error.IoFailure;
         return .cancel_complete;
@@ -1125,8 +1184,8 @@ pub const Listener = struct {
         if (token_value.slot != 0 or token_value.generation != listener.generation)
             return false;
         return switch (token_value.operation) {
-            .accept => listener.accept_active,
-            .accept_cancel => listener.cancel_active,
+            .accept => listener.state.accepting,
+            .accept_cancel => listener.state.phase == .canceling,
             .receive, .send, .cancel => false,
         };
     }
@@ -1144,7 +1203,7 @@ test "listener validates generations and tracks multishot termination" {
             .generation = 9,
             .operation = .accept,
         }).encode(),
-        .accept_active = true,
+        .state = .{ .accepting = true },
     };
     const first = try listener.complete(.{
         .user_data = listener.accept_tag,
@@ -1155,7 +1214,7 @@ test "listener validates generations and tracks multishot termination" {
         Listener.Event{ .accepted = .{ .fd = 17, .more = true } },
         first,
     );
-    try std.testing.expect(listener.accept_active);
+    try std.testing.expect(listener.state.accepting);
 
     const final = try listener.complete(.{
         .user_data = listener.accept_tag,
@@ -1182,9 +1241,7 @@ test "listener waits for both sides of cancellation" {
     var listener: Listener = .{
         .generation = generation,
         .accept_tag = Listener.token(generation, .accept),
-        .accept_active = true,
-        .cancel_active = true,
-        .closing = true,
+        .state = .{ .phase = .canceling, .accepting = true },
     };
     try std.testing.expectEqual(Listener.Event.accept_stopped, try listener.complete(.{
         .user_data = listener.accept_tag,
@@ -1200,6 +1257,45 @@ test "listener waits for both sides of cancellation" {
     try std.testing.expect(listener.canDeinit());
 }
 
+test "listener statechart is fully reachable, closing is absorbing, and teardown quiesces" {
+    const statechart = @import("statechart.zig");
+    const State = Listener.State;
+    const all_inputs = comptime std.enums.values(State.Input);
+    const teardown_inputs = [_]State.Input{
+        .begin_close, .request_cancel, .accept_stops, .cancel_completes,
+    };
+
+    var reachable_storage: [256]State = undefined;
+    const reachable = statechart.members(
+        State,
+        &statechart.reach(State, all_inputs, .{}),
+        &reachable_storage,
+    );
+    try std.testing.expectEqual(std.enums.values(State.Phase).len * 2, reachable.len);
+
+    for (reachable) |state| {
+        var next: [all_inputs.len]State = undefined;
+        for (statechart.successors(State, all_inputs, state, &next)) |successor| {
+            if (state.phase != .open)
+                try std.testing.expect(successor.phase != .open);
+            if (!state.accepting and successor.accepting)
+                try std.testing.expectEqual(State.Phase.open, state.phase);
+        }
+
+        var teardown_storage: [256]State = undefined;
+        const teardown = statechart.members(
+            State,
+            &statechart.reach(State, &teardown_inputs, state),
+            &teardown_storage,
+        );
+        const quiesces = for (teardown) |candidate| {
+            const settled: Listener = .{ .state = candidate };
+            if (settled.closing() and settled.canDeinit()) break true;
+        } else false;
+        try std.testing.expect(quiesces);
+    }
+}
+
 test "reactor routes listener tokens before colliding connection slots" {
     var owner: Reactor = undefined;
     owner.slots = .{};
@@ -1208,7 +1304,7 @@ test "reactor routes listener tokens before colliding connection slots" {
     const listener: Listener = .{
         .generation = acquired.generation,
         .accept_tag = Listener.token(acquired.generation, .accept),
-        .accept_active = true,
+        .state = .{ .accepting = true },
     };
 
     try std.testing.expectEqual(

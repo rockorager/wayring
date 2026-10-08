@@ -2621,7 +2621,7 @@ pub fn Driver(comptime protocol: type) type {
             var progress: Progress = .{};
             const reactor = driver.runtime.clients.reactor;
             if (driver.shutdown_requested and
-                !driver.runtime.endpoint.listener.closing)
+                !driver.runtime.endpoint.listener.closing())
             {
                 const queued = driver.runtime.prepareEndpointClose() catch |err| {
                     if (err == error.SubmissionQueueFull) {
