@@ -256,7 +256,7 @@ fn runManualServer(
                     .dispatched => {},
                     .terminal => |failure| return failure.cause,
                 }
-                if (!actor.receive_active) {
+                if (!actor.receiveActive()) {
                     try reactor.prepareReceive(peer);
                     prepared = true;
                 }
@@ -651,7 +651,7 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
                 .connection => |value| value,
             };
             const event = actor.completeRouted(routed.operation, completion) catch |err| {
-                if (err == error.IoFailure and actor.lifecycle == .closing) {
+                if (err == error.IoFailure and actor.lifecycle() == .closing) {
                     disconnected = true;
                     continue;
                 }
@@ -671,7 +671,7 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
                             disconnected = true;
                         } else return failure.cause,
                     }
-                    if (!disconnected and !actor.receive_active)
+                    if (!disconnected and !actor.receiveActive())
                         try reactor.prepareReceive(peer);
                 },
                 .sent => |sent| if (sent.more_queued) {
@@ -763,7 +763,7 @@ fn wayringProtocolServer(kind: ProtocolInterop, options: Options) !u8 {
                 return error.UnexpectedClient,
             .connection => |routed| {
                 const close_event = actor.completeRouted(routed.operation, completion) catch |err| {
-                    if (err == error.IoFailure and actor.lifecycle == .closing) continue;
+                    if (err == error.IoFailure and actor.lifecycle() == .closing) continue;
                     return err;
                 };
                 switch (close_event) {
@@ -2711,7 +2711,7 @@ fn pumpProtocolClient(
                 .dispatched => {},
                 .terminal => |failure| return failure.cause,
             }
-            if (!actor.receive_active) {
+            if (!actor.receiveActive()) {
                 try reactor.prepareReceive(peer);
                 prepared = true;
             }
@@ -5733,7 +5733,7 @@ fn pumpClient(
                 .dispatched => {},
                 .terminal => |failure| return failure.cause,
             }
-            if (!actor.receive_active) {
+            if (!actor.receiveActive()) {
                 try reactor.prepareReceive(peer);
                 prepared = true;
             }

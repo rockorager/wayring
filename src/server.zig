@@ -911,7 +911,7 @@ pub fn Core(comptime protocol: type) type {
                     .error_queued = false,
                 } };
             }
-            var error_queued = actor.lifecycle == .draining;
+            var error_queued = actor.lifecycle() == .draining;
             if (actor.canDispatch()) {
                 postError(
                     actor,
@@ -919,7 +919,7 @@ pub fn Core(comptime protocol: type) type {
                     displayErrorCode(cause),
                     @errorName(cause),
                 ) catch actor.beginClose();
-                error_queued = actor.lifecycle == .draining;
+                error_queued = actor.lifecycle() == .draining;
             }
             return .{ .terminal = .{
                 .dispatched = dispatched,
@@ -2656,7 +2656,7 @@ pub fn Driver(comptime protocol: type) type {
                     continue;
                 };
 
-                if (actor.lifecycle == .closing and actor.canDeinit()) {
+                if (actor.lifecycle() == .closing and actor.canDeinit()) {
                     driver.popPending();
                     // Application cleanup runs while client metadata is live.
                     // The driver, not the callback, owns destroyClient.
@@ -2667,8 +2667,8 @@ pub fn Driver(comptime protocol: type) type {
                     continue;
                 }
 
-                if (actor.lifecycle == .closing) {
-                    if (!actor.cancel_requested) {
+                if (actor.lifecycle() == .closing) {
+                    if (!actor.cancelRequested()) {
                         const queued = reactor.prepareClose(peer) catch |err| {
                             if (err == error.SubmissionQueueFull) break;
                             return err;
@@ -2731,7 +2731,7 @@ pub fn Driver(comptime protocol: type) type {
                     const peer = reactor.routedPeer(routed);
                     const actor = try reactor.getActor(peer);
                     const event = actor.completeRouted(routed.operation, completion) catch |err| {
-                        if (err == error.IoFailure and actor.lifecycle == .closing) {
+                        if (err == error.IoFailure and actor.lifecycle() == .closing) {
                             ownership.* = .driver;
                             _ = try driver.schedule(peer);
                             return;
@@ -2764,13 +2764,13 @@ pub fn Driver(comptime protocol: type) type {
                                     }
                                 },
                             }
-                            if (actor.lifecycle == .open and !actor.receive_active)
+                            if (actor.lifecycle() == .open and !actor.receiveActive())
                                 _ = try reactor.deferReceive(peer);
                             _ = try driver.schedule(peer);
                         },
                         .sent, .disconnected, .receive_stopped, .send_stopped, .cancel_complete => _ = try driver.schedule(peer),
                         .buffers_exhausted => {
-                            if (actor.lifecycle == .open)
+                            if (actor.lifecycle() == .open)
                                 _ = try reactor.deferReceive(peer);
                             _ = try driver.schedule(peer);
                         },

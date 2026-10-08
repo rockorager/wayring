@@ -152,7 +152,7 @@ test "randomized real io_uring connection soak" {
                         _ = linux.close(fd);
                         state.inbound_fds_received += 1;
                     } else |err| if (err != error.Empty) return err;
-                    if (!actor.receive_active and state.inbound_received < state.inbound_len) {
+                    if (!actor.receiveActive() and state.inbound_received < state.inbound_len) {
                         try reactor.prepareReceive(peer);
                         prepared = true;
                     }
@@ -699,7 +699,7 @@ test "real io_uring receives recover from shared buffer exhaustion" {
         const actor = try reactor.getActor(item.state.peer);
         try consumeReceivePressure(item.state, actor, item.received);
         try reactor.releaseReceived(item.state.peer, item.received);
-        if (!actor.receive_active and item.state.received < receive_pressure_bytes)
+        if (!actor.receiveActive() and item.state.received < receive_pressure_bytes)
             _ = try reactor.deferReceive(item.state.peer);
     }
     const initial_rearms = try reactor.prepareDeferredReceives();
@@ -726,7 +726,7 @@ test "real io_uring receives recover from shared buffer exhaustion" {
                     const received = try receiver.decodeCompletion(completion);
                     try consumeReceivePressure(state, actor, received);
                     try reactor.releaseReceived(state.peer, received);
-                    if (state.received < receive_pressure_bytes and !actor.receive_active)
+                    if (state.received < receive_pressure_bytes and !actor.receiveActive())
                         _ = try reactor.deferReceive(state.peer);
                 },
                 .buffers_exhausted => {

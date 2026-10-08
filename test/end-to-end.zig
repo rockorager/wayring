@@ -112,7 +112,7 @@ test "client and server complete a core round trip on one reactor" {
                     .dispatched => {},
                     .terminal => |failure| return failure.cause,
                 }
-                if (!actor.receive_active) {
+                if (!actor.receiveActive()) {
                     try reactor.prepareReceive(peer);
                     prepared = true;
                 }
@@ -269,7 +269,7 @@ test "client closes after a transported terminal display error" {
     try std.testing.expectEqual(error.ServerProtocolError, handler.failure_cause.?);
     try std.testing.expectEqual(
         wayring.connection.Lifecycle.closing,
-        (try client_connection.actor()).lifecycle,
+        (try client_connection.actor()).lifecycle(),
     );
 
     _ = try server_connections.prepareClose(server_peer);

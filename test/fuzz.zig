@@ -664,8 +664,7 @@ fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
                 actor.beginClose();
                 lifecycle = .closing;
                 if ((receive_active or send_active) and !cancel_requested) {
-                    actor.cancel_requested = true;
-                    actor.cancel_active = true;
+                    try actor.requestCancel();
                     cancel_requested = true;
                     cancel_active = true;
                 }
@@ -713,22 +712,22 @@ fn fuzzConnectionState(_: void, smith: *std.testing.Smith) !void {
             },
             else => unreachable,
         }
-        try std.testing.expectEqual(lifecycle, actor.lifecycle);
-        try std.testing.expectEqual(receive_active, actor.receive_active);
-        try std.testing.expectEqual(cancel_requested, actor.cancel_requested);
-        try std.testing.expectEqual(cancel_active, actor.cancel_active);
+        try std.testing.expectEqual(lifecycle, actor.lifecycle());
+        try std.testing.expectEqual(receive_active, actor.receiveActive());
+        try std.testing.expectEqual(cancel_requested, actor.cancelRequested());
+        try std.testing.expectEqual(cancel_active, actor.cancelActive());
         try std.testing.expectEqual(queued_bytes, actor.transmit.queuedBytes());
         try std.testing.expectEqual(send_active, actor.transmit.sendActive());
     }
 
     actor.beginClose();
-    if (actor.receive_active) {
+    if (actor.receiveActive()) {
         _ = try actor.completeRouted(
             .receive,
             cqe(.receive, -@as(i32, @intFromEnum(linux.E.CANCELED)), 0),
         );
     }
-    if (actor.cancel_active) {
+    if (actor.cancelActive()) {
         _ = try actor.completeRouted(.cancel, cqe(.cancel, 0, 0));
     }
     if (actor.transmit.sendActive()) {

@@ -247,7 +247,7 @@ test "SHM service owns pool and buffer protocol lifetimes" {
             false,
         ),
     );
-    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle());
     try std.testing.expect(server_objects.namespace.get(7) == null);
 }
 

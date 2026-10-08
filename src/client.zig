@@ -590,10 +590,10 @@ pub fn Driver(comptime protocol: type) type {
             const actor = try driver.connection.actor();
             var disconnected = false;
             if (driver.scheduled) {
-                if (actor.lifecycle == .closing and actor.canDeinit()) {
+                if (actor.lifecycle() == .closing and actor.canDeinit()) {
                     disconnected = true;
-                } else if (actor.lifecycle == .closing) {
-                    if (!actor.cancel_requested) {
+                } else if (actor.lifecycle() == .closing) {
+                    if (!actor.cancelRequested()) {
                         const queued = reactor.prepareClose(driver.connection.peer) catch |err| {
                             if (err == error.SubmissionQueueFull) {
                                 progress.pending = true;
@@ -648,7 +648,7 @@ pub fn Driver(comptime protocol: type) type {
                 return error.InvalidCompletion;
             const actor = try driver.connection.actor();
             const event = actor.completeRouted(routed.operation, completion) catch |err| {
-                if (err == error.IoFailure and actor.lifecycle == .closing) {
+                if (err == error.IoFailure and actor.lifecycle() == .closing) {
                     _ = try driver.schedule();
                     return;
                 }
@@ -676,13 +676,13 @@ pub fn Driver(comptime protocol: type) type {
                                 handler.eventError(peer, failure);
                         },
                     }
-                    if (actor.lifecycle == .open and !actor.receive_active)
+                    if (actor.lifecycle() == .open and !actor.receiveActive())
                         _ = try reactor.deferReceive(peer);
                     _ = try driver.schedule();
                 },
                 .sent, .disconnected, .receive_stopped, .send_stopped, .cancel_complete => _ = try driver.schedule(),
                 .buffers_exhausted => {
-                    if (actor.lifecycle == .open)
+                    if (actor.lifecycle() == .open)
                         _ = try reactor.deferReceive(peer);
                     _ = try driver.schedule();
                 },

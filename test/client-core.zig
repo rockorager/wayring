@@ -412,7 +412,7 @@ test "client terminal display error stops concatenated event dispatch" {
     try std.testing.expectEqual(@as(usize, 1), handler.errors);
     try std.testing.expectEqual(@as(usize, 0), handler.deleted);
     try std.testing.expectEqual(@as(usize, 12), bytes.len);
-    try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle());
     try std.testing.expect(client_objects.ids.isActive(callback.id));
 }
 

@@ -547,7 +547,7 @@ fn clientReceivePhase(
             .buffers_exhausted => {},
             else => return error.InvalidCompletion,
         }
-        if (!actor.receive_active) try owner.armReceive(peer);
+        if (!actor.receiveActive()) try owner.armReceive(peer);
     }
 }
 
@@ -793,11 +793,11 @@ fn finishMultiInput(
             .generation = actor.generation,
         };
         try owner.releaseReceived(peer, input);
-        if (!actor.receive_active) _ = try owner.deferReceive(peer);
+        if (!actor.receiveActive()) _ = try owner.deferReceive(peer);
         if (ring.cq_ready() == 0) try submitDeferredReceives(ring, owner);
     } else {
         try receiver.release(input);
-        if (!actor.receive_active) try receiver.arm(ring, fd, actor);
+        if (!actor.receiveActive()) try receiver.arm(ring, fd, actor);
     }
 }
 
@@ -960,7 +960,7 @@ fn stopMulti(
         const routed = slots.route(cqe.user_data) orelse return error.InvalidCompletion;
         const slot: usize = routed.slot;
         const actor = actors[slot];
-        const was_receiving = actor.receive_active;
+        const was_receiving = actor.receiveActive();
         const event = try actor.completeRouted(routed.operation, cqe);
         switch (routed.operation) {
             .receive => {
@@ -970,7 +970,7 @@ fn stopMulti(
                     .received, .receive_stopped, .buffers_exhausted, .disconnected => {},
                     else => return error.InvalidCompletion,
                 }
-                if (was_receiving and !actor.receive_active) receive_remaining -= 1;
+                if (was_receiving and !actor.receiveActive()) receive_remaining -= 1;
             },
             .cancel => {
                 switch (event) {

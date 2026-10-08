@@ -391,8 +391,8 @@ pub const Reactor = struct {
     /// one allocation-free FIFO entry until a returned buffer permits rearm.
     pub fn deferReceive(owner: *Reactor, peer: Peer) !bool {
         const actor = try owner.getActor(peer);
-        if (actor.lifecycle != .open) return error.Closing;
-        if (actor.receive_active) return error.ReceiveAlreadyActive;
+        if (actor.lifecycle() != .open) return error.Closing;
+        if (actor.receiveActive()) return error.ReceiveAlreadyActive;
         const node = &(try owner.getRecord(peer)).deferred_receive;
         if (node.next != deferred_none) {
             if (node.generation != peer.generation) return error.StaleHandle;
@@ -453,7 +453,7 @@ pub const Reactor = struct {
                 owner.removeDeferredReceive(slot);
                 continue;
             };
-            if (actor.lifecycle != .open or actor.receive_active) {
+            if (actor.lifecycle() != .open or actor.receiveActive()) {
                 owner.removeDeferredReceive(slot);
                 continue;
             }
@@ -480,18 +480,11 @@ pub const Reactor = struct {
     /// enter. Returns false when no operation needs cancellation.
     pub inline fn prepareClose(owner: *Reactor, peer: Peer) !bool {
         const actor = try owner.getActor(peer);
-        const previous_lifecycle = actor.lifecycle;
+        const previous = actor.state;
+        errdefer actor.state = previous;
         actor.beginClose();
-        errdefer actor.lifecycle = previous_lifecycle;
-        if (!actor.receive_active and !actor.transmit.sendActive()) return false;
-        if (actor.cancel_requested) return error.CancelAlreadyActive;
-
-        actor.cancel_requested = true;
-        actor.cancel_active = true;
-        errdefer {
-            actor.cancel_requested = false;
-            actor.cancel_active = false;
-        }
+        if (!actor.receiveActive() and !actor.transmit.sendActive()) return false;
+        try actor.requestCancel();
         const submission = try owner.ring.get_sqe();
         submission.prep_cancel_fd(
             (try owner.getRecord(peer)).fd,
@@ -736,8 +729,8 @@ test "SQE preparation failures preserve ring and operation state" {
     _ = try actor.armReceive();
     try std.testing.expectError(error.ReceiveAlreadyActive, owner.prepareReceive(peer));
     try std.testing.expectEqual(empty_ready, owner.ring.sq_ready());
-    try std.testing.expect(actor.receive_active);
-    actor.receive_active = false;
+    try std.testing.expect(actor.receiveActive());
+    actor.state.receiving = false;
 
     try actor.beginProtocolError();
     try std.testing.expectError(error.ProtocolErrorPending, owner.prepareSend(peer));
@@ -748,7 +741,7 @@ test "SQE preparation failures preserve ring and operation state" {
         linux.E.SUCCESS,
         linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)),
     );
-    actor.lifecycle = .open;
+    actor.state.phase = .open;
 
     while (true) {
         _ = owner.ring.nop(0xfeed) catch |err| {
@@ -761,7 +754,7 @@ test "SQE preparation failures preserve ring and operation state" {
 
     try std.testing.expectError(error.SubmissionQueueFull, owner.prepareReceive(peer));
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
-    try std.testing.expect(!actor.receive_active);
+    try std.testing.expect(!actor.receiveActive());
 
     try std.testing.expectError(error.SubmissionQueueFull, owner.prepareSend(peer));
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
@@ -775,11 +768,11 @@ test "SQE preparation failures preserve ring and operation state" {
     _ = try actor.armReceive();
     try std.testing.expectError(error.SubmissionQueueFull, owner.prepareClose(peer));
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
-    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle);
-    try std.testing.expect(actor.receive_active);
-    try std.testing.expect(!actor.cancel_requested);
-    try std.testing.expect(!actor.cancel_active);
-    actor.receive_active = false;
+    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle());
+    try std.testing.expect(actor.receiveActive());
+    try std.testing.expect(!actor.cancelRequested());
+    try std.testing.expect(!actor.cancelActive());
+    actor.state.receiving = false;
 
     receiver.receive_tag = try actor.armReceive();
     try std.testing.expectError(
@@ -787,11 +780,11 @@ test "SQE preparation failures preserve ring and operation state" {
         receiver.prepareStop(owner.ring, actor),
     );
     try std.testing.expectEqual(full_ready, owner.ring.sq_ready());
-    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle);
-    try std.testing.expect(actor.receive_active);
-    try std.testing.expect(!actor.cancel_requested);
-    try std.testing.expect(!actor.cancel_active);
-    actor.receive_active = false;
+    try std.testing.expectEqual(connection.Lifecycle.open, actor.lifecycle());
+    try std.testing.expect(actor.receiveActive());
+    try std.testing.expect(!actor.cancelRequested());
+    try std.testing.expect(!actor.cancelActive());
+    actor.state.receiving = false;
 
     var listener: Listener = .{};
     try std.testing.expectError(
@@ -855,12 +848,12 @@ test "reactor admits dynamically allocated peers" {
     const peer_actor = try owner.getActor(peer);
     const peer_receiver = try owner.getReceiver(peer);
     defer if (peer_live) {
-        if (peer_actor.receive_active)
+        if (peer_actor.receiveActive())
             peer_receiver.stop(owner.ring, owner.slots, peer_actor) catch unreachable;
         owner.destroyPeer(peer) catch unreachable;
     };
     try std.testing.expectEqual(peer.generation, peer_actor.generation);
-    try std.testing.expect(peer_actor.receive_active);
+    try std.testing.expect(peer_actor.receiveActive());
     _ = try owner.ring.submit();
     const payload = "12345678";
     const write_result = linux.write(first_pair[1], payload, payload.len);
@@ -1485,7 +1478,7 @@ pub const Receiver = struct {
         fixed_file: bool,
     ) !void {
         const receive_tag = try actor.armReceive();
-        errdefer actor.receive_active = false;
+        errdefer actor.state.receiving = false;
         const submission = try ring.get_sqe();
         receiver.message.iov = @ptrCast(&receiver.dummy_iov);
         receiver.receive_tag = receive_tag;
@@ -1504,7 +1497,7 @@ pub const Receiver = struct {
         actor: *connection.Actor,
     ) !Received {
         while (true) {
-            if (!actor.receive_active) try receiver.arm(ring, fd, actor);
+            if (!actor.receiveActive()) try receiver.arm(ring, fd, actor);
 
             const cqe = try ring.copy_cqe();
             const routed = slots.route(cqe.user_data) orelse return error.InvalidCompletion;
@@ -1561,18 +1554,11 @@ pub const Receiver = struct {
         ring: *linux.IoUring,
         actor: *connection.Actor,
     ) !bool {
-        const previous_lifecycle = actor.lifecycle;
+        const previous = actor.state;
+        errdefer actor.state = previous;
         actor.beginClose();
-        errdefer actor.lifecycle = previous_lifecycle;
-        if (!actor.receive_active) return false;
-        if (actor.cancel_requested) return error.CancelAlreadyActive;
-
-        actor.cancel_requested = true;
-        actor.cancel_active = true;
-        errdefer {
-            actor.cancel_requested = false;
-            actor.cancel_active = false;
-        }
+        if (!actor.receiveActive()) return false;
+        try actor.requestCancel();
         _ = try ring.cancel(actor.cancelToken(), receiver.receive_tag, 0);
         return true;
     }
@@ -1585,7 +1571,7 @@ pub const Receiver = struct {
     ) !void {
         if (!try receiver.prepareStop(ring, actor)) return;
         _ = try ring.submit();
-        while (actor.receive_active or actor.cancel_active) {
+        while (actor.receiveActive() or actor.cancelActive()) {
             const cqe = try ring.copy_cqe();
             const routed = slots.route(cqe.user_data) orelse return error.InvalidCompletion;
             const event = try actor.completeRouted(routed.operation, cqe);

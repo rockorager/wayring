@@ -676,7 +676,7 @@ test "core server queues a terminal display error before close" {
     var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
 
     try Core.postError(&actor, 7, 3, "invalid request");
-    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle());
     try std.testing.expect(!actor.canDispatch());
     const message = try firstMessage(&actor.transmit);
     const display_event = try Core.Display.decodeEvent(message, &received_fds);
@@ -697,7 +697,7 @@ test "core server queues a terminal display error before close" {
         .res = @intCast(snapshot.byteCount()),
         .flags = 0,
     });
-    try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.closing, actor.lifecycle());
     actor.deinit();
 }
 
@@ -742,7 +742,7 @@ test "server dispatch turns invalid requests into terminal display errors" {
     try std.testing.expectEqual(@as(?u32, 99), failure.object_id);
     try std.testing.expectEqual(error.UnknownObject, failure.cause);
     try std.testing.expect(failure.error_queued);
-    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, actor.lifecycle());
 
     const message = try firstMessage(&actor.transmit);
     var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
