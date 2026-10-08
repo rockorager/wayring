@@ -406,6 +406,13 @@ block backpressure, and reports the affected peer for explicit send preparation.
 Registries created while an update is pending use the current initial global
 listing and are sequence-filtered from that update, preventing duplicate
 announcements.
+A bounded model check in the server tests replays every sequence of up to six
+global, registry, bind, ack, sync, publication, and client-teardown operations
+on a real runtime with small transmit budgets. Each queued registry event must
+be owed to its registry, binds and acknowledgments must match offer state,
+`sync` completes only after every event owed when it was requested, removed
+globals are withdrawn exactly when their last offer ends, and draining from
+every state delivers all owed events and reclaims every removed global.
 The optional server driver owns only allocation-free scheduling policy over a
 borrowed runtime. It allocates one intrusive work node per reactor connection
 slot at initialization, deduplicates peers needing send or close preparation,

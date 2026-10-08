@@ -2066,3 +2066,547 @@ fn stopPeers(
         if (!was_ready and actor.canDeinit()) remaining -= 1;
     }
 }
+
+/// Model check of registry publication and removed-global lifetimes. An
+/// abstract model records which registry events each registry is owed and
+/// each offer's state. Every transition is replayed on a real runtime with
+/// real sockets and small transmit budgets; each queued event is decoded and
+/// must be owed, binds and acks must match offer state, withdrawal must happen
+/// exactly when the last offer ends, and draining from every state must deliver
+/// everything owed and reclaim every removed global.
+const RegistryModelCheck = struct {
+    const Runtime = wayring.server.Runtime(protocol);
+    const Peer = wayring.io_uring.Peer;
+    const global_count = 2;
+    const registry_count = 3;
+    const peer_count = 2;
+    const registry_peer = [registry_count]u1{ 0, 0, 1 };
+    const registry_id = [registry_count]u32{ 2, 3, 2 };
+    const callback_id = 10;
+    const callback_data = 7;
+    const bind_id = 8;
+    const byte_budget = 96;
+    const delete_id_size = 12;
+
+    const Op = union(enum) {
+        publish,
+        /// Every client reads and publication runs until complete.
+        settle,
+        drain: u1,
+        add_global: u1,
+        remove_global: u1,
+        create_registry: u2,
+        remove_registry: u2,
+        ack: struct { registry: u2, global: u1 },
+        bind: struct { peer: u1, global: u1 },
+        sync: u1,
+        destroy_client: u1,
+    };
+
+    const ops = blk: {
+        var list: []const Op = &.{ .publish, .settle };
+        for (0..peer_count) |p| list = list ++ &[_]Op{
+            .{ .drain = p },                          .{ .sync = p },                           .{ .destroy_client = p },
+            .{ .bind = .{ .peer = p, .global = 0 } }, .{ .bind = .{ .peer = p, .global = 1 } },
+        };
+        for (0..global_count) |g| list = list ++ &[_]Op{ .{ .add_global = g }, .{ .remove_global = g } };
+        for (0..registry_count) |r| {
+            list = list ++ &[_]Op{ .{ .create_registry = r }, .{ .remove_registry = r } };
+            for (0..global_count) |g| list = list ++ &[_]Op{.{ .ack = .{ .registry = r, .global = g } }};
+        }
+        break :blk list;
+    };
+
+    const Life = enum(u2) { unborn, live, gone };
+    const Offer = enum(u2) { none, offered, removal_sent };
+
+    const Model = struct {
+        globals: [global_count]Life = @splat(.unborn),
+        registries: [registry_count]Life = @splat(.unborn),
+        peers_live: [peer_count]bool = @splat(true),
+        offer: [registry_count][global_count]Offer = @splat(@splat(.none)),
+        owed_add: [registry_count][global_count]bool = @splat(@splat(false)),
+        owed_remove: [registry_count][global_count]bool = @splat(@splat(false)),
+        sync_pending: [peer_count]bool = @splat(false),
+        /// Events owed to the peer's registries when its sync was requested.
+        sync_owed: [peer_count]u16 = @splat(0),
+        /// publishNext reported complete and no mutation has happened since.
+        clean: bool = true,
+        queued: [peer_count]u8 = @splat(0),
+
+        fn owedBit(r: usize, g: usize, remove: bool) u16 {
+            return @as(u16, 1) << @intCast((r * global_count + g) * 2 + @intFromBool(remove));
+        }
+
+        fn owedMask(model: Model, p: usize) u16 {
+            var mask: u16 = 0;
+            for (0..registry_count) |r| {
+                if (registry_peer[r] != p) continue;
+                for (0..global_count) |g| {
+                    if (model.owed_add[r][g]) mask |= owedBit(r, g, false);
+                    if (model.owed_remove[r][g]) mask |= owedBit(r, g, true);
+                }
+            }
+            return mask;
+        }
+
+        fn anyOwed(model: Model) bool {
+            for (0..peer_count) |p| if (model.owedMask(p) != 0) return true;
+            return false;
+        }
+
+        fn hasOffer(model: Model, g: usize) bool {
+            for (0..registry_count) |r| if (model.offer[r][g] != .none) return true;
+            return false;
+        }
+
+        fn peerHasOffer(model: Model, p: usize, g: usize) bool {
+            for (0..registry_count) |r|
+                if (registry_peer[r] == p and model.offer[r][g] != .none) return true;
+            return false;
+        }
+
+        fn dropRegistry(model: *Model, r: usize) void {
+            model.registries[r] = .gone;
+            model.offer[r] = @splat(.none);
+            model.owed_add[r] = @splat(false);
+            model.owed_remove[r] = @splat(false);
+        }
+
+        fn key(model: Model) u128 {
+            var value: u128 = @intFromBool(model.clean);
+            for (model.globals) |life| value = value << 2 | @intFromEnum(life);
+            for (model.registries) |life| value = value << 2 | @intFromEnum(life);
+            for (model.peers_live, model.sync_pending, model.sync_owed, model.queued) |live, pending, owed, queued| {
+                value = value << 1 | @intFromBool(live);
+                value = value << 1 | @intFromBool(pending);
+                value = value << 12 | owed;
+                value = value << 7 | queued;
+            }
+            for (0..registry_count) |r| for (0..global_count) |g| {
+                value = value << 2 | @intFromEnum(model.offer[r][g]);
+                value = value << 1 | @intFromBool(model.owed_add[r][g]);
+                value = value << 1 | @intFromBool(model.owed_remove[r][g]);
+            };
+            return value;
+        }
+    };
+
+    const World = struct {
+        reactor: *wayring.io_uring.Reactor,
+        runtime: Runtime,
+        listener_remote: linux.fd_t,
+        peers: [peer_count]Peer,
+        remotes: [peer_count]linux.fd_t,
+        registries: [registry_count]wayring.objects.Handle = undefined,
+        globals: [global_count]wayring.objects.Handle = undefined,
+        states: [global_count]WithdrawalState = @splat(.{}),
+        parsed: [peer_count]usize = @splat(0),
+        model: Model = .{},
+        last_publish: ?std.meta.Tag(Runtime.PublishResult) = null,
+        message_bytes: [256]u8 = undefined,
+
+        /// The reactor is shared across replays; each world gets a fresh
+        /// runtime, so global names and object state restart from scratch.
+        fn init(world: *World, reactor: *wayring.io_uring.Reactor) !void {
+            const allocator = std.testing.allocator;
+            world.* = .{
+                .reactor = reactor,
+                .runtime = undefined,
+                .listener_remote = undefined,
+                .peers = undefined,
+                .remotes = undefined,
+            };
+            var listener: [2]linux.fd_t = undefined;
+            try expectSocketPair(&listener);
+            world.listener_remote = listener[1];
+            world.runtime = try Runtime.init(allocator, world.reactor, listener[0], .{
+                .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = byte_budget, .transmit_fd_budget = 1 },
+                .object_capacity = 16,
+                .object_quota = 16,
+                .buckets_per_client = 16,
+                .max_globals = global_count,
+                .registry_capacity = registry_count,
+            });
+            for (&world.peers, &world.remotes) |*peer, *remote| {
+                var sockets: [2]linux.fd_t = undefined;
+                try expectSocketPair(&sockets);
+                peer.* = try world.runtime.clients.admit(.{ .fd = sockets[0], .more = true }, world.runtime.actor_config, null);
+                remote.* = sockets[1];
+            }
+            // Recycled slots come back in LIFO order; publication iterates by
+            // slot, so keep peer indexes in slot order for deterministic replay.
+            if (world.peers[0].slot > world.peers[1].slot) {
+                std.mem.swap(Peer, &world.peers[0], &world.peers[1]);
+                std.mem.swap(linux.fd_t, &world.remotes[0], &world.remotes[1]);
+            }
+            _ = try world.reactor.ring.submit();
+        }
+
+        fn peerIndex(world: *World, peer: Peer) !usize {
+            for (world.peers, 0..) |candidate, p| {
+                if (world.model.peers_live[p] and std.meta.eql(candidate, peer)) return p;
+            }
+            return error.UnknownPeer;
+        }
+
+        fn transmit(world: *World, p: usize) !*wayring.tx.Queue {
+            return &(try world.reactor.getActor(world.peers[p])).transmit;
+        }
+
+        /// Decodes messages queued on peer `p` since the previous call.
+        fn newMessages(world: *World, p: usize, out: *[4]wayring.wire.Message) ![]wayring.wire.Message {
+            if (!world.model.peers_live[p]) return out[0..0];
+            const queue = try world.transmit(p);
+            const total = queue.queuedBytes();
+            if (total == world.parsed[p]) return out[0..0];
+            var descriptor_scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+            try std.testing.expectEqual(total, snapshot.byteCount());
+            @memcpy(world.message_bytes[0..snapshot.first.len], snapshot.first);
+            @memcpy(world.message_bytes[snapshot.first.len..total], snapshot.second);
+            var offset = world.parsed[p];
+            var count: usize = 0;
+            while (offset < total) : (count += 1) {
+                const message = (try wayring.wire.Message.decode(world.message_bytes[offset..total])) orelse
+                    return error.IncompleteMessage;
+                out[count] = message;
+                offset += message.header.size;
+            }
+            world.parsed[p] = total;
+            world.model.queued[p] = @intCast(total);
+            return out[0..count];
+        }
+
+        fn expectNoNewMessages(world: *World) !void {
+            for (0..peer_count) |p| {
+                if (!world.model.peers_live[p]) continue;
+                try std.testing.expectEqual(world.parsed[p], (try world.transmit(p)).queuedBytes());
+            }
+        }
+
+        fn argument(message: wayring.wire.Message, index: usize) u32 {
+            return std.mem.readInt(u32, message.payload[index * 4 ..][0..4], @import("builtin").cpu.arch.endian());
+        }
+
+        fn globalIndex(world: *World, name: u32) !usize {
+            for (world.model.globals, world.globals, 0..) |life, handle, g| {
+                if (life != .unborn and handle.id == name) return g;
+            }
+            return error.UnknownGlobalEvent;
+        }
+
+        /// Checks one event published to peer `p` against the owed events.
+        fn observePublished(world: *World, p: usize) !void {
+            const model = &world.model;
+            var storage: [4]wayring.wire.Message = undefined;
+            const messages = try world.newMessages(p, &storage);
+            if (messages.len == 2) {
+                // wl_callback.done followed by wl_display.delete_id.
+                try std.testing.expectEqual(@as(u32, callback_id), messages[0].header.object_id);
+                try std.testing.expectEqual(@as(u16, 0), messages[0].header.opcode);
+                try std.testing.expectEqual(@as(u32, callback_data), argument(messages[0], 0));
+                try std.testing.expectEqual(@as(u32, 1), messages[1].header.object_id);
+                try std.testing.expectEqual(@as(u16, 1), messages[1].header.opcode);
+                try std.testing.expectEqual(@as(u32, callback_id), argument(messages[1], 0));
+                try std.testing.expect(model.sync_pending[p]);
+                // Every registry event owed when the sync arrived precedes done.
+                try std.testing.expectEqual(@as(u16, 0), model.sync_owed[p] & model.owedMask(p));
+                model.sync_pending[p] = false;
+                model.sync_owed[p] = 0;
+                return;
+            }
+            try std.testing.expectEqual(@as(usize, 1), messages.len);
+            const message = messages[0];
+            const r = for (0..registry_count) |r| {
+                if (registry_peer[r] == p and model.registries[r] == .live and
+                    registry_id[r] == message.header.object_id) break r;
+            } else return error.EventForUnknownRegistry;
+            const g = try world.globalIndex(argument(message, 0));
+            switch (message.header.opcode) {
+                0 => {
+                    try std.testing.expectEqual(@as(usize, 32), message.payload.len);
+                    try std.testing.expectEqual(@as(u32, 1), argument(message, 7));
+                    try std.testing.expect(model.owed_add[r][g]);
+                    try std.testing.expectEqual(Offer.none, model.offer[r][g]);
+                    model.owed_add[r][g] = false;
+                    model.offer[r][g] = .offered;
+                },
+                1 => {
+                    try std.testing.expect(model.owed_remove[r][g]);
+                    try std.testing.expectEqual(Offer.offered, model.offer[r][g]);
+                    model.owed_remove[r][g] = false;
+                    model.offer[r][g] = .removal_sent;
+                },
+                else => return error.UnexpectedRegistryEvent,
+            }
+        }
+
+        /// Applies `op` to the model and the runtime, checking the runtime's
+        /// outcome. Returns false, with nothing changed, when not applicable.
+        fn apply(world: *World, op: Op) !bool {
+            const model = &world.model;
+            const runtime = &world.runtime;
+            switch (op) {
+                .publish => {
+                    const result = try runtime.publishNext();
+                    world.last_publish = result;
+                    switch (result) {
+                        .complete => {
+                            try std.testing.expect(!model.anyOwed());
+                            for (0..peer_count) |p|
+                                try std.testing.expect(!(model.peers_live[p] and model.sync_pending[p]));
+                            model.clean = true;
+                        },
+                        .blocked => |peer| {
+                            const p = try world.peerIndex(peer);
+                            try std.testing.expect(model.owedMask(p) != 0 or model.sync_pending[p]);
+                        },
+                        .sent => |peer| try world.observePublished(try world.peerIndex(peer)),
+                    }
+                },
+                .settle => {
+                    if (model.clean and std.mem.allEqual(u8, &model.queued, 0)) return false;
+                    var steps: usize = 0;
+                    while (true) : (steps += 1) {
+                        try std.testing.expect(steps < 64);
+                        for (0..peer_count) |p| _ = try world.apply(.{ .drain = @intCast(p) });
+                        try std.testing.expect(try world.apply(.publish));
+                        try world.check();
+                        if (world.last_publish.? == .complete) break;
+                    }
+                    for (0..peer_count) |p| _ = try world.apply(.{ .drain = @intCast(p) });
+                },
+                .drain => |p| {
+                    if (!model.peers_live[p] or model.queued[p] == 0) return false;
+                    try consume(try world.transmit(p));
+                    world.parsed[p] = 0;
+                    model.queued[p] = 0;
+                },
+                .add_global => |g| {
+                    if (model.globals[g] != .unborn) return false;
+                    const result = runtime.addGlobalWithBinder(
+                        &protocol.wp_wayring_test_v1.info,
+                        1,
+                        &world.states[g],
+                        WithdrawalState.bind,
+                    );
+                    world.globals[g] = (try mutationOutcome(model.*, result)) orelse return true;
+                    model.globals[g] = .live;
+                    for (0..registry_count) |r| {
+                        if (model.registries[r] == .live) model.owed_add[r][g] = true;
+                    }
+                    model.clean = false;
+                },
+                .remove_global => |g| {
+                    if (model.globals[g] != .live) return false;
+                    const result = runtime.removeGlobalWithCallback(world.globals[g], WithdrawalState.withdrawn);
+                    _ = (try mutationOutcome(model.*, if (result) |_| true else |err| err)) orelse return true;
+                    model.globals[g] = .gone;
+                    for (0..registry_count) |r| {
+                        if (model.offer[r][g] == .offered) model.owed_remove[r][g] = true;
+                    }
+                    model.clean = false;
+                },
+                .create_registry => |r| {
+                    const p = registry_peer[r];
+                    if (model.registries[r] != .unborn or !model.peers_live[p]) return false;
+                    world.registries[r] = try createRegistry(runtime, world.peers[p], registry_id[r]);
+                    model.registries[r] = .live;
+                    for (0..global_count) |g| {
+                        if (model.globals[g] != .live) continue;
+                        model.owed_add[r][g] = true;
+                        model.clean = false;
+                    }
+                },
+                .remove_registry => |r| {
+                    const p = registry_peer[r];
+                    if (model.registries[r] != .live) return false;
+                    const result = runtime.removeRegistry(world.peers[p], world.registries[r]);
+                    if (model.queued[p] + delete_id_size > byte_budget) {
+                        try std.testing.expectError(error.ByteBudgetExceeded, result);
+                        return true;
+                    }
+                    _ = try result;
+                    var storage: [4]wayring.wire.Message = undefined;
+                    const messages = try world.newMessages(p, &storage);
+                    try std.testing.expectEqual(@as(usize, 1), messages.len);
+                    try std.testing.expectEqual(@as(u32, 1), messages[0].header.object_id);
+                    try std.testing.expectEqual(@as(u16, 1), messages[0].header.opcode);
+                    try std.testing.expectEqual(registry_id[r], argument(messages[0], 0));
+                    model.dropRegistry(r);
+                },
+                .ack => |target| {
+                    const r = target.registry;
+                    const g = target.global;
+                    if (model.registries[r] != .live or model.globals[g] == .unborn) return false;
+                    const result = runtime.ackGlobalRemove(world.peers[registry_peer[r]], world.registries[r], world.globals[g].id);
+                    if (model.offer[r][g] == .removal_sent) {
+                        try result;
+                        model.offer[r][g] = .none;
+                    } else try std.testing.expectError(error.InvalidAckRemove, result);
+                },
+                .bind => |target| {
+                    const p = target.peer;
+                    const g = target.global;
+                    if (!model.peers_live[p] or model.globals[g] == .unborn) return false;
+                    const binds = world.states[g].binds;
+                    const result = runtime.bindGlobal(world.peers[p], .{ .bind = .{
+                        .name = world.globals[g].id,
+                        .id = .{ .interface = protocol.wp_wayring_test_v1.info.name, .version = 1, .id = bind_id },
+                    } });
+                    if (model.globals[g] == .live or model.peerHasOffer(p, g)) {
+                        const resource = try result;
+                        try std.testing.expectEqual(binds + 1, world.states[g].binds);
+                        try std.testing.expectEqual(world.globals[g], world.states[g].last.?.global);
+                        _ = try (try runtime.clients.get(world.peers[p])).removeClient(resource);
+                    } else {
+                        try std.testing.expectError(error.UnknownGlobal, result);
+                        try std.testing.expectEqual(binds, world.states[g].binds);
+                    }
+                },
+                .sync => |p| {
+                    if (!model.peers_live[p] or model.sync_pending[p]) return false;
+                    var bytes: [12]u8 = undefined;
+                    try (wayring.wire.Header{ .object_id = 1, .opcode = 0, .size = bytes.len }).encode(bytes[0..8]);
+                    std.mem.writeInt(u32, bytes[8..], callback_id, @import("builtin").cpu.arch.endian());
+                    const action = try runtime.decodeDisplayRequest(
+                        world.peers[p],
+                        (try wayring.wire.Message.decode(&bytes)).?,
+                        &(try world.reactor.getActor(world.peers[p])).received_fds,
+                        null,
+                    );
+                    try runtime.completeSync(world.peers[p], action.sync, callback_data);
+                    model.sync_pending[p] = true;
+                    model.sync_owed[p] = model.owedMask(p);
+                },
+                .destroy_client => |p| {
+                    if (!model.peers_live[p]) return false;
+                    try stopPeers(world.reactor, &.{world.peers[p]});
+                    try runtime.destroyClient(world.peers[p]);
+                    model.peers_live[p] = false;
+                    for (0..registry_count) |r| {
+                        if (registry_peer[r] == p and model.registries[r] == .live) model.dropRegistry(r);
+                    }
+                    model.sync_pending[p] = false;
+                    model.sync_owed[p] = 0;
+                    model.queued[p] = 0;
+                    world.parsed[p] = 0;
+                },
+            }
+            return true;
+        }
+
+        /// Global mutations are rejected while any registry event is owed and
+        /// accepted after publication reported complete. In between, the
+        /// runtime may still hold an exhausted cursor, so either is allowed.
+        fn mutationOutcome(model: Model, result: anytype) !?@typeInfo(@TypeOf(result)).error_union.payload {
+            if (model.anyOwed()) {
+                try std.testing.expectError(error.GlobalUpdateActive, result);
+                return null;
+            }
+            return result catch |err| {
+                if (model.clean) return err;
+                try std.testing.expectEqual(error.GlobalUpdateActive, err);
+                return null;
+            };
+        }
+
+        fn check(world: *World) !void {
+            try world.expectNoNewMessages();
+            for (0..peer_count) |p| {
+                if (world.model.peers_live[p])
+                    try std.testing.expectEqual(@as(usize, world.model.queued[p]), (try world.transmit(p)).queuedBytes());
+            }
+            // Withdrawal happens exactly once, when a removed global's last offer ends.
+            for (world.model.globals, world.states, world.globals, 0..) |life, state, handle, g| {
+                const withdrawn = life == .gone and !world.model.hasOffer(g);
+                try std.testing.expectEqual(@as(usize, @intFromBool(withdrawn)), state.withdrawals);
+                if (withdrawn) try std.testing.expectEqual(handle, state.withdrawn_handle.?);
+            }
+        }
+
+        /// Liveness: when every client reads, publication delivers every owed
+        /// event and sync; destroying the clients then withdraws every removed
+        /// global and lets the runtime shut down.
+        fn teardown(world: *World) !void {
+            _ = try world.apply(.settle);
+            try std.testing.expect(world.model.clean);
+            for (0..peer_count) |p| _ = try world.apply(.{ .destroy_client = @intCast(p) });
+            try world.check();
+            for (world.model.globals, world.states) |life, state|
+                try std.testing.expectEqual(@as(usize, @intFromBool(life == .gone)), state.withdrawals);
+            try world.runtime.deinit(std.testing.allocator);
+            for (world.remotes) |remote| _ = linux.close(remote);
+            _ = linux.close(world.listener_remote);
+        }
+    };
+
+    const Node = struct { parent: u32, op: Op, depth: u8 };
+
+    /// Breadth-first exploration to `max_depth` operations; returns the
+    /// number of distinct abstract states reached.
+    fn explore(max_depth: u8) !usize {
+        const allocator = std.testing.allocator;
+        var reactor: wayring.io_uring.Reactor = undefined;
+        try reactor.initOwned(allocator, .{ .entries = 16 }, .{
+            .receive_buffer_size = 4096,
+            .receive_buffer_count = 4,
+            .receive_control_capacity = 64,
+            .fragment_block_size = 64,
+            .fragment_block_count = 2,
+            .transmit_block_size = 256,
+            .transmit_block_count = 4,
+            .descriptor_count = 4,
+            .send_descriptor_capacity = 1,
+        });
+        // Released only on success: a failed check leaves live peers behind,
+        // and the reactor's teardown assertion would mask the real failure.
+        var nodes: std.ArrayList(Node) = .empty;
+        defer nodes.deinit(allocator);
+        var seen: std.AutoHashMapUnmanaged(u128, void) = .empty;
+        defer seen.deinit(allocator);
+        try nodes.append(allocator, .{ .parent = std.math.maxInt(u32), .op = undefined, .depth = 0 });
+        try seen.put(allocator, (Model{}).key(), {});
+
+        var path: [32]Op = undefined;
+        var current: usize = 0;
+        while (current < nodes.items.len) : (current += 1) {
+            const depth = nodes.items[current].depth;
+            if (depth == max_depth) continue;
+            var cursor: u32 = @intCast(current);
+            var index: usize = depth;
+            while (cursor != 0) : (cursor = nodes.items[cursor].parent) {
+                index -= 1;
+                path[index] = nodes.items[cursor].op;
+            }
+            var world: World = undefined;
+            var replayed = false;
+            for (ops) |op| {
+                if (!replayed) {
+                    try world.init(&reactor);
+                    for (path[0..depth]) |step| try std.testing.expect(try world.apply(step));
+                    replayed = true;
+                }
+                if (!try world.apply(op)) continue;
+                replayed = false;
+                try world.check();
+                const key = world.model.key();
+                try world.teardown();
+                if (seen.contains(key)) continue;
+                try seen.put(allocator, key, {});
+                try nodes.append(allocator, .{ .parent = @intCast(current), .op = op, .depth = depth + 1 });
+            }
+            if (replayed) try world.teardown();
+        }
+        reactor.deinit(allocator);
+        return nodes.items.len;
+    }
+};
+
+test "registry publication and removed-global lifetimes match a bounded model" {
+    // Six operations reach a removal acknowledged after global_remove, plus
+    // racing binds, backpressure, and every withdrawal path.
+    try std.testing.expect(try RegistryModelCheck.explore(6) > 4000);
+}
