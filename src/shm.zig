@@ -459,9 +459,12 @@ pub const Store = struct {
 
     /// Returns a zero-copy read-only slice only while this pin remains active
     /// and file seals make truncation faults impossible for the full mapping.
+    /// Backing replaced after an earlier truncation fault stays invalid even
+    /// if the client later restores and seals the file.
     pub fn bytes(store: *Store, pin_value: Pin) StoreError![]const u8 {
         const pin_node = try store.resolvePin(pin_value.token);
         const pool = try store.resolvePool(pin_node.pool);
+        if (pool.invalid_backing) return error.InvalidBacking;
         if (!pool.sealed_direct) return error.UnsafeAccess;
         return pool.mapping[pin_node.metadata.offset..pin_node.metadata.end()];
     }
@@ -1211,4 +1214,468 @@ test "buffer validation is format-aware and overflow-safe" {
         error.InvalidConfig,
         createBuffer(4096, .{ .value = 1, .bytes_per_pixel = 0 }, 0, 1, 1, 1),
     );
+}
+
+/// Exhaustive model check of one pool's lifetime. An independent abstract
+/// model predicts every Store outcome; each explored transition is replayed on
+/// a real Store with real memfds, failed remaps, and SIGBUS truncation, then
+/// torn down to prove the pool is always reclaimed.
+const PoolModelCheck = struct {
+    const sizes = [_]usize{ 4096, 8192, 12288 };
+    const max_buffers = 2;
+    const max_pins = 2;
+    const format: Format = .{ .value = 0, .bytes_per_pixel = 4 };
+
+    const Op = struct {
+        kind: Kind,
+        index: u1 = 0,
+        /// Lower RLIMIT_AS so a remap attempted by this operation fails.
+        fail: bool = false,
+
+        const Kind = enum {
+            destroy_resource,
+            grow,
+            resize_same,
+            add_buffer,
+            destroy_buffer,
+            pin,
+            unpin,
+            begin_access,
+            end_access,
+            truncate,
+            seal_restore,
+        };
+    };
+
+    const ops = blk: {
+        var list: []const Op = &.{
+            .{ .kind = .destroy_resource },
+            .{ .kind = .grow },
+            .{ .kind = .grow, .fail = true },
+            .{ .kind = .resize_same },
+            .{ .kind = .resize_same, .fail = true },
+            .{ .kind = .add_buffer },
+            .{ .kind = .seal_restore },
+        };
+        for (0..2) |index| list = list ++ &[_]Op{
+            .{ .kind = .destroy_buffer, .index = index },
+            .{ .kind = .pin, .index = index },
+            .{ .kind = .pin, .index = index, .fail = true },
+            .{ .kind = .unpin, .index = index },
+            .{ .kind = .unpin, .index = index, .fail = true },
+            .{ .kind = .begin_access, .index = index },
+            .{ .kind = .end_access, .index = index },
+            .{ .kind = .truncate, .index = index },
+        };
+        break :blk list;
+    };
+
+    /// The abstract pool. Buffer and pin sizes are indexes into `sizes` for
+    /// the declared pool size when the buffer was created; a buffer ends there.
+    const Model = struct {
+        /// The file starts shrink-sealed; otherwise it can be sealed later.
+        sealed: bool,
+        sealed_file: bool,
+        /// File length still covers the largest pool size.
+        file_full: bool = true,
+        /// The store's sealed_direct, recomputed only when the mapping remaps.
+        direct: bool,
+        live: bool = true,
+        resource: bool = true,
+        declared: u2 = 0,
+        mapped: u2 = 0,
+        faulted: bool = false,
+        invalid: bool = false,
+        buffer_len: u2 = 0,
+        buffer_size: [max_buffers]u2 = @splat(0),
+        pin_len: u2 = 0,
+        pin_size: [max_pins]u2 = @splat(0),
+        pin_access: [max_pins]bool = @splat(false),
+
+        fn pending(model: Model) bool {
+            return model.declared != model.mapped;
+        }
+
+        fn openAccesses(model: Model) usize {
+            var count: usize = 0;
+            for (model.pin_access[0..model.pin_len]) |open| count += @intFromBool(open);
+            return count;
+        }
+
+        fn remapped(model: *Model, size: u2) void {
+            model.mapped = size;
+            model.direct = model.sealed_file and model.file_full;
+        }
+
+        fn release(model: *Model) void {
+            if (model.live and !model.resource and model.buffer_len == 0 and model.pin_len == 0)
+                model.live = false;
+        }
+
+        /// Canonical encoding; buffers and pins are unordered multisets.
+        fn key(model: Model) u32 {
+            var buffers: [max_buffers]u32 = @splat(0);
+            for (model.buffer_size[0..model.buffer_len], 0..) |size, index| buffers[index] = size;
+            std.mem.sort(u32, buffers[0..model.buffer_len], {}, std.sort.asc(u32));
+            var pins: [max_pins]u32 = @splat(0);
+            for (0..model.pin_len) |index|
+                pins[index] = @as(u32, model.pin_size[index]) << 1 | @intFromBool(model.pin_access[index]);
+            std.mem.sort(u32, pins[0..model.pin_len], {}, std.sort.asc(u32));
+            var value: u32 = @intFromBool(model.live);
+            value = value << 1 | @intFromBool(model.resource);
+            value = value << 2 | model.declared;
+            value = value << 2 | model.mapped;
+            value = value << 1 | @intFromBool(model.faulted);
+            value = value << 1 | @intFromBool(model.invalid);
+            value = value << 1 | @intFromBool(model.sealed_file);
+            value = value << 1 | @intFromBool(model.file_full);
+            value = value << 1 | @intFromBool(model.direct);
+            value = value << 2 | model.buffer_len;
+            for (buffers) |size| value = value << 2 | size;
+            value = value << 2 | model.pin_len;
+            for (pins) |pin_key| value = value << 3 | pin_key;
+            return value;
+        }
+    };
+
+    const World = struct {
+        store: Store,
+        fd: linux.fd_t,
+        pool: PoolToken,
+        model: Model,
+        buffers: [max_buffers]BufferToken = undefined,
+        pins: [max_pins]Store.Pin = undefined,
+        accesses: [max_pins]?Store.WriteAccess = @splat(null),
+
+        /// Initializes in place: active accesses point at `store`.
+        fn init(world: *World, sealed: bool) !void {
+            world.* = .{
+                .store = try Store.init(
+                    std.testing.allocator,
+                    .{ .max_pool_bytes = sizes[sizes.len - 1] },
+                    1,
+                    max_buffers,
+                ),
+                .fd = undefined,
+                .pool = undefined,
+                .model = .{ .sealed = sealed, .sealed_file = sealed, .direct = sealed },
+            };
+            errdefer world.store.deinit(std.testing.allocator);
+            world.fd = if (sealed) try testMemfd(sizes[sizes.len - 1], true) else blk: {
+                // Sealable but unsealed, so `seal_restore` can seal it later.
+                const result = linux.memfd_create(
+                    "wayring-shm-model",
+                    linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
+                );
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+                const fd: linux.fd_t = @intCast(result);
+                errdefer _ = linux.close(fd);
+                try std.testing.expectEqual(
+                    linux.E.SUCCESS,
+                    linux.errno(linux.ftruncate(fd, sizes[sizes.len - 1])),
+                );
+                break :blk fd;
+            };
+            world.pool = try world.store.addPool(world.fd, sizes[0]);
+        }
+
+        fn lowerAddressSpace(fail: bool) !?linux.rlimit {
+            if (!fail) return null;
+            const original = try std.posix.getrlimit(.AS);
+            try std.posix.setrlimit(.AS, .{ .cur = 1, .max = original.max });
+            return original;
+        }
+
+        fn restoreAddressSpace(original: ?linux.rlimit) void {
+            if (original) |limit| std.posix.setrlimit(.AS, limit) catch unreachable;
+        }
+
+        /// Applies `op` to both the model and the real store, checking that
+        /// the store's outcome matches the model. Returns false when `op` is
+        /// not applicable in this state.
+        fn apply(world: *World, op: Op) !bool {
+            const model = &world.model;
+            const store = &world.store;
+            const index = op.index;
+            switch (op.kind) {
+                .destroy_resource => {
+                    if (!model.live) {
+                        try std.testing.expectError(error.StalePool, store.destroyPoolResource(world.pool));
+                    } else if (!model.resource) {
+                        try std.testing.expectError(error.ResourceDestroyed, store.destroyPoolResource(world.pool));
+                    } else {
+                        try store.destroyPoolResource(world.pool);
+                        model.resource = false;
+                        model.release();
+                    }
+                },
+                .grow, .resize_same => {
+                    if (!model.live or !model.resource) {
+                        if (op.fail or op.kind == .resize_same) return false;
+                        const expected: StoreError = if (model.live) error.ResourceDestroyed else error.StalePool;
+                        try std.testing.expectError(expected, store.resize(world.pool, @intCast(sizes[1])));
+                        return true;
+                    }
+                    const target: u2 = if (op.kind == .grow) blk: {
+                        if (model.declared == sizes.len - 1) return false;
+                        break :blk model.declared + 1;
+                    } else model.declared;
+                    const remaps = model.pin_len == 0 and (target != model.mapped);
+                    if (op.fail and !remaps) return false;
+                    const limit = try lowerAddressSpace(op.fail);
+                    const result = store.resize(world.pool, @intCast(sizes[target]));
+                    restoreAddressSpace(limit);
+                    if (op.fail) {
+                        try std.testing.expectError(error.OutOfMemory, result);
+                    } else {
+                        try result;
+                        model.declared = target;
+                        if (remaps) model.remapped(target);
+                    }
+                },
+                .add_buffer => {
+                    if (!model.live) return false;
+                    if (!model.resource) {
+                        try std.testing.expectError(
+                            error.ResourceDestroyed,
+                            store.addBuffer(world.pool, format, 0, 1, 1, 4),
+                        );
+                        return true;
+                    }
+                    if (model.buffer_len == max_buffers) return false;
+                    // The buffer ends exactly at the declared size, which may
+                    // exceed the mapping while growth is deferred.
+                    const offset: i32 = @intCast(sizes[model.declared] - 4);
+                    world.buffers[model.buffer_len] = try store.addBuffer(world.pool, format, offset, 1, 1, 4);
+                    model.buffer_size[model.buffer_len] = model.declared;
+                    model.buffer_len += 1;
+                },
+                .destroy_buffer => {
+                    if (index >= model.buffer_len) return false;
+                    try store.destroyBuffer(world.buffers[index]);
+                    for (index..model.buffer_len - 1) |slot| {
+                        world.buffers[slot] = world.buffers[slot + 1];
+                        model.buffer_size[slot] = model.buffer_size[slot + 1];
+                    }
+                    model.buffer_len -= 1;
+                    model.release();
+                },
+                .pin => {
+                    if (index >= model.buffer_len or model.pin_len == max_pins) return false;
+                    const blocked = model.pending() and model.pin_len != 0;
+                    const remaps = model.pending() and model.pin_len == 0;
+                    if (op.fail and !remaps) return false;
+                    const limit = try lowerAddressSpace(op.fail);
+                    const result = store.pin(world.buffers[index]);
+                    restoreAddressSpace(limit);
+                    if (blocked) {
+                        try std.testing.expectError(error.ResizePending, result);
+                    } else if (op.fail) {
+                        try std.testing.expectError(error.OutOfMemory, result);
+                    } else {
+                        world.pins[model.pin_len] = try result;
+                        world.accesses[model.pin_len] = null;
+                        model.pin_size[model.pin_len] = model.buffer_size[index];
+                        model.pin_access[model.pin_len] = false;
+                        model.pin_len += 1;
+                        if (remaps) model.remapped(model.declared);
+                    }
+                },
+                .unpin => {
+                    if (index >= model.pin_len) return false;
+                    const accessed = model.pin_access[index];
+                    const remaps = !accessed and model.pin_len == 1 and model.pending();
+                    if (op.fail and !remaps) return false;
+                    const limit = try lowerAddressSpace(op.fail);
+                    const result = store.unpin(world.pins[index]);
+                    restoreAddressSpace(limit);
+                    if (accessed) {
+                        try std.testing.expectError(error.AccessActive, result);
+                        return true;
+                    }
+                    // The pin is consumed even when deferred growth fails.
+                    if (op.fail) try std.testing.expectError(error.OutOfMemory, result) else try result;
+                    for (index..model.pin_len - 1) |slot| {
+                        world.pins[slot] = world.pins[slot + 1];
+                        world.accesses[slot] = world.accesses[slot + 1];
+                        model.pin_size[slot] = model.pin_size[slot + 1];
+                        model.pin_access[slot] = model.pin_access[slot + 1];
+                    }
+                    model.pin_len -= 1;
+                    world.accesses[model.pin_len] = null;
+                    model.pin_access[model.pin_len] = false;
+                    if (remaps and !op.fail) model.remapped(model.declared);
+                    model.release();
+                },
+                .begin_access => {
+                    if (index >= model.pin_len or model.pin_access[index]) return false;
+                    if (model.invalid) {
+                        try std.testing.expectError(error.InvalidBacking, store.writeAccess(world.pins[index]));
+                        return true;
+                    }
+                    world.accesses[index] = try store.writeAccess(world.pins[index]);
+                    model.pin_access[index] = true;
+                },
+                .end_access => {
+                    if (index >= model.pin_len or !model.pin_access[index]) return false;
+                    const outermost = model.openAccesses() == 1;
+                    const result = world.accesses[index].?.end();
+                    world.accesses[index] = null;
+                    model.pin_access[index] = false;
+                    if (model.faulted and outermost) {
+                        try std.testing.expectError(error.InvalidBacking, result);
+                        model.faulted = false;
+                        model.invalid = true;
+                    } else try result;
+                },
+                .truncate => {
+                    if (model.sealed_file or model.faulted or model.invalid) return false;
+                    if (index >= model.pin_len or !model.pin_access[index]) return false;
+                    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(world.fd, 0)));
+                    const target: *volatile u8 = @ptrCast(world.accesses[index].?.bytes.ptr);
+                    target.* = 1;
+                    model.faulted = true;
+                    model.file_full = false;
+                },
+                .seal_restore => {
+                    // A client restores the file length and shrink-seals it.
+                    if (model.sealed_file or !model.live) return false;
+                    try std.testing.expectEqual(
+                        linux.E.SUCCESS,
+                        linux.errno(linux.ftruncate(world.fd, sizes[sizes.len - 1])),
+                    );
+                    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(
+                        world.fd,
+                        linux.F.ADD_SEALS,
+                        linux.F.SEAL_SHRINK,
+                    )));
+                    model.sealed_file = true;
+                    model.file_full = true;
+                },
+            }
+            return true;
+        }
+
+        /// Compares real store state with the model and checks memory-safety
+        /// invariants: pinned and accessed ranges always lie inside the mapping.
+        fn check(world: *World) !void {
+            const model = world.model;
+            if (!model.live) {
+                try std.testing.expectError(error.StalePool, world.store.poolInfo(world.pool));
+                try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(world.fd, linux.F.GETFD, 0)));
+                try std.testing.expectEqual(@as(usize, 0), world.store.active_pools);
+                return;
+            }
+            const info = try world.store.poolInfo(world.pool);
+            try std.testing.expectEqual(sizes[model.mapped], info.mapped_size);
+            try std.testing.expectEqual(sizes[model.declared], info.declared_size);
+            try std.testing.expectEqual(
+                if (model.pending()) @as(?usize, sizes[model.declared]) else null,
+                info.pending_size,
+            );
+            try std.testing.expectEqual(@as(usize, model.buffer_len), info.buffer_count);
+            try std.testing.expectEqual(@as(usize, model.pin_len), info.pin_count);
+            try std.testing.expectEqual(model.resource, info.resource_alive);
+            try std.testing.expectEqual(model.direct, info.sealed_direct);
+
+            const pool = try world.store.resolvePool(world.pool);
+            try std.testing.expectEqual(model.invalid, pool.invalid_backing);
+            const start = @intFromPtr(pool.mapping.ptr);
+            for (world.pins[0..model.pin_len], world.accesses[0..model.pin_len], 0..) |pin_value, maybe_access, slot| {
+                const pin_node = try world.store.resolvePin(pin_value.token);
+                try std.testing.expect(pin_node.metadata.end() <= pool.mapping.len);
+                try std.testing.expectEqual(sizes[model.pin_size[slot]], pin_node.metadata.end());
+                if (model.invalid) {
+                    try std.testing.expectError(error.InvalidBacking, world.store.bytes(pin_value));
+                } else if (model.direct) {
+                    const view = try world.store.bytes(pin_value);
+                    try std.testing.expect(@intFromPtr(view.ptr) + view.len <= start + pool.mapping.len);
+                } else try std.testing.expectError(error.UnsafeAccess, world.store.bytes(pin_value));
+                if (maybe_access) |scope| {
+                    try std.testing.expect(@intFromPtr(scope.bytes.ptr) >= start);
+                    try std.testing.expect(@intFromPtr(scope.bytes.ptr) + scope.bytes.len <= start + pool.mapping.len);
+                }
+            }
+            const guarded_open = if (model.direct) 0 else model.openAccesses();
+            try std.testing.expectEqual(guarded_open, access_depth);
+            try std.testing.expectEqual(
+                if (guarded_open != 0) @intFromPtr(pool) else 0,
+                active_pool_address.load(.acquire),
+            );
+        }
+
+        /// Liveness: ordinary teardown from any state reclaims the pool,
+        /// closes its descriptor, and leaves no guarded access behind.
+        fn teardown(world: *World) !void {
+            for (0..max_pins) |slot| {
+                if (slot < world.model.pin_len and world.model.pin_access[slot])
+                    try std.testing.expect(try world.apply(.{ .kind = .end_access, .index = @intCast(slot) }));
+            }
+            while (world.model.pin_len != 0) try std.testing.expect(try world.apply(.{ .kind = .unpin }));
+            while (world.model.buffer_len != 0) try std.testing.expect(try world.apply(.{ .kind = .destroy_buffer }));
+            if (world.model.live) try std.testing.expect(try world.apply(.{ .kind = .destroy_resource }));
+            try std.testing.expect(!world.model.live);
+            try world.check();
+            try std.testing.expectEqual(@as(usize, 0), access_depth);
+            world.store.deinit(std.testing.allocator);
+        }
+    };
+
+    const Node = struct { parent: u32, op: Op };
+
+    /// Breadth-first exploration of abstract states; returns the state count.
+    fn explore(sealed: bool) !usize {
+        const allocator = std.testing.allocator;
+        var nodes: std.ArrayList(Node) = .empty;
+        defer nodes.deinit(allocator);
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(allocator);
+
+        var root: World = undefined;
+        try root.init(sealed);
+        try root.check();
+        try seen.put(allocator, root.model.key(), {});
+        try root.teardown();
+        try nodes.append(allocator, .{ .parent = std.math.maxInt(u32), .op = undefined });
+
+        var path: [64]Op = undefined;
+        var current: usize = 0;
+        while (current < nodes.items.len) : (current += 1) {
+            var depth: usize = 0;
+            var cursor: u32 = @intCast(current);
+            while (cursor != 0) : (cursor = nodes.items[cursor].parent) {
+                path[path.len - 1 - depth] = nodes.items[cursor].op;
+                depth += 1;
+            }
+            // Inapplicable operations leave the world untouched, so one replay
+            // serves every operation until one applies.
+            var world: World = undefined;
+            var replayed = false;
+            for (ops) |op| {
+                if (!replayed) {
+                    try world.init(sealed);
+                    for (path[path.len - depth ..]) |step| try std.testing.expect(try world.apply(step));
+                    replayed = true;
+                }
+                if (!try world.apply(op)) continue;
+                replayed = false;
+                try world.check();
+                const key = world.model.key();
+                try world.teardown();
+                if (seen.contains(key)) continue;
+                try seen.put(allocator, key, {});
+                try nodes.append(allocator, .{ .parent = @intCast(current), .op = op });
+            }
+            if (replayed) try world.teardown();
+        }
+        return nodes.items.len;
+    }
+};
+
+test "SHM pool lifetime matches an exhaustive model and always reclaims" {
+    const sealed_states = try PoolModelCheck.explore(true);
+    const guarded_states = try PoolModelCheck.explore(false);
+    // Guarded pools add truncation faults and invalid backing states.
+    try std.testing.expect(sealed_states > 100);
+    try std.testing.expect(guarded_states > sealed_states);
 }

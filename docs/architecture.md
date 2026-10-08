@@ -528,7 +528,14 @@ installs a process-wide SIGBUS guard modeled on the MIT-licensed Wayland
 reference server. If a client truncates active backing, the handler replaces
 the complete mapping with zero-filled anonymous pages at its existing address.
 The faulting instruction can finish; the outer access reports `InvalidBacking`
-for a protocol owner to disconnect that client. Unrelated SIGBUS retains the
+for a protocol owner to disconnect that client. The replaced backing stays
+invalid: later scoped access and the zero-copy slice both report
+`InvalidBacking`, even if the client restores and shrink-seals the file.
+A unit test exhaustively explores one pool's lifetime against an independent
+model, replaying each transition on a real store with failed remaps,
+truncation faults, and late sealing, and checks that pinned and accessed ranges
+stay inside the mapping and that teardown from every state reclaims the pool.
+Unrelated SIGBUS retains the
 action captured at
 handler installation, and a later competing handler makes guarded access fail
 rather than silently running unprotected. The positional io_uring copy API
